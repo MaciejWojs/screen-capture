@@ -31,7 +31,7 @@ inline IDirect3DDevice CreateDirect3DDevice(IDXGIDevice* dxgiDevice) {
 }
 
 class WinPlatformCapture final : public IPlatformCapture {
-    public:
+public:
     WinPlatformCapture() {
         init_apartment(apartment_type::multi_threaded);
         InitializeD3D();
@@ -59,25 +59,12 @@ class WinPlatformCapture final : public IPlatformCapture {
             com_ptr<IDXGIDevice> dxgiDevice;
             m_device->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.put_void());
 
-            auto winrtDevice = CreateDirect3DDevice(dxgiDevice.get());
+            m_winrtDevice = CreateDirect3DDevice(dxgiDevice.get());
 
             m_width = m_item.Size().Width;
             m_height = m_item.Size().Height;
 
-            m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-                winrtDevice,
-                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                2,
-                m_item.Size()
-            );
-
-            m_session = m_framePool.CreateCaptureSession(m_item);
-            m_session.IsCursorCaptureEnabled(false);
-            m_session.IsBorderRequired(false);
-            m_session.IncludeSecondaryWindows(true);
-
-            m_token = m_framePool.FrameArrived({ this, &WinPlatformCapture::OnFrame });
-            m_session.StartCapture();
+            CreateFramePoolAndSession();
         } catch (const hresult_error& e) {
             StopInternal();
             throw std::runtime_error(to_string(e.message()));
@@ -93,15 +80,17 @@ class WinPlatformCapture final : public IPlatformCapture {
         if (!handle) return std::nullopt;
 
         SharedHandleInfo info;
-        info.handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+        info.handle = reinterpret_cast<uint64_t>(handle);
         info.width = m_width;
         info.height = m_height;
         return info;
     }
 
-    private:
+private:
     com_ptr<ID3D11Device> m_device;
     com_ptr<ID3D11DeviceContext> m_context;
+
+    IDirect3DDevice m_winrtDevice{ nullptr };
 
     com_ptr<ID3D11Texture2D> m_sharedTex;
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
@@ -133,7 +122,6 @@ class WinPlatformCapture final : public IPlatformCapture {
     void StopInternal() {
         if (m_framePool) {
             if (m_token.value) m_framePool.FrameArrived(m_token);
-            m_token = {};
             m_framePool.Close();
             m_framePool = nullptr;
         }
@@ -149,6 +137,33 @@ class WinPlatformCapture final : public IPlatformCapture {
         if (handle) CloseHandle(handle);
     }
 
+    void CreateFramePoolAndSession() {
+        if (m_framePool) {
+            if (m_token.value) m_framePool.FrameArrived(m_token);
+            m_framePool.Close();
+            m_framePool = nullptr;
+        }
+        if (m_session) {
+            m_session.Close();
+            m_session = nullptr;
+        }
+
+        m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            m_winrtDevice,
+            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            m_item.Size()
+        );
+
+        m_session = m_framePool.CreateCaptureSession(m_item);
+        m_session.IsCursorCaptureEnabled(false);
+        m_session.IsBorderRequired(false);
+        m_session.IncludeSecondaryWindows(true);
+
+        m_token = m_framePool.FrameArrived({ this, &WinPlatformCapture::OnFrame });
+        m_session.StartCapture();
+    }
+
     void OnFrame(Direct3D11CaptureFramePool const& sender,
         winrt::Windows::Foundation::IInspectable const&) {
         try {
@@ -157,14 +172,12 @@ class WinPlatformCapture final : public IPlatformCapture {
 
             auto size = frame.ContentSize();
 
+            if (size.Width == 0 || size.Height == 0) return;
+
             if (size.Width != m_width || size.Height != m_height) {
                 m_width = size.Width;
                 m_height = size.Height;
-
-                m_sharedTex = nullptr;
-
-                HANDLE oldHandle = m_sharedHandle.exchange(nullptr);
-                if (oldHandle) CloseHandle(oldHandle);
+                CreateFramePoolAndSession();
             }
 
             auto surface = frame.Surface().as<IDirect3DSurface>();
