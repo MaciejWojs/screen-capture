@@ -4,6 +4,9 @@
 
 #include <atomic>
 #include <stdexcept>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -32,43 +35,68 @@ inline IDirect3DDevice CreateDirect3DDevice(IDXGIDevice* dxgiDevice) {
 
 class WinPlatformCapture final : public IPlatformCapture {
 public:
-    WinPlatformCapture() {
-        init_apartment(apartment_type::multi_threaded);
-        InitializeD3D();
-    }
+    WinPlatformCapture() = default;
 
     ~WinPlatformCapture() override {
         StopInternal();
     }
 
-    void Start(Napi::Env) override {
-        if (m_session) return;
-
-        try {
-            HMONITOR monitor = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
-
-            auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-            check_hresult(
-                interop->CreateForMonitor(
-                    monitor,
-                    guid_of<GraphicsCaptureItem>(),
-                    put_abi(m_item)
-                )
-            );
-
-            com_ptr<IDXGIDevice> dxgiDevice;
-            m_device->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.put_void());
-
-            m_winrtDevice = CreateDirect3DDevice(dxgiDevice.get());
-
-            m_width = m_item.Size().Width;
-            m_height = m_item.Size().Height;
-
-            CreateFramePoolAndSession();
-        } catch (const hresult_error& e) {
-            StopInternal();
-            throw std::runtime_error(to_string(e.message()));
+    static void CleanupHook(void* arg) {
+        if (arg) {
+            static_cast<WinPlatformCapture*>(arg)->StopInternal();
         }
+    }
+
+    void Start(Napi::Env env) override {
+        if (m_isRunning) return;
+
+        m_env = env;
+        napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+
+        m_isRunning = true;
+        m_captureThread = std::thread([this]() {
+            try {
+                init_apartment(apartment_type::multi_threaded);
+                InitializeD3D();
+
+                HMONITOR monitor = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
+
+                auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+                check_hresult(
+                    interop->CreateForMonitor(
+                        monitor,
+                        guid_of<GraphicsCaptureItem>(),
+                        put_abi(m_item)
+                    )
+                );
+
+                com_ptr<IDXGIDevice> dxgiDevice;
+                m_device->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.put_void());
+
+                m_winrtDevice = CreateDirect3DDevice(dxgiDevice.get());
+
+                m_width = m_item.Size().Width;
+                m_height = m_item.Size().Height;
+
+                CreateFramePoolAndSession();
+
+                // Wait until StopInternal() is called
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_cv.wait_for(lock, std::chrono::milliseconds(100), [this]() { return !m_isRunning.load(); });
+                while (m_isRunning.load()) {
+                    m_cv.wait_for(lock, std::chrono::milliseconds(100), [this]() { return !m_isRunning.load(); });
+                }
+
+                CleanupCapture();
+
+            } catch (const hresult_error& e) {
+                OutputDebugStringW(e.message().c_str());
+            } catch (const std::exception& e) {
+                OutputDebugStringA(e.what());
+            } catch (...) {
+                OutputDebugStringA("Capture thread error");
+            }
+        });
     }
 
     void Stop() override {
@@ -87,6 +115,12 @@ public:
     }
 
 private:
+    napi_env m_env{ nullptr };
+    std::thread m_captureThread;
+    std::atomic<bool> m_isRunning{ false };
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+
     com_ptr<ID3D11Device> m_device;
     com_ptr<ID3D11DeviceContext> m_context;
 
@@ -120,8 +154,25 @@ private:
     }
 
     void StopInternal() {
+        if (m_env) {
+            napi_remove_env_cleanup_hook(m_env, CleanupHook, this);
+            m_env = nullptr;
+        }
+
+        if (!m_isRunning.exchange(false)) return;
+        m_cv.notify_all();
+
+        if (m_captureThread.joinable()) {
+            m_captureThread.join();
+        }
+    }
+
+    void CleanupCapture() {
         if (m_framePool) {
-            if (m_token.value) m_framePool.FrameArrived(m_token);
+            if (m_token.value) {
+                m_framePool.FrameArrived(m_token);
+                m_token.value = 0;
+            }
             m_framePool.Close();
             m_framePool = nullptr;
         }
@@ -131,7 +182,11 @@ private:
             m_session = nullptr;
         }
 
+        m_item = nullptr;
+        m_winrtDevice = nullptr;
         m_sharedTex = nullptr;
+        m_device = nullptr;
+        m_context = nullptr;
 
         HANDLE handle = m_sharedHandle.exchange(nullptr);
         if (handle) CloseHandle(handle);
@@ -139,7 +194,10 @@ private:
 
     void CreateFramePoolAndSession() {
         if (m_framePool) {
-            if (m_token.value) m_framePool.FrameArrived(m_token);
+            if (m_token.value) {
+                m_framePool.FrameArrived(m_token);
+                m_token.value = 0;
+            }
             m_framePool.Close();
             m_framePool = nullptr;
         }
