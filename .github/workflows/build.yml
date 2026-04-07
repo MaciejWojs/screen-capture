@@ -1,0 +1,64 @@
+name: Build and Publish
+
+on:
+  push:
+    tags:
+      - 'v*' 
+
+jobs:
+  build-prebuilds:
+    name: Build Prebuilds
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+
+      - name: install linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt update && sudo apt install -y build-essential pkg-config libglib2.0-dev libpipewire-0.3-dev libspa-0.2-dev libsystemd-dev
+
+      - name: Install Dependencies
+        run: bun install
+
+      - name: Build platform binary
+        run: bun run prebuildify
+
+      - name: Upload prebuilds to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilds-${{ runner.os }}
+          path: prebuilds/
+
+  publish:
+    name: Publish to NPM
+    needs: build-prebuilds
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6.3.0
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download Prebuilds Artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          path: prebuilds/
+          pattern: prebuilds-*
+          merge-multiple: true
+
+      - name: Publish Package
+        run: npm publish --provenance
