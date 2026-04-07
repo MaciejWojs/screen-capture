@@ -37,6 +37,7 @@
   },
   "scripts": {
     "build": "bun x tsc",
+    "prepublishOnly": "bun run build",
     "rebuild": "node-gyp rebuild",
     "prebuildify": "bun run build && bun x prebuildify --napi --strip --node-gyp node-gyp",
     "prebuildify:all": "bun run prebuildify --platform win32 --platform linux --platform darwin",

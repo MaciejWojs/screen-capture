@@ -1,0 +1,10 @@
+# Omijamy plik .gitignore, aby NPM nie ignorował katalogu dist
+# (NPM domyślnie korzysta z .gitignore, jeśli brak .npmignore)
+
+# Ignorujemy katalogi, których nie chcemy w paczce
+.github
+node_modules
+.vscode
+build/
+*.log
+*.tgz

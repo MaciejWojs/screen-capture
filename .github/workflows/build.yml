@@ -53,6 +53,14 @@ jobs:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile
+
       - name: Download Prebuilds Artifacts
         uses: actions/download-artifact@v8.0.1
         with:
