@@ -26,7 +26,7 @@ jobs:
         run: sudo apt update && sudo apt install -y build-essential pkg-config libglib2.0-dev libpipewire-0.3-dev libspa-0.2-dev libsystemd-dev
 
       - name: Install Dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: Build platform binary
         run: bun run prebuildify

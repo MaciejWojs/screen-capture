@@ -38,11 +38,10 @@
   "scripts": {
     "build": "bun x tsc",
     "rebuild": "node-gyp rebuild",
-    "prebuildify": "bun run build && prebuildify --napi --strip --node-gyp \"bun x --silent node-gyp\"",
-    "prebuildify:all": "bun run build && prebuildify --napi --strip --node-gyp \"bun x --silent node-gyp\" --platform win32 --platform linux --platform darwin",
+    "prebuildify": "bun run build && bun x prebuildify --napi --strip --node-gyp node-gyp",
+    "prebuildify:all": "bun run prebuildify --platform win32 --platform linux --platform darwin",
     "test:load": "bun run build && node -e \"import('./dist/index.js').then(() => console.log('addon loaded'))\"",
-    "install": "node-gyp-build",
-    "prepack": "bun run build"
+    "install": "node-gyp-build"
   },
   "devDependencies": {
     "@types/bun": "latest",
