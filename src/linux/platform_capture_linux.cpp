@@ -256,7 +256,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}"));
         g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(1));
         g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(FALSE));
-        g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(2));
+        g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(1));
 
         m_stage = PortalStage::SelectingSources;
         CallPortalMethod("SelectSources", g_variant_new("(oa{sv})", m_sessionHandle.c_str(), &builder));
