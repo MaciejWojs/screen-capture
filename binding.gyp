@@ -40,6 +40,12 @@
         ["OS=='linux'", {
           "sources": [
             "src/linux/platform_capture_linux.cpp"
+          ],
+          "cflags_cc": [
+            "<!@(pkg-config --cflags gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3)"
+          ],
+          "libraries": [
+            "<!@(pkg-config --libs gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3)"
           ]
         }],
         ["OS!='win' and OS!='linux'", {

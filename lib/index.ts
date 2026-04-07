@@ -9,6 +9,13 @@ export interface SharedHandleInfo {
     handle: bigint;
     width: number;
     height: number;
+    stride: number;
+    offset: number;
+    planeSize: bigint;
+    pixelFormat: number;
+    modifier: bigint;
+    bufferType: number;
+    chunkSize: number;
 }
 
 export interface IScreenCapture {

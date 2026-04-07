@@ -52,6 +52,13 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         obj.Set("handle", Napi::BigInt::New(info.Env(), shared->handle));
         obj.Set("width", shared->width);
         obj.Set("height", shared->height);
+        obj.Set("stride", shared->stride);
+        obj.Set("offset", shared->offset);
+        obj.Set("planeSize", Napi::BigInt::New(info.Env(), shared->planeSize));
+        obj.Set("pixelFormat", shared->pixelFormat);
+        obj.Set("modifier", Napi::BigInt::New(info.Env(), shared->modifier));
+        obj.Set("bufferType", shared->bufferType);
+        obj.Set("chunkSize", shared->chunkSize);
         return obj;
     }
 };
