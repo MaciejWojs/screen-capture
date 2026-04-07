@@ -1,6 +1,18 @@
 {
-  "name": "screen-capture",
+  "name": "@maciejwojs/screen-capture",
   "version": "0.1.0",
+  "description": "Native screen capture addon for Node.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maciejwojs/screen-capture.git"
+  },
+  "keywords": [
+    "screen-capture",
+    "desktop-capture",
+    "node-addon-api",
+    "napi"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "os": [
@@ -16,6 +28,13 @@
   ],
   "module": "dist/index.js",
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
   "scripts": {
     "build": "bun x tsc",
     "rebuild": "node-gyp rebuild",
