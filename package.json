@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/maciejwojs/screen-capture.git"
+    "url": "https://github.com/MaciejWojs/screen-capture.git"
   },
   "keywords": [
     "screen-capture",
