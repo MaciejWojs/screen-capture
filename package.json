@@ -1,6 +1,6 @@
 {
   "name": "@maciejwojs/screen-capture",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Native screen capture addon for Node.js",
   "license": "MIT",
   "repository": {
