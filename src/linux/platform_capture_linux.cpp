@@ -44,10 +44,8 @@ struct GVariantBuilderWrapper {
 std::string gen_token() {
     static std::random_device rd;
     static std::mt19937 gen(rd());
-    std::uniform_int_distribution<uint32_t> dis(0, 0xFFFFFFFF);
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0') << std::setw(8) << dis(gen);
-    return ss.str();
+    std::uniform_int_distribution<uint32_t> dis;
+    return "electron_capture_" + std::to_string(dis(gen));
 }
 
 template <typename T, auto FreeFunc>
@@ -94,6 +92,9 @@ class LinuxPlatformCapture final : public IPlatformCapture {
 
     ~LinuxPlatformCapture() override {
         Stop();
+        if (m_worker.joinable() && std::this_thread::get_id() != m_worker.get_id()) {
+            m_worker.join();
+        }
     }
 
     void Start(Napi::Env) override {
@@ -122,10 +123,6 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             }
         }
         m_captureCv.notify_all();
-
-        if (m_worker.joinable() && std::this_thread::get_id() != m_worker.get_id()) {
-            m_worker.join();
-        }
 
         CleanupSharedHandle();
         m_running.store(false);
@@ -161,6 +158,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     PortalStage m_stage = PortalStage::Idle;
 
     std::string m_sessionHandle;
+    std::string m_currentRequestPath;
     std::optional<SharedHandleInfo> m_sharedHandle;
     uint32_t m_streamNodeId = PW_ID_ANY;
     uint32_t m_width = 0;
@@ -177,7 +175,6 @@ class LinuxPlatformCapture final : public IPlatformCapture {
 
     int m_pendingPipewireFd = -1;
     int m_sharedFd = -1;
-    int m_lastPipewireFd = -1;
 
     void RunCaptureFlow() {
         int pipewireFd = -1;
@@ -215,10 +212,12 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             g_variant_builder_add(builder, "{sv}", "handle_token", g_variant_new_string(("t" + gen_token()).c_str()));
 
             m_stage = PortalStage::CreatingSession;
-            CallPortalMethod("CreateSession", g_variant_new("(a{sv})", builder));
+            m_currentRequestPath = CallPortalMethod("CreateSession", g_variant_new("(a{sv})", builder));
 
             g_main_context_push_thread_default(nullptr);
-            g_main_loop_run(m_glibLoop.get());
+            while (g_main_loop_is_running(m_glibLoop.get()) && !m_stopRequested.load() && m_stage != PortalStage::OpeningRemote) {
+                g_main_context_iteration(nullptr, TRUE);
+            }
             g_main_context_pop_thread_default(nullptr);
 
             if (m_stopRequested.load()) {
@@ -253,7 +252,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         m_running.store(false);
     }
 
-    void CallPortalMethod(const char* method, GVariant* params) {
+    std::string CallPortalMethod(const char* method, GVariant* params) {
         GError* rawError = nullptr;
         GVariantPtr result(g_dbus_connection_call_sync(
             m_connection.get(),
@@ -274,13 +273,17 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             std::string message = error ? error->message : "Unknown portal error";
             throw std::runtime_error(message);
         }
+
+        const gchar* path = nullptr;
+        g_variant_get(result.get(), "(o)", &path);
+        return path ? path : "";
     }
 
     void StartSession() {
         std::cerr << "[3/4] Start..." << std::endl;
         GVariantBuilderWrapper builder(G_VARIANT_TYPE("a{sv}"));
         m_stage = PortalStage::StartingSession;
-        CallPortalMethod("Start", g_variant_new("(osa{sv})", m_sessionHandle.c_str(), "", builder));
+        m_currentRequestPath = CallPortalMethod("Start", g_variant_new("(osa{sv})", m_sessionHandle.c_str(), "", builder));
     }
 
     void SelectSources() {
@@ -291,7 +294,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         g_variant_builder_add(builder, "{sv}", "cursor_mode", g_variant_new_uint32(2));
 
         m_stage = PortalStage::SelectingSources;
-        CallPortalMethod("SelectSources", g_variant_new("(oa{sv})", m_sessionHandle.c_str(), builder));
+        m_currentRequestPath = CallPortalMethod("SelectSources", g_variant_new("(oa{sv})", m_sessionHandle.c_str(), builder));
     }
 
     void OpenPipeWireRemote() {
@@ -363,7 +366,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             SPA_FORMAT_mediaSubtype,
             SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
             SPA_FORMAT_VIDEO_format,
-            SPA_POD_CHOICE_ENUM_Id(7, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
+            SPA_POD_CHOICE_ENUM_Id(7, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
             SPA_FORMAT_VIDEO_size,
             SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
             SPA_FORMAT_VIDEO_framerate,
@@ -454,6 +457,9 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     }
 
     void CleanupPipewire() {
+        if (m_streamState.pw_loop) {
+            pw_thread_loop_stop(m_streamState.pw_loop.get());
+        }
         m_streamState.stream.reset();
         m_streamState.core.reset();
         m_streamState.context.reset();
@@ -492,7 +498,6 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         m_chunkSize = 0;
         m_loggedNonDmabuf = false;
         m_frameConsumed = false;
-        m_lastPipewireFd = -1;
     }
 
     void PublishSharedHandleLocked() {
@@ -515,10 +520,6 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     }
 
     void UpdateSharedHandleFromFdLocked(int fd) {
-        if (fd == m_lastPipewireFd) {
-            m_frameConsumed = false;
-            return;
-        }
         int duplicatedFd = dup(fd);
         if (duplicatedFd < 0) {
             return;
@@ -528,7 +529,6 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             close(m_sharedFd);
         }
         m_sharedFd = duplicatedFd;
-        m_lastPipewireFd = fd;
         m_frameConsumed = false;
         PublishSharedHandleLocked();
     }
@@ -632,20 +632,18 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     static void OnPortalResponse(
         GDBusConnection*,
         const gchar*,
-        const gchar*,
+        const gchar* object_path,
         const gchar*,
         const gchar*,
         GVariant* parameters,
         gpointer userData) {
         auto* self = static_cast<LinuxPlatformCapture*>(userData);
-        if (!self) return;
+        if (!self || self->m_currentRequestPath != object_path) return;
 
         guint32 responseCode = 1;
-        GVariantIter* results = nullptr;
-        g_variant_get(parameters, "(ua{sv})", &responseCode, &results);
-        
-        using GVariantIterPtr = std::unique_ptr<GVariantIter, GenericDeleter<GVariantIter, g_variant_iter_free>>;
-        GVariantIterPtr resultsIter(results);
+        GVariant* results = nullptr;
+        g_variant_get(parameters, "(u@a{sv})", &responseCode, &results);
+        GVariantPtr resultsPtr(results);
 
         if (responseCode != 0) {
             if (responseCode == 1) {
@@ -661,61 +659,37 @@ class LinuxPlatformCapture final : public IPlatformCapture {
 
         try {
             if (self->m_stage == PortalStage::CreatingSession) {
-                const gchar* key = nullptr;
-                GVariant* value = nullptr;
-                bool foundSession = false;
-
-                while (results && g_variant_iter_next(results, "{sv}", &key, &value)) {
-                    GVariantPtr val(value);
-                    if (g_strcmp0(key, "session_handle") == 0) {
-                        self->m_sessionHandle = g_variant_get_string(val.get(), nullptr);
-                        foundSession = true;
-                    }
+                const gchar* session_handle = nullptr;
+                if (g_variant_lookup(results, "session_handle", "&s", &session_handle)) {
+                    self->m_sessionHandle = session_handle;
+                    self->SelectSources();
+                    return;
                 }
-
-                if (!foundSession || self->m_sessionHandle.empty()) {
-                    throw std::runtime_error("CreateSession response did not include a session handle");
-                }
-
-                self->SelectSources();
-                return;
+                throw std::runtime_error("CreateSession response did not include a session handle");
             }
-
             if (self->m_stage == PortalStage::SelectingSources) {
                 self->StartSession();
                 return;
             }
-
             if (self->m_stage == PortalStage::StartingSession) {
-                const gchar* key = nullptr;
-                GVariant* value = nullptr;
-                bool foundNode = false;
-                uint32_t nodeId = PW_ID_ANY;
-
-                while (results && g_variant_iter_next(results, "{sv}", &key, &value)) {
-                    GVariantPtr val(value);
-                    if (g_strcmp0(key, "streams") == 0 && g_variant_is_of_type(val.get(), G_VARIANT_TYPE("a(ua{sv})"))) {
-                        GVariantIter streamIter;
-                        g_variant_iter_init(&streamIter, val.get());
-                        GVariantPtr streamTuple(g_variant_iter_next_value(&streamIter));
-                        if (streamTuple) {
-                            GVariant* props = nullptr;
-                            g_variant_get(streamTuple.get(), "(u@a{sv})", &nodeId, &props);
-                            if (props) {
-                                GVariantPtr propsPtr(props);
-                            }
-                            foundNode = true;
-                        }
+                GVariant* streamsVar = g_variant_lookup_value(results, "streams", G_VARIANT_TYPE("a(ua{sv})"));
+                if (streamsVar) {
+                    GVariantPtr streamsPtr(streamsVar);
+                    GVariantIter streamIter;
+                    g_variant_iter_init(&streamIter, streamsVar);
+                    uint32_t nodeId = PW_ID_ANY;
+                    GVariant* streamTuple = g_variant_iter_next_value(&streamIter);
+                    if (streamTuple) {
+                        GVariantPtr tuplePtr(streamTuple);
+                        g_variant_get(streamTuple, "(u@a{sv})", &nodeId, nullptr);
+                    }
+                    if (nodeId != PW_ID_ANY) {
+                        self->m_streamNodeId = nodeId;
+                        self->OpenPipeWireRemote();
+                        return;
                     }
                 }
-
-                if (!foundNode || nodeId == PW_ID_ANY) {
-                    throw std::runtime_error("Start response did not include a valid PipeWire stream node id");
-                }
-
-                self->m_streamNodeId = nodeId;
-                self->OpenPipeWireRemote();
-                return;
+                throw std::runtime_error("Start response did not include a valid PipeWire stream node id");
             }
 
             if (self->m_glibLoop) {
