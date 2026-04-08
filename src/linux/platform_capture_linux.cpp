@@ -462,7 +462,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             SPA_TYPE_OBJECT_ParamBuffers,
             SPA_PARAM_Buffers,
             SPA_PARAM_BUFFERS_dataType,
-            SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_DmaBuf)));
+            SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
 
         pw_stream_add_listener(
             m_streamState.stream.get(),
@@ -633,7 +633,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             SPA_TYPE_OBJECT_ParamBuffers,
             SPA_PARAM_Buffers,
             SPA_PARAM_BUFFERS_dataType,
-            SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_DmaBuf)));
+            SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
 
         pw_stream_update_params(self->m_streamState.stream.get(), params, 2);
     }
