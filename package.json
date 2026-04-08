@@ -39,7 +39,7 @@
     "build": "bun x tsc",
     "prepublishOnly": "bun run build",
     "rebuild": "node-gyp rebuild",
-    "prebuildify": "bun run build && bun x prebuildify --napi --strip --node-gyp node-gyp",
+    "prebuildify": "bun run build && bun x prebuildify --napi --strip --electron-compat --node-gyp node-gyp",
     "prebuildify:all": "bun run prebuildify --platform win32 --platform linux --platform darwin",
     "test:load": "bun run build && node -e \"import('./dist/index.js').then(() => console.log('addon loaded'))\"",
     "install": "node-gyp-build"
