@@ -19,12 +19,15 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <future>
+#include <utility>
 #include <unistd.h>
 #include <fstream>
 
@@ -62,6 +65,7 @@ using PwStreamPtr = std::unique_ptr<pw_stream, GenericDeleter<pw_stream, pw_stre
 using GVariantPtr = std::unique_ptr<GVariant, GenericDeleter<GVariant, g_variant_unref>>;
 using GErrorPtr = std::unique_ptr<GError, GenericDeleter<GError, g_error_free>>;
 using GUnixFDListPtr = std::unique_ptr<GUnixFDList, GObjectDeleter>;
+using UniqueFd = std::unique_ptr<int, FdDeleter>;
 
 struct GVariantBuilderWrapper {
     GVariantBuilder builder;
@@ -88,6 +92,13 @@ enum class PortalStage {
 
 } // namespace
 
+struct StreamConfig {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pixelFormat = 0;
+    uint64_t modifier = 0;
+};
+
 class LinuxPlatformCapture final : public IPlatformCapture {
     public:
     LinuxPlatformCapture() = default;
@@ -108,14 +119,15 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         m_stopRequested.store(true);
 
         {
-            std::lock_guard<std::mutex> lock(m_stateMutex);
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
             if (m_glibLoop) {
                 g_main_loop_quit(m_glibLoop.get());
                 GMainContext* ctx = g_main_loop_get_context(m_glibLoop.get());
                 if (ctx) g_main_context_wakeup(ctx);
             }
-            if (m_pwLoop) {
-                pw_thread_loop_stop(m_pwLoop); pw_thread_loop_signal(m_pwLoop, false);
+            if (m_streamState.pw_loop) {
+                pw_thread_loop_stop(m_streamState.pw_loop.get());
+                pw_thread_loop_signal(m_streamState.pw_loop.get(), false);
             }
         }
 
@@ -130,19 +142,24 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        std::lock_guard<std::mutex> lock(m_stateMutex);
-        if (!m_sharedHandle.has_value() || m_frameConsumed || m_sharedFd < 0) {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        if (!m_sharedHandle.has_value() || m_frameConsumed || !m_sharedFd || *m_sharedFd < 0) {
+            return std::nullopt;
+        }
+
+        int duplicatedFd = dup(*m_sharedFd);
+        if (duplicatedFd < 0) {
             return std::nullopt;
         }
 
         SharedHandleInfo info = *m_sharedHandle;
-        info.handle = static_cast<uint64_t>(dup(m_sharedFd));
+        info.handle = static_cast<uint64_t>(duplicatedFd);
         m_frameConsumed = true;
         return info;
     }
 
     private:
-    mutable std::mutex m_stateMutex;
+    mutable std::shared_mutex m_stateMutex;
     std::thread m_worker;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopRequested{false};
@@ -152,41 +169,37 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     GMainLoopPtr m_glibLoop;
     GDBusConnectionPtr m_connection;
 
-    pw_thread_loop* m_pwLoop = nullptr;
     StreamState m_streamState{};
-    PortalStage m_stage = PortalStage::Idle;
+    std::atomic<PortalStage> m_stage{PortalStage::Idle};
 
     std::string m_sessionHandle;
     std::optional<SharedHandleInfo> m_sharedHandle;
-    uint32_t m_streamNodeId = PW_ID_ANY;
-    uint32_t m_width = 0;
-    uint32_t m_height = 0;
+    std::optional<StreamConfig> m_streamConfig;
+    std::atomic<uint32_t> m_streamNodeId{PW_ID_ANY};
     uint32_t m_stride = 0;
     uint32_t m_offset = 0;
     uint64_t m_planeSize = 0;
-    uint32_t m_pixelFormat = 0;
-    uint64_t m_modifier = 0;
     uint32_t m_bufferType = 0;
     uint32_t m_chunkSize = 0;
     bool m_loggedNonDmabuf = false;
-    mutable bool m_frameConsumed = false;
+    mutable std::atomic<bool> m_frameConsumed{false};
 
-    int m_pendingPipewireFd = -1;
-    int m_sharedFd = -1;
+    std::atomic<int> m_pendingPipewireFd{-1};
+    UniqueFd m_sharedFd;
 
     void RunCaptureFlow() {
         int pipewireFd = -1;
-        GMainContext* context = nullptr;
+        GMainContextPtr context;
 
         try {
             pw_init(nullptr, nullptr);
 
-            context = g_main_context_new();
-            g_main_context_push_thread_default(context);
+            context.reset(g_main_context_new());
+            g_main_context_push_thread_default(context.get());
 
             {
-                std::lock_guard<std::mutex> lock(m_stateMutex);
-                m_glibLoop.reset(g_main_loop_new(context, FALSE));
+                std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                m_glibLoop.reset(g_main_loop_new(context.get(), FALSE));
             }
 
             GError* rawError = nullptr;
@@ -239,11 +252,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
                 throw std::runtime_error("Capture stopped before PipeWire remote was opened");
             }
 
-            {
-                std::lock_guard<std::mutex> lock(m_stateMutex);
-                pipewireFd = m_pendingPipewireFd;
-                m_pendingPipewireFd = -1;
-            }
+            pipewireFd = m_pendingPipewireFd.exchange(-1);
 
             if (pipewireFd < 0) {
                 throw std::runtime_error("PipeWire file descriptor was not received from the portal");
@@ -265,9 +274,8 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         CleanupPipewire();
 
         if (context) {
-            g_main_context_pop_thread_default(context);
-            g_main_context_unref(context);
-            context = nullptr;
+            g_main_context_pop_thread_default(context.get());
+            context.reset();
         }
 
         m_glibLoop.reset();
@@ -302,7 +310,12 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     void StartSession() {
         GVariantBuilderWrapper builder;
         m_stage = PortalStage::StartingSession;
-        CallPortalMethod("Start", g_variant_new("(osa{sv})", m_sessionHandle.c_str(), "", static_cast<GVariantBuilder*>(builder)));
+        std::string handle;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+            handle = m_sessionHandle;
+        }
+        CallPortalMethod("Start", g_variant_new("(osa{sv})", handle.c_str(), "", static_cast<GVariantBuilder*>(builder)));
     }
 
     void SelectSources() {
@@ -312,7 +325,12 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         g_variant_builder_add(builder, "{sv}", "cursor_mode", g_variant_new_uint32(1));
 
         m_stage = PortalStage::SelectingSources;
-        CallPortalMethod("SelectSources", g_variant_new("(oa{sv})", m_sessionHandle.c_str(), static_cast<GVariantBuilder*>(builder)));
+        std::string handle;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+            handle = m_sessionHandle;
+        }
+        CallPortalMethod("SelectSources", g_variant_new("(oa{sv})", handle.c_str(), static_cast<GVariantBuilder*>(builder)));
     }
 
     void OpenPipeWireRemote() {
@@ -320,13 +338,19 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         GError* rawError = nullptr;
         GUnixFDList* rawOutFdList = nullptr;
 
+        std::string handle;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+            handle = m_sessionHandle;
+        }
+
         GVariantPtr result(g_dbus_connection_call_with_unix_fd_list_sync(
             m_connection.get(),
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
             "org.freedesktop.portal.ScreenCast",
             "OpenPipeWireRemote",
-            g_variant_new("(oa{sv})", m_sessionHandle.c_str(), static_cast<GVariantBuilder*>(builder)),
+            g_variant_new("(oa{sv})", handle.c_str(), static_cast<GVariantBuilder*>(builder)),
             G_VARIANT_TYPE("(h)"),
             G_DBUS_CALL_FLAGS_NONE,
             -1,
@@ -355,10 +379,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             throw std::runtime_error(message);
         }
 
-        {
-            std::lock_guard<std::mutex> lock(m_stateMutex);
-            m_pendingPipewireFd = fd;
-        }
+        m_pendingPipewireFd.store(fd);
 
         m_stage = PortalStage::OpeningRemote;
         g_main_loop_quit(m_glibLoop.get());
@@ -366,15 +387,10 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         if (ctx) g_main_context_wakeup(ctx);
     }
 
-    void StartPipewireStream(int pipewireFd) {
+    void StartPipewireStream(int& pipewireFd) {
         m_streamState.pw_loop.reset(pw_thread_loop_new("pw-capt", nullptr));
         if (!m_streamState.pw_loop) {
             throw std::runtime_error("Unable to create the PipeWire main loop");
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(m_stateMutex);
-            m_pwLoop = m_streamState.pw_loop.get();
         }
 
         pw_loop* loop = pw_thread_loop_get_loop(m_streamState.pw_loop.get());
@@ -383,9 +399,8 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             throw std::runtime_error("Unable to create the PipeWire context");
         }
 
-        m_streamState.core.reset(pw_context_connect_fd(m_streamState.context.get(), pipewireFd, nullptr, 0));
+        m_streamState.core.reset(pw_context_connect_fd(m_streamState.context.get(), std::exchange(pipewireFd, -1), nullptr, 0));
         if (!m_streamState.core) {
-            close(pipewireFd);
             throw std::runtime_error("Unable to connect to the PipeWire core through the portal FD");
         }
 
@@ -443,7 +458,8 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             &kStreamEvents,
             this);
 
-        uint32_t targetId = m_streamNodeId == PW_ID_ANY ? PW_ID_ANY : m_streamNodeId;
+        uint32_t currentStreamNodeId = m_streamNodeId.load();
+        uint32_t targetId = currentStreamNodeId == PW_ID_ANY ? PW_ID_ANY : currentStreamNodeId;
         int result = pw_stream_connect(
             m_streamState.stream.get(),
             PW_DIRECTION_INPUT,
@@ -463,11 +479,11 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         m_connection.reset();
         
         {
-            std::lock_guard<std::mutex> lock(m_stateMutex);
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+            m_sessionHandle.clear();
             m_glibLoop.reset();
         }
 
-        m_sessionHandle.clear();
         m_streamNodeId = PW_ID_ANY;
         m_stage = PortalStage::Idle;
     }
@@ -478,30 +494,19 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         m_streamState.context.reset();
         m_streamState.pw_loop.reset();
 
-        {
-            std::lock_guard<std::mutex> lock(m_stateMutex);
-            m_pwLoop = nullptr;
-        }
-
         CleanupSharedHandle();
     }
 
     void CleanupSharedHandle() {
-        std::lock_guard<std::mutex> lock(m_stateMutex);
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         m_sharedHandle.reset();
 
-        if (m_sharedFd >= 0) {
-            close(m_sharedFd);
-            m_sharedFd = -1;
-        }
+        m_sharedFd.reset();
 
-        m_width = 0;
-        m_height = 0;
+        m_streamConfig.reset();
         m_stride = 0;
         m_offset = 0;
         m_planeSize = 0;
-        m_pixelFormat = 0;
-        m_modifier = 0;
         m_bufferType = 0;
         m_chunkSize = 0;
         m_loggedNonDmabuf = false;
@@ -509,19 +514,19 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     }
 
     void PublishSharedHandleLocked() {
-        if (m_sharedFd < 0 || m_width == 0 || m_height == 0) {
+        if (!m_sharedFd || *m_sharedFd < 0 || !m_streamConfig || m_streamConfig->width == 0 || m_streamConfig->height == 0) {
             return;
         }
 
         m_sharedHandle = SharedHandleInfo{
-            static_cast<uint64_t>(m_sharedFd),
-            m_width,
-            m_height,
+            static_cast<uint64_t>(*m_sharedFd),
+            m_streamConfig->width,
+            m_streamConfig->height,
             m_stride,
             m_offset,
             m_planeSize,
-            m_pixelFormat,
-            m_modifier,
+            m_streamConfig->pixelFormat,
+            m_streamConfig->modifier,
             m_bufferType,
             m_chunkSize,
         };
@@ -533,11 +538,8 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(m_stateMutex);
-        if (m_sharedFd >= 0) {
-            close(m_sharedFd);
-        }
-        m_sharedFd = duplicatedFd;
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        m_sharedFd.reset(new int(duplicatedFd));
         m_frameConsumed = false;
         PublishSharedHandleLocked();
     }
@@ -560,17 +562,20 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         }
 
         {
-            std::lock_guard<std::mutex> lock(self->m_stateMutex);
-            self->m_width = info.size.width;
-            self->m_height = info.size.height;
-            self->m_pixelFormat = static_cast<uint32_t>(info.format);
-            self->m_modifier = info.modifier;
+            std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
+            if (!self->m_streamConfig) {
+                self->m_streamConfig = StreamConfig{};
+            }
+            self->m_streamConfig->width = info.size.width;
+            self->m_streamConfig->height = info.size.height;
+            self->m_streamConfig->pixelFormat = static_cast<uint32_t>(info.format);
+            self->m_streamConfig->modifier = info.modifier;
             self->PublishSharedHandleLocked();
         }
 
         uint8_t buffer[1024];
         spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-        const spa_pod* params[1];
+        const spa_pod* params[2];
         params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
             &builder,
             SPA_TYPE_OBJECT_Format,
@@ -584,9 +589,18 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             SPA_FORMAT_VIDEO_size,
             SPA_POD_Rectangle(&info.size),
             SPA_FORMAT_VIDEO_framerate,
-            SPA_POD_Fraction(&info.framerate)));
+            SPA_POD_Fraction(&info.framerate),
+            SPA_FORMAT_VIDEO_modifier,
+            SPA_POD_Long(info.modifier)));
 
-        pw_stream_update_params(self->m_streamState.stream.get(), params, 1);
+        params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+            &builder,
+            SPA_TYPE_OBJECT_ParamBuffers,
+            SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_dataType,
+            SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_DmaBuf)));
+
+        pw_stream_update_params(self->m_streamState.stream.get(), params, 2);
     }
 
     static void OnStreamProcess(void* userdata) {
@@ -606,7 +620,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             const uint32_t chunkSize = data.chunk ? data.chunk->size : 0;
             if ((data.type == SPA_DATA_DmaBuf || data.type == SPA_DATA_MemFd) && data.fd >= 0) {
                 {
-                    std::lock_guard<std::mutex> lock(self->m_stateMutex);
+                    std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
                     self->m_bufferType = static_cast<uint32_t>(data.type);
                     self->m_chunkSize = chunkSize;
                     if (data.chunk) {
@@ -622,7 +636,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
                 self->UpdateSharedHandleFromFd(data.fd);
                 self->m_loggedNonDmabuf = false;
             } else {
-                std::lock_guard<std::mutex> lock(self->m_stateMutex);
+                std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
                 self->m_bufferType = static_cast<uint32_t>(data.type);
                 self->m_chunkSize = chunkSize;
             }
@@ -675,6 +689,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
 
                 while (results && g_variant_iter_next(results, "{sv}", &key, &value)) {
                     if (g_strcmp0(key, "session_handle") == 0) {
+                        std::unique_lock<std::shared_mutex> lock(self->m_stateMutex);
                         self->m_sessionHandle = g_variant_get_string(value, nullptr);
                         foundSession = true;
                     }
