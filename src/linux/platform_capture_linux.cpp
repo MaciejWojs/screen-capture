@@ -99,6 +99,18 @@ struct StreamConfig {
     uint64_t modifier = 0;
 };
 
+namespace Config {
+    constexpr uint32_t DEFAULT_WIDTH = 1920;
+    constexpr uint32_t DEFAULT_HEIGHT = 1080;
+    constexpr uint32_t MAX_WIDTH = 8192;
+    constexpr uint32_t MAX_HEIGHT = 8192;
+    constexpr uint32_t DEFAULT_FPS_NUM = 60;
+    constexpr uint32_t DEFAULT_FPS_DEN = 1;
+    constexpr uint32_t MAX_FPS_NUM = 144;
+    constexpr size_t POD_BUFFER_SIZE_CONNECT = 2048;
+    constexpr size_t POD_BUFFER_SIZE_UPDATE = 1024;
+}
+
 class LinuxPlatformCapture final : public IPlatformCapture {
     public:
     LinuxPlatformCapture() = default;
@@ -142,7 +154,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         if (!m_sharedHandle.has_value() || m_frameConsumed || !m_sharedFd || *m_sharedFd < 0) {
             return std::nullopt;
         }
@@ -202,28 +214,28 @@ class LinuxPlatformCapture final : public IPlatformCapture {
                 m_glibLoop.reset(g_main_loop_new(context.get(), FALSE));
             }
 
-            GError* rawError = nullptr;
+            GError* rawAddressError = nullptr;
             std::unique_ptr<gchar, GenericDeleter<gchar, g_free>> address(
-                g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, nullptr, &rawError)
+                g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, nullptr, &rawAddressError)
             );
-            GErrorPtr dbusError(rawError);
+            GErrorPtr dbusAddressError(rawAddressError);
 
             if (!address) {
-                std::string msg = dbusError ? dbusError->message : "Unknown error";
+                std::string msg = dbusAddressError ? dbusAddressError->message : "Unknown error";
                 throw std::runtime_error("Unable to get session D-Bus address: " + msg);
             }
 
-            rawError = nullptr;
+            GError* rawConnError = nullptr;
             m_connection.reset(g_dbus_connection_new_for_address_sync(
                 address.get(),
                 static_cast<GDBusConnectionFlags>(G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION | G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT),
                 nullptr,
                 nullptr,
-                &rawError));
-            dbusError.reset(rawError);
+                &rawConnError));
+            GErrorPtr dbusConnError(rawConnError);
 
             if (!m_connection) {
-                std::string msg = dbusError ? dbusError->message : "Unknown DBus error";
+                std::string msg = dbusConnError ? dbusConnError->message : "Unknown DBus error";
                 throw std::runtime_error("Unable to connect to private session D-Bus: " + msg);
             }
 
@@ -335,7 +347,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
 
     void OpenPipeWireRemote() {
         GVariantBuilderWrapper builder;
-        GError* rawError = nullptr;
+        GError* rawResultError = nullptr;
         GUnixFDList* rawOutFdList = nullptr;
 
         std::string handle;
@@ -357,25 +369,25 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             nullptr,
             &rawOutFdList,
             nullptr,
-            &rawError));
+            &rawResultError));
 
-        GErrorPtr error(rawError);
+        GErrorPtr resultError(rawResultError);
         GUnixFDListPtr outFdList(rawOutFdList);
 
         if (!result) {
-            std::string message = error ? error->message : "Unknown portal error";
+            std::string message = resultError ? resultError->message : "Unknown portal error";
             throw std::runtime_error(message);
         }
 
         gint32 fdIndex = -1;
         g_variant_get(result.get(), "(h)", &fdIndex);
         
-        rawError = nullptr;
-        int fd = g_unix_fd_list_get(outFdList.get(), fdIndex, &rawError);
-        error.reset(rawError);
+        GError* rawFdError = nullptr;
+        int fd = g_unix_fd_list_get(outFdList.get(), fdIndex, &rawFdError);
+        GErrorPtr fdError(rawFdError);
 
         if (fd < 0) {
-            std::string message = error ? error->message : "Unable to extract PipeWire FD";
+            std::string message = fdError ? fdError->message : "Unable to extract PipeWire FD";
             throw std::runtime_error(message);
         }
 
@@ -417,7 +429,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             throw std::runtime_error("Unable to create the PipeWire stream");
         }
 
-        uint8_t buffer[2048];
+        uint8_t buffer[Config::POD_BUFFER_SIZE_CONNECT];
         spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
         const spa_pod* params[2];
 
@@ -489,6 +501,9 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     }
 
     void CleanupPipewire() {
+        if (m_streamState.pw_loop) {
+            pw_thread_loop_stop(m_streamState.pw_loop.get());
+        }
         m_streamState.stream.reset();
         m_streamState.core.reset();
         m_streamState.context.reset();
@@ -561,6 +576,8 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             return;
         }
 
+        bool hasModifier = (info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
+
         {
             std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
             if (!self->m_streamConfig) {
@@ -569,29 +586,47 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             self->m_streamConfig->width = info.size.width;
             self->m_streamConfig->height = info.size.height;
             self->m_streamConfig->pixelFormat = static_cast<uint32_t>(info.format);
-            self->m_streamConfig->modifier = info.modifier;
+            self->m_streamConfig->modifier = hasModifier ? info.modifier : 0;
             self->PublishSharedHandleLocked();
         }
 
-        uint8_t buffer[1024];
+        uint8_t buffer[Config::POD_BUFFER_SIZE_UPDATE];
         spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
         const spa_pod* params[2];
-        params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-            &builder,
-            SPA_TYPE_OBJECT_Format,
-            SPA_PARAM_Format,
-            SPA_FORMAT_mediaType,
-            SPA_POD_Id(SPA_MEDIA_TYPE_video),
-            SPA_FORMAT_mediaSubtype,
-            SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-            SPA_FORMAT_VIDEO_format,
-            SPA_POD_Id(info.format),
-            SPA_FORMAT_VIDEO_size,
-            SPA_POD_Rectangle(&info.size),
-            SPA_FORMAT_VIDEO_framerate,
-            SPA_POD_Fraction(&info.framerate),
-            SPA_FORMAT_VIDEO_modifier,
-            SPA_POD_Long(info.modifier)));
+
+        if (hasModifier) {
+            params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_Format,
+                SPA_PARAM_Format,
+                SPA_FORMAT_mediaType,
+                SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype,
+                SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                SPA_FORMAT_VIDEO_format,
+                SPA_POD_Id(info.format),
+                SPA_FORMAT_VIDEO_size,
+                SPA_POD_Rectangle(&info.size),
+                SPA_FORMAT_VIDEO_framerate,
+                SPA_POD_Fraction(&info.framerate),
+                SPA_FORMAT_VIDEO_modifier,
+                SPA_POD_Long(info.modifier)));
+        } else {
+            params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_Format,
+                SPA_PARAM_Format,
+                SPA_FORMAT_mediaType,
+                SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype,
+                SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                SPA_FORMAT_VIDEO_format,
+                SPA_POD_Id(info.format),
+                SPA_FORMAT_VIDEO_size,
+                SPA_POD_Rectangle(&info.size),
+                SPA_FORMAT_VIDEO_framerate,
+                SPA_POD_Fraction(&info.framerate)));
+        }
 
         params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
             &builder,
