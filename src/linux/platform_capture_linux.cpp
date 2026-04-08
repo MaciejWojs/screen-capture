@@ -115,11 +115,15 @@ class LinuxPlatformCapture final : public IPlatformCapture {
 
         {
             std::lock_guard<std::mutex> lock(m_stateMutex);
-            if (m_glibLoop) {
-                g_main_loop_quit(m_glibLoop.get());
-            }
             if (m_pwLoop) {
                 pw_thread_loop_stop(m_pwLoop);
+            }
+            if (m_glibLoop) {
+                g_main_loop_quit(m_glibLoop.get());
+                GMainContext* ctx = g_main_loop_get_context(m_glibLoop.get());
+                if (ctx) {
+                    g_main_context_wakeup(ctx);
+                }
             }
         }
         m_captureCv.notify_all();
@@ -149,6 +153,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     std::thread m_worker;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopRequested{false};
+    std::atomic<bool> m_portalFailed{false};
 
     GMainLoopPtr m_glibLoop;
     GDBusConnectionPtr m_connection;
@@ -178,14 +183,20 @@ class LinuxPlatformCapture final : public IPlatformCapture {
 
     void RunCaptureFlow() {
         int pipewireFd = -1;
+        GMainContext* context = nullptr;
 
         try {
             pw_init(nullptr, nullptr);
 
+            context = g_main_context_new();
+            g_main_context_push_thread_default(context);
+
             {
                 std::lock_guard<std::mutex> lock(m_stateMutex);
-                m_glibLoop.reset(g_main_loop_new(nullptr, FALSE));
+                m_glibLoop.reset(g_main_loop_new(context, FALSE));
             }
+
+            m_portalFailed.store(false);
 
             m_connection.reset(g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, nullptr));
             if (!m_connection) {
@@ -214,14 +225,14 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             m_stage = PortalStage::CreatingSession;
             m_currentRequestPath = CallPortalMethod("CreateSession", g_variant_new("(a{sv})", builder));
 
-            g_main_context_push_thread_default(nullptr);
-            while (g_main_loop_is_running(m_glibLoop.get()) && !m_stopRequested.load() && m_stage != PortalStage::OpeningRemote) {
-                g_main_context_iteration(nullptr, TRUE);
-            }
-            g_main_context_pop_thread_default(nullptr);
+            g_main_loop_run(m_glibLoop.get());
 
             if (m_stopRequested.load()) {
                 throw std::runtime_error("Capture stopped before PipeWire remote was opened");
+            }
+
+            if (m_portalFailed.load()) {
+                throw std::runtime_error("Portal request failed or user cancelled");
             }
 
             {
@@ -240,6 +251,12 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             if (pipewireFd >= 0) {
                 close(pipewireFd);
             }
+        }
+
+        if (context) {
+            g_main_context_pop_thread_default(context);
+            g_main_context_unref(context);
+            context = nullptr;
         }
 
         std::unique_lock<std::mutex> waitLock(m_captureMutex);
@@ -346,6 +363,8 @@ class LinuxPlatformCapture final : public IPlatformCapture {
 
         m_stage = PortalStage::OpeningRemote;
         g_main_loop_quit(m_glibLoop.get());
+        GMainContext* ctx = g_main_loop_get_context(m_glibLoop.get());
+        if (ctx) g_main_context_wakeup(ctx);
     }
 
     void BuildFormatParams(spa_pod_builder* builder, const spa_pod** params) {
@@ -651,9 +670,8 @@ class LinuxPlatformCapture final : public IPlatformCapture {
             } else {
                 std::cerr << "[Portal] Response error: " << responseCode << std::endl;
             }
-            if (self->m_glibLoop) {
-                g_main_loop_quit(self->m_glibLoop.get());
-            }
+            self->m_portalFailed.store(true);
+            if (self->m_glibLoop) g_main_loop_quit(self->m_glibLoop.get());
             return;
         }
 
@@ -692,14 +710,12 @@ class LinuxPlatformCapture final : public IPlatformCapture {
                 throw std::runtime_error("Start response did not include a valid PipeWire stream node id");
             }
 
-            if (self->m_glibLoop) {
-                g_main_loop_quit(self->m_glibLoop.get());
-            }
+            self->m_portalFailed.store(true);
+            if (self->m_glibLoop) g_main_loop_quit(self->m_glibLoop.get());
         } catch (const std::exception& e) {
             std::cerr << "[Portal] " << e.what() << std::endl;
-            if (self->m_glibLoop) {
-                g_main_loop_quit(self->m_glibLoop.get());
-            }
+            self->m_portalFailed.store(true);
+            if (self->m_glibLoop) g_main_loop_quit(self->m_glibLoop.get());
         }
     }
 
