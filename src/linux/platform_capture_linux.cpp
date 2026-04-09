@@ -29,6 +29,13 @@
 #include <future>
 #include <utility>
 #include <unistd.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/mman.h>
+
 #include <fstream>
 
 namespace {
@@ -852,17 +859,119 @@ class X11PlatformCapture final : public BaseWaylandPlatformCapture {
 
     private:
     void CaptureLoop() {
-        // Główna pętla przechwytywania (60 FPS z fallbackiem)
-        while (!m_stopRequested.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
-            
-            // TODO dla X11: 
-            // 1. Otwarcie XOpenDisplay(NULL) jeśli jeszcze nie ma
-            // 2. Utworzenie obrazu z użyciem XShmGetImage (wydajniejsze) lub XGetImage
-            // 3. Zapisanie zawartości pikseli do tymczasowego memfd (memfd_create)
-            // 4. Przypisanie fd do m_sharedFd
-            // 5. Ustawienie m_sharedHandle podając wymiary, stride i deskryptor
+        Display* display = XOpenDisplay(nullptr);
+        if (!display) {
+            std::cerr << "[X11] Cannot open display" << std::endl;
+            return;
         }
+
+        int screen = DefaultScreen(display);
+        Window root = RootWindow(display, screen);
+
+        XWindowAttributes attr;
+        XGetWindowAttributes(display, root, &attr);
+        int width = attr.width;
+        int height = attr.height;
+
+        XShmSegmentInfo shminfo;
+        XImage* image = XShmCreateImage(display, attr.visual, attr.depth, ZPixmap, nullptr, &shminfo, width, height);
+        if (!image) {
+            std::cerr << "[X11] Cannot create XShmImage" << std::endl;
+            XCloseDisplay(display);
+            return;
+        }
+
+        shminfo.shmid = shmget(IPC_PRIVATE, image->bytes_per_line * image->height, IPC_CREAT | 0600);
+        shminfo.shmaddr = image->data = (char*)shmat(shminfo.shmid, 0, 0);
+        shminfo.readOnly = False;
+
+        if (!XShmAttach(display, &shminfo)) {
+            std::cerr << "[X11] XShmAttach failed" << std::endl;
+            XDestroyImage(image);
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XCloseDisplay(display);
+            return;
+        }
+
+        int memfd = memfd_create("x11_capture", MFD_CLOEXEC);
+        if (memfd < 0) {
+            std::cerr << "[X11] memfd_create failed" << std::endl;
+            XShmDetach(display, &shminfo);
+            XDestroyImage(image);
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XCloseDisplay(display);
+            return;
+        }
+
+        size_t size = image->bytes_per_line * image->height;
+        if (ftruncate(memfd, size) < 0) {
+            std::cerr << "[X11] ftruncate failed" << std::endl;
+            close(memfd);
+            XShmDetach(display, &shminfo);
+            XDestroyImage(image);
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XCloseDisplay(display);
+            return;
+        }
+
+        void* memfd_ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+        if (memfd_ptr == MAP_FAILED) {
+            close(memfd);
+            XShmDetach(display, &shminfo);
+            XDestroyImage(image);
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XCloseDisplay(display);
+            return;
+        }
+
+        {
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+            m_sharedFd.reset(new int(dup(memfd)));
+            m_sharedHandle = SharedHandleInfo{
+                static_cast<uint64_t>(*m_sharedFd),
+                static_cast<uint32_t>(width),
+                static_cast<uint32_t>(height),
+                static_cast<uint32_t>(image->bytes_per_line),
+                0, // offset
+                static_cast<uint64_t>(size), // planeSize
+                SPA_VIDEO_FORMAT_BGRA, // domyślny format wizualizacji X11 dla ZPixmap z głębią 24/32
+                0, // modifier
+                1, // Zgodne z SPA_DATA_MemFd
+                static_cast<uint32_t>(size) // chunkSize
+            };
+            m_frameConsumed = false;
+        }
+
+        // Pętla przechwytywania (ok. 60 FPS)
+        while (!m_stopRequested.load()) {
+            auto start = std::chrono::steady_clock::now();
+
+            if (XShmGetImage(display, root, image, 0, 0, AllPlanes)) {
+                memcpy(memfd_ptr, image->data, size);
+
+                std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                m_frameConsumed = false;
+            }
+
+            auto end = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+            if (duration.count() < 16) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(16) - duration);
+            }
+        }
+
+        // Czyszczenie
+        munmap(memfd_ptr, size);
+        close(memfd);
+        XShmDetach(display, &shminfo);
+        XDestroyImage(image);
+        shmdt(shminfo.shmaddr);
+        shmctl(shminfo.shmid, IPC_RMID, 0);
+        XCloseDisplay(display);
     }
 };
 
