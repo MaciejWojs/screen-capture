@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "platform_capture.hpp"
+#include "serialize.hpp"
 
 class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     public:
@@ -11,7 +12,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         Napi::Function func = DefineClass(env, "ScreenCapture", {
             InstanceMethod("start", &ScreenCapture::Start),
             InstanceMethod("stop", &ScreenCapture::Stop),
-            InstanceMethod("getSharedHandle", &ScreenCapture::GetSharedHandle)
+            InstanceMethod("getSharedHandle", &ScreenCapture::GetSharedHandleLegacy),
+            InstanceMethod("getSharedTextureInfo", &ScreenCapture::GetSharedTextureInfo)
             });
 
         auto* constructor = new Napi::FunctionReference();
@@ -44,22 +46,14 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         return info.Env().Undefined();
     }
 
-    Napi::Value GetSharedHandle(const Napi::CallbackInfo& info) {
+    Napi::Value GetSharedHandleLegacy(const Napi::CallbackInfo& info) {
         auto shared = m_backend->GetSharedHandle();
-        if (!shared.has_value()) return info.Env().Null();
+        return SerializeSharedHandleLegacy(info.Env(), shared);
+    }
 
-        Napi::Object obj = Napi::Object::New(info.Env());
-        obj.Set("handle", Napi::BigInt::New(info.Env(), shared->handle));
-        obj.Set("width", shared->width);
-        obj.Set("height", shared->height);
-        obj.Set("stride", shared->stride);
-        obj.Set("offset", shared->offset);
-        obj.Set("planeSize", Napi::BigInt::New(info.Env(), shared->planeSize));
-        obj.Set("pixelFormat", shared->pixelFormat);
-        obj.Set("modifier", Napi::BigInt::New(info.Env(), shared->modifier));
-        obj.Set("bufferType", shared->bufferType);
-        obj.Set("chunkSize", shared->chunkSize);
-        return obj;
+    Napi::Value GetSharedTextureInfo(const Napi::CallbackInfo& info) {
+        auto shared = m_backend->GetSharedHandle();
+        return SerializeSharedTextureInfo(info.Env(), shared);
     }
 };
 
