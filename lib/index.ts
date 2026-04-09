@@ -40,12 +40,44 @@ export interface IScreenCapture {
     /** Stops the screen capture process. */
     stop(): void;
     /**
-     * Retrieves the shared handle information for the latest captured frame.
+     * Retrieves the legacy shared handle information for the latest captured frame.
      * @returns The shared handle info if available, otherwise null.
      */
     getSharedHandle(): SharedHandleInfo | null;
+    /**
+     * Retrieves the texture info formulated for Electron's shared-texture.
+     * @returns The shared texture info if available, otherwise null.
+     */
+    getSharedTextureInfo(): SharedTextureImportTextureInfo | null;
 }
 
+/**
+ * Platform-specific handles for shared textures supported by Electron.
+ */
+export interface SharedTextureHandle {
+    /** Windows - NT HANDLE that holds the shared texture. */
+    ntHandle?: Buffer;
+    /** Linux - Structure containing planes of the shared texture. */
+    nativePixmap?: any;
+    /** macOS - IOSurfaceRef that holds the shared texture. */
+    ioSurface?: Buffer;
+}
+
+/**
+ * Information required by Electron to import a shared texture.
+ */
+export interface SharedTextureImportTextureInfo {
+    /** The pixel format of the texture (e.g., 'bgra', 'rgba', 'nv12'). */
+    pixelFormat: string;
+    /** The full dimensions of the shared texture. */
+    codedSize: { width: number; height: number };
+    /** The platform-specific shared texture handle. */
+    handle: SharedTextureHandle;
+}
+
+/**
+ * Interface representing the native addon exports.
+ */
 export interface INativeAddon {
     ScreenCapture: new () => IScreenCapture;
 }
