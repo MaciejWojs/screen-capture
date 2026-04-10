@@ -859,6 +859,7 @@ class X11PlatformCapture final : public BaseWaylandPlatformCapture {
 
     private:
     void CaptureLoop() {
+        std::cerr << "[X11] Uruchamiam proces przechwytywania (CaptureLoop)..." << std::endl;
         Display* display = XOpenDisplay(nullptr);
         if (!display) {
             std::cerr << "[X11] Cannot open display" << std::endl;
@@ -872,6 +873,7 @@ class X11PlatformCapture final : public BaseWaylandPlatformCapture {
         XGetWindowAttributes(display, root, &attr);
         int width = attr.width;
         int height = attr.height;
+        std::cerr << "[X11] Wymiary okna root: " << width << "x" << height << ", depth=" << attr.depth << std::endl;
 
         XShmSegmentInfo shminfo;
         XImage* image = XShmCreateImage(display, attr.visual, attr.depth, ZPixmap, nullptr, &shminfo, width, height);
@@ -931,6 +933,7 @@ class X11PlatformCapture final : public BaseWaylandPlatformCapture {
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
             m_sharedFd.reset(new int(dup(memfd)));
+            std::cerr << "[X11] MemFd utworzony, FD: " << *m_sharedFd << " (size: " << size << ")" << std::endl;
             m_sharedHandle = SharedHandleInfo{
                 static_cast<uint64_t>(*m_sharedFd),
                 static_cast<uint32_t>(width),
@@ -938,14 +941,15 @@ class X11PlatformCapture final : public BaseWaylandPlatformCapture {
                 static_cast<uint32_t>(image->bytes_per_line),
                 0, // offset
                 static_cast<uint64_t>(size), // planeSize
-                SPA_VIDEO_FORMAT_BGRA, // domyślny format wizualizacji X11 dla ZPixmap z głębią 24/32
+                7, // SPA_VIDEO_FORMAT_BGRA domyślny format wizualizacji X11 dla ZPixmap z głębią 24/32
                 0, // modifier
-                1, // Zgodne z SPA_DATA_MemFd
+                1, // Przywrócono typ 1 (MemFd), w 'preload' dodano wsparcie dla type=1
                 static_cast<uint32_t>(size) // chunkSize
             };
             m_frameConsumed = false;
         }
 
+        uint64_t frameCounter = 0;
         // Pętla przechwytywania (ok. 60 FPS)
         while (!m_stopRequested.load()) {
             auto start = std::chrono::steady_clock::now();
@@ -955,6 +959,12 @@ class X11PlatformCapture final : public BaseWaylandPlatformCapture {
 
                 std::unique_lock<std::shared_mutex> lock(m_stateMutex);
                 m_frameConsumed = false;
+                frameCounter++;
+                if (frameCounter % 120 == 0) {
+                    std::cerr << "[X11] Pomyślnie zrzucono klatkę, nr: " << frameCounter << std::endl;
+                }
+            } else {
+                std::cerr << "[X11] Błąd pobierania XShmGetImage!" << std::endl;
             }
 
             auto end = std::chrono::steady_clock::now();
@@ -963,6 +973,7 @@ class X11PlatformCapture final : public BaseWaylandPlatformCapture {
                 std::this_thread::sleep_for(std::chrono::milliseconds(16) - duration);
             }
         }
+        std::cerr << "[X11] Zatrzymywanie pętli CaptureLoop. Sklonowano klatek: " << frameCounter << std::endl;
 
         // Czyszczenie
         munmap(memfd_ptr, size);
