@@ -26,14 +26,35 @@
 
 bool IsWinRTCaptureAvailable() {
 #if HAS_WINRT_CAPTURE
-    HMODULE mod = LoadLibraryW(L"windows.graphics.capture.dll");
-    if (!mod) return false;
+    // Optional safeguard: ensure the core Graphics library is actually present in system
+    HMODULE mod = LoadLibraryW(L"Windows.Graphics.dll");
+    if (!mod) {
+        OutputDebugStringA("[ScreenCapture] WARN: Windows.Graphics.dll not found on the system!\n");
+        return false;
+    }
     FreeLibrary(mod);
 
-    // LoadLibrary succeeds, now we can safely use the API
-    return winrt::Windows::Foundation::Metadata::ApiInformation::IsTypePresent(
-        L"Windows.Graphics.Capture.GraphicsCaptureSession"
-    );
+    try {
+        // C++/WinRT requires COM to be initialized for ApiInformation::IsTypePresent to not throw
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool isInitializedByUs = SUCCEEDED(hr);
+
+        bool isPresent = winrt::Windows::Foundation::Metadata::ApiInformation::IsTypePresent(
+            L"Windows.Graphics.Capture.GraphicsCaptureSession"
+        );
+
+        if (isInitializedByUs) {
+            CoUninitialize();
+        }
+
+        return isPresent;
+    } catch (const winrt::hresult_error& e) {
+        OutputDebugStringA("[ScreenCapture] WARN: WinRT Exception during IsTypePresent check.\n");
+        return false;
+    } catch (...) {
+        OutputDebugStringA("[ScreenCapture] WARN: Unknown C++ exception during IsTypePresent check.\n");
+        return false;
+    }
 #else
     return false;
 #endif
