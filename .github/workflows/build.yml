@@ -2,8 +2,6 @@ name: Build and Publish
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
 
@@ -25,7 +23,7 @@ jobs:
 
       - name: install linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt update && sudo apt install -y build-essential pkg-config libglib2.0-dev libpipewire-0.3-dev libspa-0.2-dev libsystemd-dev
+        run: sudo apt update && sudo apt install -y build-essential pkg-config libx11-dev libxext-dev libglib2.0-dev libpipewire-0.3-dev libspa-0.2-dev libsystemd-dev
 
       - name: Install Dependencies
         run: bun install --frozen-lockfile --ignore-scripts
