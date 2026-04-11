@@ -29,6 +29,13 @@
 #include <future>
 #include <utility>
 #include <unistd.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/mman.h>
+
 #include <fstream>
 
 namespace {
@@ -111,11 +118,45 @@ namespace Config {
     constexpr size_t POD_BUFFER_SIZE_UPDATE = 1024;
 }
 
-class LinuxPlatformCapture final : public IPlatformCapture {
-    public:
-    LinuxPlatformCapture() = default;
+class BaseLinuxPlatformCapture : public IPlatformCapture {
+protected:
+    mutable std::shared_mutex m_stateMutex;
+    std::thread m_worker;
+    std::atomic<bool> m_running{false};
+    std::atomic<bool> m_stopRequested{false};
+    std::mutex m_captureMutex;
+    std::condition_variable m_captureCv;
 
-    ~LinuxPlatformCapture() override {
+    std::optional<SharedHandleInfo> m_sharedHandle;
+    UniqueFd m_sharedFd;
+    mutable std::atomic<bool> m_frameConsumed{false};
+
+public:
+    virtual ~BaseLinuxPlatformCapture() = default;
+
+    std::optional<SharedHandleInfo> GetSharedHandle() const override {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        if (!m_sharedHandle.has_value() || m_frameConsumed || !m_sharedFd || *m_sharedFd < 0) {
+            return std::nullopt;
+        }
+
+        int duplicatedFd = dup(*m_sharedFd);
+        if (duplicatedFd < 0) {
+            return std::nullopt;
+        }
+
+        SharedHandleInfo info = *m_sharedHandle;
+        info.handle = static_cast<uint64_t>(duplicatedFd);
+        m_frameConsumed = true;
+        return info;
+    }
+};
+
+class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
+    public:
+    WaylandPlatformCapture() = default;
+
+    ~WaylandPlatformCapture() override {
         Stop();
     }
 
@@ -124,7 +165,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         if (!m_running.compare_exchange_strong(expected, true)) {
             return;
         }
-        m_worker = std::thread(&LinuxPlatformCapture::RunCaptureFlow, this);
+        m_worker = std::thread(&WaylandPlatformCapture::RunCaptureFlow, this);
     }
 
     void Stop() override {
@@ -153,30 +194,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         m_running.store(false);
     }
 
-    std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        if (!m_sharedHandle.has_value() || m_frameConsumed || !m_sharedFd || *m_sharedFd < 0) {
-            return std::nullopt;
-        }
-
-        int duplicatedFd = dup(*m_sharedFd);
-        if (duplicatedFd < 0) {
-            return std::nullopt;
-        }
-
-        SharedHandleInfo info = *m_sharedHandle;
-        info.handle = static_cast<uint64_t>(duplicatedFd);
-        m_frameConsumed = true;
-        return info;
-    }
-
     private:
-    mutable std::shared_mutex m_stateMutex;
-    std::thread m_worker;
-    std::atomic<bool> m_running{false};
-    std::atomic<bool> m_stopRequested{false};
-    std::mutex m_captureMutex;
-    std::condition_variable m_captureCv;
 
     GMainLoopPtr m_glibLoop;
     GDBusConnectionPtr m_connection;
@@ -185,7 +203,6 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     std::atomic<PortalStage> m_stage{PortalStage::Idle};
 
     std::string m_sessionHandle;
-    std::optional<SharedHandleInfo> m_sharedHandle;
     std::optional<StreamConfig> m_streamConfig;
     std::atomic<uint32_t> m_streamNodeId{PW_ID_ANY};
     uint32_t m_stride = 0;
@@ -194,10 +211,8 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     uint32_t m_bufferType = 0;
     uint32_t m_chunkSize = 0;
     bool m_loggedNonDmabuf = false;
-    mutable std::atomic<bool> m_frameConsumed{false};
 
     std::atomic<int> m_pendingPipewireFd{-1};
-    UniqueFd m_sharedFd;
 
     void RunCaptureFlow() {
         int pipewireFd = -1;
@@ -247,7 +262,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
                 nullptr,
                 nullptr,
                 G_DBUS_SIGNAL_FLAGS_NONE,
-                &LinuxPlatformCapture::OnPortalResponse,
+                &WaylandPlatformCapture::OnPortalResponse,
                 this,
                 nullptr);
 
@@ -566,7 +581,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     }
 
     static void OnStreamParamChanged(void* data, uint32_t id, const spa_pod* param) {
-        auto* self = static_cast<LinuxPlatformCapture*>(data);
+        auto* self = static_cast<WaylandPlatformCapture*>(data);
         if (!param || id != SPA_PARAM_Format) {
             return;
         }
@@ -639,7 +654,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     }
 
     static void OnStreamProcess(void* userdata) {
-        auto* self = static_cast<LinuxPlatformCapture*>(userdata);
+        auto* self = static_cast<WaylandPlatformCapture*>(userdata);
         if (!self->m_streamState.stream) {
             return;
         }
@@ -693,7 +708,7 @@ class LinuxPlatformCapture final : public IPlatformCapture {
         const gchar*,
         GVariant* parameters,
         gpointer userData) {
-        auto* self = static_cast<LinuxPlatformCapture*>(userData);
+        auto* self = static_cast<WaylandPlatformCapture*>(userData);
 
         guint32 responseCode = 1;
         GVariantIter* results = nullptr;
@@ -796,17 +811,190 @@ class LinuxPlatformCapture final : public IPlatformCapture {
     static const pw_stream_events kStreamEvents;
 };
 
-const pw_stream_events LinuxPlatformCapture::kStreamEvents = [] {
+const pw_stream_events WaylandPlatformCapture::kStreamEvents = [] {
     pw_stream_events events{};
     events.version = PW_VERSION_STREAM_EVENTS;
-    events.state_changed = LinuxPlatformCapture::OnStreamStateChanged;
-    events.param_changed = LinuxPlatformCapture::OnStreamParamChanged;
-    events.process = LinuxPlatformCapture::OnStreamProcess;
+    events.state_changed = WaylandPlatformCapture::OnStreamStateChanged;
+    events.param_changed = WaylandPlatformCapture::OnStreamParamChanged;
+    events.process = WaylandPlatformCapture::OnStreamProcess;
     return events;
 }();
 
+
+class X11PlatformCapture final : public BaseLinuxPlatformCapture {
+    public:
+    X11PlatformCapture() = default;
+
+    ~X11PlatformCapture() override {
+        Stop();
+    }
+
+    void Start(Napi::Env) override {
+        bool expected = false;
+        if (!m_running.compare_exchange_strong(expected, true)) {
+            return;
+        }
+        m_worker = std::thread(&X11PlatformCapture::CaptureLoop, this);
+    }
+
+    void Stop() override {
+        m_stopRequested.store(true);
+        m_captureCv.notify_all();
+
+        if (m_worker.joinable() && std::this_thread::get_id() != m_worker.get_id()) {
+            m_worker.join();
+        }
+        m_running.store(false);
+    }
+
+    private:
+    void CaptureLoop() {
+        std::cerr << "[X11] Uruchamiam proces przechwytywania (CaptureLoop)..." << std::endl;
+        Display* display = XOpenDisplay(nullptr);
+        if (!display) {
+            std::cerr << "[X11] Cannot open display" << std::endl;
+            return;
+        }
+
+        int screen = DefaultScreen(display);
+        Window root = RootWindow(display, screen);
+
+        XWindowAttributes attr;
+        XGetWindowAttributes(display, root, &attr);
+        int width = attr.width;
+        int height = attr.height;
+        std::cerr << "[X11] Wymiary okna root: " << width << "x" << height << ", depth=" << attr.depth << std::endl;
+
+        XShmSegmentInfo shminfo;
+        XImage* image = XShmCreateImage(display, attr.visual, attr.depth, ZPixmap, nullptr, &shminfo, width, height);
+        if (!image) {
+            std::cerr << "[X11] Cannot create XShmImage" << std::endl;
+            XCloseDisplay(display);
+            return;
+        }
+
+        shminfo.shmid = shmget(IPC_PRIVATE, image->bytes_per_line * image->height, IPC_CREAT | 0600);
+        shminfo.shmaddr = image->data = (char*)shmat(shminfo.shmid, 0, 0);
+        shminfo.readOnly = False;
+
+        if (!XShmAttach(display, &shminfo)) {
+            std::cerr << "[X11] XShmAttach failed" << std::endl;
+            XDestroyImage(image);
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XCloseDisplay(display);
+            return;
+        }
+
+        int memfd = memfd_create("x11_capture", MFD_CLOEXEC);
+        if (memfd < 0) {
+            std::cerr << "[X11] memfd_create failed" << std::endl;
+            XShmDetach(display, &shminfo);
+            XDestroyImage(image);
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XCloseDisplay(display);
+            return;
+        }
+
+        size_t size = image->bytes_per_line * image->height;
+        if (ftruncate(memfd, size) < 0) {
+            std::cerr << "[X11] ftruncate failed" << std::endl;
+            close(memfd);
+            XShmDetach(display, &shminfo);
+            XDestroyImage(image);
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XCloseDisplay(display);
+            return;
+        }
+
+        void* memfd_ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+        if (memfd_ptr == MAP_FAILED) {
+            close(memfd);
+            XShmDetach(display, &shminfo);
+            XDestroyImage(image);
+            shmdt(shminfo.shmaddr);
+            shmctl(shminfo.shmid, IPC_RMID, 0);
+            XCloseDisplay(display);
+            return;
+        }
+
+        {
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+            m_sharedFd.reset(new int(dup(memfd)));
+            std::cerr << "[X11] MemFd utworzony, FD: " << *m_sharedFd << " (size: " << size << ")" << std::endl;
+            m_sharedHandle = SharedHandleInfo{
+                static_cast<uint64_t>(*m_sharedFd),
+                static_cast<uint32_t>(width),
+                static_cast<uint32_t>(height),
+                static_cast<uint32_t>(image->bytes_per_line),
+                0, // offset
+                static_cast<uint64_t>(size), // planeSize
+                7, // SPA_VIDEO_FORMAT_BGRA domyślny format wizualizacji X11 dla ZPixmap z głębią 24/32
+                0, // modifier
+                1, // Przywrócono typ 1 (MemFd), w 'preload' dodano wsparcie dla type=1
+                static_cast<uint32_t>(size) // chunkSize
+            };
+            m_frameConsumed = false;
+        }
+
+        uint64_t frameCounter = 0;
+        // Pętla przechwytywania (ok. 60 FPS)
+        while (!m_stopRequested.load()) {
+            auto start = std::chrono::steady_clock::now();
+
+            if (XShmGetImage(display, root, image, 0, 0, AllPlanes)) {
+                memcpy(memfd_ptr, image->data, size);
+
+                std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                m_frameConsumed = false;
+                frameCounter++;
+                if (frameCounter % 120 == 0) {
+                    std::cerr << "[X11] Pomyślnie zrzucono klatkę, nr: " << frameCounter << std::endl;
+                }
+            } else {
+                std::cerr << "[X11] Błąd pobierania XShmGetImage!" << std::endl;
+            }
+
+            auto end = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+            if (duration.count() < 16) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(16) - duration);
+            }
+        }
+        std::cerr << "[X11] Zatrzymywanie pętli CaptureLoop. Sklonowano klatek: " << frameCounter << std::endl;
+
+        // Czyszczenie
+        munmap(memfd_ptr, size);
+        close(memfd);
+        XShmDetach(display, &shminfo);
+        XDestroyImage(image);
+        shmdt(shminfo.shmaddr);
+        shmctl(shminfo.shmid, IPC_RMID, 0);
+        XCloseDisplay(display);
+    }
+};
+
+bool IsWayland() {
+    const char* waylandDisplay = std::getenv("WAYLAND_DISPLAY");
+    if (waylandDisplay && waylandDisplay[0] != '\0') return true;
+    
+    const char* sessionType = std::getenv("XDG_SESSION_TYPE");
+    if (sessionType && std::string(sessionType) == "wayland") return true;
+    
+    return false;
+}
+
 std::unique_ptr<IPlatformCapture> CreatePlatformCapture() {
-    return std::make_unique<LinuxPlatformCapture>();
+    if (IsWayland()) {
+        std::cout << "[Capture] Wykryto środowisko Wayland." << std::endl;
+        return std::make_unique<WaylandPlatformCapture>();
+    } else {
+        std::cout << "[Capture] Wykryto środowisko X11." << std::endl;
+        return std::make_unique<X11PlatformCapture>();
+    }
 }
 
 #endif
+
