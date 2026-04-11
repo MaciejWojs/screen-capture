@@ -118,24 +118,24 @@ namespace Config {
     constexpr size_t POD_BUFFER_SIZE_UPDATE = 1024;
 }
 
-class BaseWaylandPlatformCapture : public IPlatformCapture {
+class BaseLinuxPlatformCapture : public IPlatformCapture {
 protected:
     mutable std::shared_mutex m_stateMutex;
     std::thread m_worker;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopRequested{false};
-    mutable std::atomic<bool> m_frameConsumed{false};
     std::mutex m_captureMutex;
     std::condition_variable m_captureCv;
 
     std::optional<SharedHandleInfo> m_sharedHandle;
     UniqueFd m_sharedFd;
+    mutable std::atomic<bool> m_frameConsumed{false};
 
 public:
-    virtual ~BaseWaylandPlatformCapture() = default;
+    virtual ~BaseLinuxPlatformCapture() = default;
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         if (!m_sharedHandle.has_value() || m_frameConsumed || !m_sharedFd || *m_sharedFd < 0) {
             return std::nullopt;
         }
@@ -152,7 +152,7 @@ public:
     }
 };
 
-class WaylandPlatformCapture final : public BaseWaylandPlatformCapture {
+class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     public:
     WaylandPlatformCapture() = default;
 
@@ -194,9 +194,8 @@ class WaylandPlatformCapture final : public BaseWaylandPlatformCapture {
         m_running.store(false);
     }
 
-
-
     private:
+
     GMainLoopPtr m_glibLoop;
     GDBusConnectionPtr m_connection;
 
@@ -204,7 +203,6 @@ class WaylandPlatformCapture final : public BaseWaylandPlatformCapture {
     std::atomic<PortalStage> m_stage{PortalStage::Idle};
 
     std::string m_sessionHandle;
-    std::optional<SharedHandleInfo> m_sharedHandle;
     std::optional<StreamConfig> m_streamConfig;
     std::atomic<uint32_t> m_streamNodeId{PW_ID_ANY};
     uint32_t m_stride = 0;
@@ -213,10 +211,8 @@ class WaylandPlatformCapture final : public BaseWaylandPlatformCapture {
     uint32_t m_bufferType = 0;
     uint32_t m_chunkSize = 0;
     bool m_loggedNonDmabuf = false;
-    mutable std::atomic<bool> m_frameConsumed{false};
 
     std::atomic<int> m_pendingPipewireFd{-1};
-    UniqueFd m_sharedFd;
 
     void RunCaptureFlow() {
         int pipewireFd = -1;
@@ -825,13 +821,7 @@ const pw_stream_events WaylandPlatformCapture::kStreamEvents = [] {
 }();
 
 
-
-// ==========================================
-// Implementacja dla środowiska X11
-// Wymagane zależności: libX11, libXext, libXfixes
-// W binding.gyp należy dodać `x11` i `xext` w sekcji cflags_cc oraz libraries
-// ==========================================
-class X11PlatformCapture final : public BaseWaylandPlatformCapture {
+class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     public:
     X11PlatformCapture() = default;
 
@@ -1007,3 +997,4 @@ std::unique_ptr<IPlatformCapture> CreatePlatformCapture() {
 }
 
 #endif
+
