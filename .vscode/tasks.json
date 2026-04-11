@@ -1,0 +1,89 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cleanup",
+            "type": "shell",
+            "linux": {
+                "command": "rm -rf build dist maciejwojs-input-bridge-*.tgz"
+            },
+            "windows": {
+                "command": "rmdir /s /q build dist && del maciejwojs-input-bridge-*.tgz"
+            },
+            "presentation": {
+                "reveal": "silent",
+                "clear": true,
+                "close": true
+            },
+            "group": "build"
+        },
+        
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "bun run build",
+            "problemMatcher": ["$tsc"],
+            "group": "build",
+            "presentation": {
+                "reveal": "silent",
+                "focus": false,
+                "panel": "dedicated",
+                "clear": false,
+                "close": true
+            }
+        },
+        {
+            "label": "rebuild",
+            "type": "shell",
+            "command": "bun rebuild",
+            "group": "build"
+        },
+        {
+            "label": "prebuild",
+            "type": "shell",
+            "command": "bun prebuildify",
+            "group": "build"
+        },
+        {
+            "label": "prepare",
+            "dependsOn": ["cleanup", "make addon and compile types"],
+            "dependsOrder": "sequence",
+            "hide": true,
+            "group": "build"
+        },
+        {
+            "label": "make addon and compile types",
+            "dependsOn": ["build", "rebuild"],
+            "dependsOrder": "parallel",
+            "hide": true,
+            "group": "build"
+        },
+        {
+            "label": "pack",
+            "type": "shell",
+            "command": "bun pm pack",
+            "dependsOn": ["prepare", "prebuild"],
+            "dependsOrder": "sequence",
+            "presentation": {
+                "reveal": "always",
+                "clear": true
+            },
+            "group": "build"
+        },
+        {
+            "label": "playground",
+            "type": "shell",
+            "command": "cp ${workspaceFolder}/build/Release/input_bridge_addon.node ${workspaceFolder}/playground && bun run playground",
+            "dependsOn": ["prepare"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "clear": true,
+                "focus": true,
+            },
+            "group": "build"
+        }
+    ]
+}
