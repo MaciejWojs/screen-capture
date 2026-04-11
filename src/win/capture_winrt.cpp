@@ -1,6 +1,7 @@
 #ifdef _WIN32
+#include "win_capture_internal.hpp"
 
-#include "../platform_capture.hpp"
+#if HAS_WINRT_CAPTURE
 
 #include <atomic>
 #include <stdexcept>
@@ -10,8 +11,11 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <wrl/client.h>
+
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
@@ -34,7 +38,7 @@ inline IDirect3DDevice CreateDirect3DDevice(IDXGIDevice* dxgiDevice) {
 }
 
 class WinPlatformCapture final : public IPlatformCapture {
-public:
+    public:
     WinPlatformCapture() = default;
 
     ~WinPlatformCapture() override {
@@ -51,6 +55,14 @@ public:
         if (m_isRunning) return;
 
         m_env = env;
+
+        // Logging to JS console (Electron/Node.js)
+        try {
+            auto console = env.Global().Get("console").As<Napi::Object>();
+            auto log = console.Get("log").As<Napi::Function>();
+            log.Call(console, { Napi::String::New(env, "[ScreenCapture] INFO: Screen capture started via WinRT Graphics Capture") });
+        } catch (...) {}
+
         napi_add_env_cleanup_hook(m_env, CleanupHook, this);
 
         m_isRunning = true;
@@ -96,7 +108,7 @@ public:
             } catch (...) {
                 OutputDebugStringA("Capture thread error");
             }
-        });
+            });
     }
 
     void Stop() override {
@@ -114,7 +126,7 @@ public:
         return info;
     }
 
-private:
+    private:
     napi_env m_env{ nullptr };
     std::thread m_captureThread;
     std::atomic<bool> m_isRunning{ false };
@@ -270,8 +282,15 @@ private:
     }
 };
 
-std::unique_ptr<IPlatformCapture> CreatePlatformCapture() {
+std::unique_ptr<IPlatformCapture> CreateWinRTCapture() {
     return std::make_unique<WinPlatformCapture>();
 }
 
-#endif
+#else
+
+std::unique_ptr<IPlatformCapture> CreateWinRTCapture() {
+    return nullptr;
+}
+
+#endif // HAS_WINRT_CAPTURE
+#endif // _WIN32

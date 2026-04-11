@@ -8,6 +8,23 @@ Native Node.js addon for screen capture. Packages are published to NPM with prov
 - Linux backend is implemented with `xdg-desktop-portal` (D-Bus) and PipeWire stream, supporting modern desktop environments (Wayland/X11).
 - Runtime loading uses `node-gyp-build`, so local build and `prebuilds/` binaries are both supported.
 
+## Usage
+
+```javascript
+import { ScreenCapture } from '@maciejwojs/screen-capture';
+
+const capture = new ScreenCapture();
+capture.start();
+
+// Get texture structure formatted for Electron's shared-texture API:
+const textureInfo = capture.getSharedTextureInfo();
+
+// Or get the raw handle data (legacy):
+const rawHandle = capture.getSharedHandle();
+
+capture.stop();
+```
+
 ## Install
 
 ```bash
@@ -53,6 +70,7 @@ Practical architecture:
 - Keep per-platform backend in separate `.cpp` files and select in `binding.gyp` conditions.
 - Current split is:
 	- `src/addon.cpp` - shared N-API wrapper
+	- `src/serialize.cpp` - N-API data serialization logic for Electron and raw handles
 	- `src/win/platform_capture_win.cpp` - Windows backend
 	- `src/linux/platform_capture_linux.cpp` - Linux backend entry point
 	- `src/platform_capture_stub.cpp` - fallback for other systems

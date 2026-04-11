@@ -2,8 +2,12 @@
   "targets": [
     {
       "target_name": "screen_capture_addon",
+      "variables": {
+        "force_api%": "<!(node -p \"process.env.force_api || 'auto'\")"
+      },
       "sources": [
-        "src/addon.cpp"
+        "src/addon.cpp",
+        "src/serialize.cpp"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"
@@ -12,16 +16,31 @@
         "<!(node -p \"require('node-addon-api').gyp\")"
       ],
       "defines": [
-        "NAPI_DISABLE_CPP_EXCEPTIONS"
+        "NAPI_DISABLE_CPP_EXCEPTIONS",
+        "GYP_FORCE_API=\"<(force_api)\""
       ],
       "cflags_cc": [
         "-std=c++20",
         "-fexceptions"
       ],
-      "conditions": [
+
+    "conditions": [
+        ["force_api=='winrt'", {
+          "defines": ["FORCE_API_WINRT"]
+        }],
+        ["force_api=='dxgi'", {
+          "defines": ["FORCE_API_DXGI"]
+        }],
+        ["force_api=='gdi'", {
+          "defines": ["FORCE_API_GDI"]
+        }],
+
         ["OS=='win'", {
           "sources": [
-            "src/win/platform_capture_win.cpp"
+            "src/win/capture_winrt.cpp",
+            "src/win/capture_dxgi.cpp",
+            "src/win/capture_gdi.cpp",
+            "src/win/capture_factory.cpp"
           ],
           "msvs_settings": {
             "VCCLCompilerTool": {
