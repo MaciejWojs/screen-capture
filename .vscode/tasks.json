@@ -5,10 +5,10 @@
             "label": "cleanup",
             "type": "shell",
             "linux": {
-                "command": "rm -rf build dist maciejwojs-input-bridge-*.tgz"
+                "command": "rm -rf build dist maciejwojs-screen-capture-*.tgz prebuilds/"
             },
             "windows": {
-                "command": "rmdir /s /q build dist && del maciejwojs-input-bridge-*.tgz"
+                "command": "rmdir /s /q build dist prebuilds/ && del maciejwojs-screen-capture-*.tgz"
             },
             "presentation": {
                 "reveal": "silent",
