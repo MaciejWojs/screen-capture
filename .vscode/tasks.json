@@ -4,26 +4,41 @@
         {
             "label": "cleanup",
             "type": "shell",
+            "detail": "Removes build artifacts and prebuilds. Also removes the packed tarball if it exists.",
             "linux": {
-                "command": "rm -rf build dist maciejwojs-screen-capture-*.tgz prebuilds/"
+                "command": "rm -rf build dist prebuilds maciejwojs-screen-capture-*.tgz playground/input_bridge_addon.node",
             },
             "windows": {
-                "command": "rmdir /s /q build dist prebuilds/ && del maciejwojs-screen-capture-*.tgz"
+                "command": "powershell",
+                "args": [
+                    "-NoProfile",
+                    "-Command",
+                    "Remove-Item -Recurse -Force build,dist,prebuilds,playground/input_bridge_addon.node,maciejwojs-screen-capture-*.tgz -ErrorAction SilentlyContinue"
+                ]
             },
             "presentation": {
                 "reveal": "silent",
                 "clear": true,
                 "close": true
             },
-            "group": "build"
+            "group": "build",
+            "icon": {
+                "id": "trashcan",
+                "color": "terminal.ansiRed"
+            }
         },
-        
         {
             "label": "build",
+            "detail": "Compiles TypeScript types. Does not build the native addon.",
             "type": "shell",
             "command": "bun run build",
-            "problemMatcher": ["$tsc"],
+            "problemMatcher": [
+                "$tsc"
+            ],
             "group": "build",
+            "icon": {
+                "id": "gear"
+            },
             "presentation": {
                 "reveal": "silent",
                 "focus": false,
@@ -34,54 +49,83 @@
         },
         {
             "label": "rebuild",
+            "detail": "Rebuilds the native addon.",
             "type": "shell",
             "command": "bun rebuild",
-            "group": "build"
+            "group": "build",
+            "icon": {
+                "id": "refresh"
+            }
         },
         {
             "label": "prebuild",
+            "detail": "Creates prebuilt binaries for the native addon.",
             "type": "shell",
             "command": "bun prebuildify",
-            "group": "build"
+            "group": "build",
+            "icon": {
+                "id": "cloud-upload"
+            }
         },
         {
             "label": "prepare",
-            "dependsOn": ["cleanup", "make addon and compile types"],
+            "detail": "Prepares the environment for building. (cleanup+build+rebuild)",
+            "dependsOn": [
+                "cleanup",
+                "make addon and compile types"
+            ],
             "dependsOrder": "sequence",
             "hide": true,
             "group": "build"
         },
         {
             "label": "make addon and compile types",
-            "dependsOn": ["build", "rebuild"],
+            "detail": "Builds the native addon and compiles TypeScript types.",
+            "dependsOn": [
+                "build",
+                "rebuild"
+            ],
             "dependsOrder": "parallel",
             "hide": true,
             "group": "build"
         },
         {
             "label": "pack",
+            "detail": "Packs the module into a tarball using bun. Depends on prepare and prebuild to ensure everything is up to date.",
             "type": "shell",
             "command": "bun pm pack",
-            "dependsOn": ["prepare", "prebuild"],
+            "dependsOn": [
+                "prepare",
+                "prebuild"
+            ],
             "dependsOrder": "sequence",
             "presentation": {
                 "reveal": "always",
                 "clear": true
             },
+            "icon": {
+                "id": "package"
+            },
             "group": "build"
         },
         {
             "label": "playground",
+            "detail": "Runs the playground script. Depends on prepare to ensure the addon is built and ready.",
             "type": "shell",
             "command": "cp ${workspaceFolder}/build/Release/input_bridge_addon.node ${workspaceFolder}/playground && bun run playground",
-            "dependsOn": ["prepare"],
+            "dependsOn": [
+                "prepare"
+            ],
             "options": {
                 "cwd": "${workspaceFolder}"
             },
             "presentation": {
                 "reveal": "always",
                 "clear": true,
-                "focus": true,
+                "focus": true
+            },
+            "icon": {
+                "id": "play"
             },
             "group": "build"
         }
