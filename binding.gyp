@@ -61,10 +61,10 @@
             "src/linux/platform_capture_linux.cpp"
           ],
           "cflags_cc": [
-            "<!@(pkg-config --cflags gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3)"
+            "<!@(pkg-config --cflags gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3 x11 xext)"
           ],
           "libraries": [
-            "<!@(pkg-config --libs gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3)"
+            "<!@(pkg-config --libs gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3 x11 xext)"
           ]
         }],
         ["OS!='win' and OS!='linux'", {
