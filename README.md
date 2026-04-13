@@ -67,16 +67,21 @@ Practical architecture:
 
 - Keep one JS API (`ScreenCapture`) for all OSes.
 - Keep one addon target in `binding.gyp`.
-- Keep per-platform backend in separate `.cpp` files and select in `binding.gyp` conditions.
+- Keep per-platform backend in separate `.cpp` files and select them with `binding.gyp` conditions.
 - Current split is:
-	- `src/addon.cpp` - shared N-API wrapper
-	- `src/serialize.cpp` - N-API data serialization logic for Electron and raw handles
-	- `src/win/platform_capture_win.cpp` - Windows backend
-	- `src/linux/platform_capture_linux.cpp` - Linux backend entry point
-	- `src/platform_capture_stub.cpp` - fallback for other systems
-	- `src/platform_capture.hpp` - common backend interface
-- For unsupported combinations, return a clear runtime error (already done).
+	- `lib/index.ts` - JavaScript export entry point, compiled to `dist/index.js`
+	- `src/addon.cpp` - shared N-API wrapper and native binding glue
+	- `src/serialize.cpp` - N-API serialization for Electron shared textures and raw handles
+	- `src/win/capture_winrt.cpp` - Windows WinRT capture backend
+	- `src/win/capture_dxgi.cpp` - Windows DXGI capture backend
+	- `src/win/capture_gdi.cpp` - Windows GDI capture backend
+	- `src/win/capture_factory.cpp` - Windows backend selection and helper logic
+	- `src/linux/platform_capture_linux.cpp` - Linux portal / PipeWire implementation
+	- `src/platform_capture_stub.cpp` - compile-time fallback for unsupported systems
+	- `src/platform_capture.hpp` - common backend interface and shared definitions
+- `binding.gyp` also supports `force_api` build flags (`winrt`, `dxgi`, `gdi`) for Windows variants.
+- For unsupported combinations, the stub backend returns a clear runtime error.
 
-To add next platform, create next backend file (for example `src/macos/platform_capture_macos.cpp`) and add it in matching `binding.gyp` condition branch.
+To add a new platform, implement the backend in a new source file (for example `src/macos/platform_capture_macos.cpp`) and add it to the matching `binding.gyp` condition branch.
 
-This gives you one npm package with many prebuilt binaries and no user-side compile step.
+This keeps one npm package with both local build support and published `prebuilds/` binaries, without requiring users to compile manually.
