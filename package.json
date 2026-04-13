@@ -24,7 +24,9 @@
     "dist",
     "binding.gyp",
     "src",
-    "prebuilds"
+    "prebuilds",
+    "README.md",
+    "CHANGELOG.md"
   ],
   "module": "dist/index.js",
   "type": "module",
@@ -38,6 +40,8 @@
   "scripts": {
     "build": "bun x tsc",
     "prepublishOnly": "bun run build",
+    "version": " bun x conventional-changelog",
+    "postversion": "git add CHANGELOG.md && git commit --amend --no-edit",
     "rebuild": "node-gyp rebuild",
     "prebuildify": "bun run build && bun x prebuildify --napi --strip --electron-compat --node-gyp node-gyp",
     "prebuildify:winrt": "bun run build && cross-env force_api=winrt bun x prebuildify --napi --strip --electron-compat --node-gyp node-gyp",
