@@ -96,6 +96,11 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     uint32_t m_width = 0;
     uint32_t m_height = 0;
 
+    // FPS counter
+    std::atomic<uint64_t> m_frameCount{ 0 };
+    std::atomic<int> m_lastFps{ 0 };
+    std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
+
     bool InitializeDirect3D() {
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
         HRESULT hr = D3D11CreateDevice(
@@ -187,6 +192,8 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return true;
         }
 
+        m_frameCount++;
+
         Microsoft::WRL::ComPtr<ID3D11Texture2D> desktopTexture;
         if (SUCCEEDED(desktopResource.As(&desktopTexture))) {
             // We copy texture obtained from Desktop Duplication directly to our SharedTexture on hardware side
@@ -195,7 +202,22 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         }
 
         m_duplication->ReleaseFrame();
+
+        // FPS calculation
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
+        if (elapsed >= 1) {
+            uint64_t frames = m_frameCount.exchange(0);
+            m_lastFps = static_cast<int>(frames / elapsed);
+            m_lastFpsTime = now;
+        }
+
         return true;
+    }
+
+    public:
+    int GetFps() const override {
+        return m_lastFps.load();
     }
 };
 
