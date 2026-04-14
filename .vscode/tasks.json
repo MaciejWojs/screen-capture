@@ -13,7 +13,7 @@
                 "args": [
                     "-NoProfile",
                     "-Command",
-                    "Remove-Item -Recurse -Force build,dist,prebuilds,playground/input_bridge_addon.node,maciejwojs-screen-capture-*.tgz -ErrorAction SilentlyContinue"
+                    "Remove-Item -Recurse -Force build,dist,prebuilds -ErrorAction SilentlyContinue; Remove-Item -Force playground/input_bridge_addon.node -ErrorAction SilentlyContinue; Get-ChildItem -Path . -Filter 'maciejwojs-screen-capture-*.tgz' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue"
                 ]
             },
             "presentation": {
