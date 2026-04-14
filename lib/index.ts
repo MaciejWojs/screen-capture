@@ -49,6 +49,10 @@ export interface IScreenCapture {
      * @returns The shared texture info if available, otherwise null.
      */
     getSharedTextureInfo(): SharedTextureImportTextureInfo | null;
+    /**
+     * Returns the current frames per second (FPS) or -1 if not implemented.
+     */
+    getFps(): number;
 }
 
 /**

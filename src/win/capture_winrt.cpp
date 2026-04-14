@@ -149,6 +149,11 @@ class WinPlatformCapture final : public IPlatformCapture {
     uint32_t m_width = 0;
     uint32_t m_height = 0;
 
+    // FPS counter
+    std::atomic<uint64_t> m_frameCount{ 0 };
+    std::atomic<int> m_lastFps{ 0 };
+    std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
+
     void InitializeD3D() {
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         check_hresult(D3D11CreateDevice(
@@ -236,6 +241,7 @@ class WinPlatformCapture final : public IPlatformCapture {
 
     void OnFrame(Direct3D11CaptureFramePool const& sender,
         winrt::Windows::Foundation::IInspectable const&) {
+        m_frameCount++;
         try {
             auto frame = sender.TryGetNextFrame();
             if (!frame) return;
@@ -274,11 +280,26 @@ class WinPlatformCapture final : public IPlatformCapture {
                     m_sharedTex = srcTex;
                 }
             }
+
+            // FPS calculation
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
+            if (elapsed >= 1) {
+                uint64_t frames = m_frameCount.exchange(0);
+                m_lastFps = static_cast<int>(frames / elapsed);
+                m_lastFpsTime = now;
+            }
+
         } catch (const std::exception& e) {
             OutputDebugStringA(e.what());
         } catch (...) {
             OutputDebugStringA("Unknown error in OnFrame");
         }
+    }
+
+    public:
+    int GetFps() const override {
+        return m_lastFps.load();
     }
 };
 

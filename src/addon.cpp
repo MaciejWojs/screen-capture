@@ -9,11 +9,13 @@
 class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     public:
     static Napi::Object Init(Napi::Env env, Napi::Object exports) {
+
         Napi::Function func = DefineClass(env, "ScreenCapture", {
             InstanceMethod("start", &ScreenCapture::Start),
             InstanceMethod("stop", &ScreenCapture::Stop),
             InstanceMethod("getSharedHandle", &ScreenCapture::GetSharedHandleLegacy),
-            InstanceMethod("getSharedTextureInfo", &ScreenCapture::GetSharedTextureInfo)
+            InstanceMethod("getSharedTextureInfo", &ScreenCapture::GetSharedTextureInfo),
+            InstanceMethod("getFps", &ScreenCapture::GetFps)
             });
 
         auto* constructor = new Napi::FunctionReference();
@@ -31,6 +33,14 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
 
     private:
     std::unique_ptr<IPlatformCapture> m_backend;
+
+    Napi::Value GetFps(const Napi::CallbackInfo& info) {
+        int fps = -1;
+        if (m_backend) {
+            fps = m_backend->GetFps();
+        }
+        return Napi::Number::New(info.Env(), fps);
+    }
 
     Napi::Value Start(const Napi::CallbackInfo& info) {
         try {
