@@ -18,13 +18,16 @@ struct SharedHandleInfo {
     uint32_t chunkSize = 0;
 };
 
+
 class IPlatformCapture {
-    public:
+public:
     virtual ~IPlatformCapture() = default;
 
     virtual void Start(Napi::Env env) = 0;
     virtual void Stop() = 0;
     virtual std::optional<SharedHandleInfo> GetSharedHandle() const = 0;
+    // Returns FPS or -1 if not implemented
+    virtual int GetFps() const { return -1; }
 };
 
 std::unique_ptr<IPlatformCapture> CreatePlatformCapture();
