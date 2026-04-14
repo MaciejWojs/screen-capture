@@ -91,6 +91,11 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     uint32_t m_height = 0;
     std::vector<uint8_t> m_pixels;
 
+    // FPS counter
+    std::atomic<uint64_t> m_frameCount{ 0 };
+    std::atomic<int> m_lastFps{ 0 };
+    std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
+
     void InitializeDirect3D() {
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
         HRESULT hr = D3D11CreateDevice(
@@ -144,6 +149,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     }
 
     void CaptureScreenGDI() {
+        m_frameCount++;
         if (!m_stagingTex || !m_sharedTex) return;
 
         HDC hScreenDC = GetDC(nullptr);
@@ -185,6 +191,20 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         DeleteObject(hBitmap);
         DeleteDC(hMemoryDC);
         ReleaseDC(nullptr, hScreenDC);
+
+        // FPS calculation
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
+        if (elapsed >= 1) {
+            uint64_t frames = m_frameCount.exchange(0);
+            m_lastFps = static_cast<int>(frames / elapsed);
+            m_lastFpsTime = now;
+        }
+    }
+
+    public:
+    int GetFps() const override {
+        return m_lastFps.load();
     }
 };
 
