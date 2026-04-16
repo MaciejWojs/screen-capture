@@ -1,6 +1,7 @@
 #ifdef __linux__
 
 #include "../platform_capture.hpp"
+#include "../pixel_conversion.hpp"
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
@@ -12,8 +13,10 @@
 #include <spa/pod/builder.h>
 #include <spa/utils/result.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -253,7 +256,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_running.store(false);
     }
 
-    std::optional<std::vector<uint8_t>> GetPixelData() const override;
+    std::optional<std::vector<uint8_t>> GetPixelData(const std::string& desiredFormat = "rgba") const override;
     int GetWidth() const override {
         std::shared_lock<std::shared_mutex> lock(m_stateMutex);
         return m_streamConfig ? static_cast<int>(m_streamConfig->width) : 0;
@@ -1156,7 +1159,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     }
 };
 
-std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData() const {
+std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const std::string& desiredFormat) const {
     std::unique_lock<std::shared_mutex> lock(m_stateMutex);
     if (!m_sharedFd || *m_sharedFd < 0 || m_frameConsumed || !m_streamConfig) {
         return std::nullopt;
@@ -1182,8 +1185,24 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData() const
     memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(m_offset), dataSize);
     munmap(mapped, mapSize);
 
+    std::string format = desiredFormat;
+    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+        });
+
+    uint32_t stride = m_stride ? m_stride : static_cast<uint32_t>(m_streamConfig->width * 4);
+    std::vector<uint8_t> result = ConvertPixelBuffer(
+        buffer.data(),
+        buffer.size(),
+        static_cast<uint32_t>(m_streamConfig->width),
+        static_cast<uint32_t>(m_streamConfig->height),
+        stride,
+        m_streamConfig->pixelFormat,
+        format
+    );
+
     m_frameConsumed = true;
-    return buffer;
+    return result;
 }
 
 bool IsWayland() {

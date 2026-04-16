@@ -36,6 +36,10 @@ export interface SharedHandleInfo {
  */
 export type Backend = "winrt" | "dxgi" | "gdi" | "wayland" | "x11" | "stub" | "unknown";
 
+
+/** The format of the pixel data to retrieve. */
+export type PixelDataFormat = "rgba" | "bgra" | "rgbx" | "bgrx" | "xrgb" | "xbgr";
+
 export interface IScreenCapture {
     /** Starts the screen capture process. */
     start(): void;
@@ -48,10 +52,11 @@ export interface IScreenCapture {
     getSharedHandle(): SharedHandleInfo | null;
     /**
      * Retrieves raw pixel data for the latest captured frame.
-     * For MemFd frames this performs a CPU copy; for DMA-BUF it can also read the mapped pixels.
+     * The returned pixel buffer is normalized to RGBA by default.
+     * @param format Optional target color layout, e.g. 'rgba' or 'bgra'.
      * @returns A Buffer containing pixel bytes, or null if unavailable.
      */
-    getPixelData(): Buffer | null;
+    getPixelData(format?: PixelDataFormat): Buffer | null;
     /**
      * Returns the backend identifier used for the current capture implementation.
      */

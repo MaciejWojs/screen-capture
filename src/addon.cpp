@@ -1,5 +1,7 @@
 #include <napi.h>
 
+#include <algorithm>
+#include <cctype>
 #include <exception>
 #include <memory>
 #include <string>
@@ -74,7 +76,15 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     }
 
     Napi::Value GetPixelData(const Napi::CallbackInfo& info) {
-        auto pixels = m_backend->GetPixelData();
+        std::string desiredFormat = "rgba";
+        if (info.Length() > 0 && info[0].IsString()) {
+            desiredFormat = info[0].As<Napi::String>().Utf8Value();
+            std::transform(desiredFormat.begin(), desiredFormat.end(), desiredFormat.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+        }
+
+        auto pixels = m_backend->GetPixelData(desiredFormat);
         return SerializePixelData(info.Env(), pixels);
     }
 

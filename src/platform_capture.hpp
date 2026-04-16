@@ -28,7 +28,7 @@ class IPlatformCapture {
     virtual void Start(Napi::Env env) = 0;
     virtual void Stop() = 0;
     virtual std::optional<SharedHandleInfo> GetSharedHandle() const = 0;
-    virtual std::optional<std::vector<uint8_t>> GetPixelData() const { return std::nullopt; }
+    virtual std::optional<std::vector<uint8_t>> GetPixelData(const std::string& desiredFormat = "rgba") const { return std::nullopt; }
     virtual int GetWidth() const { return 0; }
     virtual int GetHeight() const { return 0; }
     virtual int GetStride() const { return 0; }
