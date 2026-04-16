@@ -231,6 +231,49 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_running.store(false);
     }
 
+    std::optional<std::vector<uint8_t>> GetPixelData() const override;
+    int GetWidth() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_streamConfig ? static_cast<int>(m_streamConfig->width) : 0;
+    }
+    int GetHeight() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_streamConfig ? static_cast<int>(m_streamConfig->height) : 0;
+    }
+    int GetStride() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return static_cast<int>(m_stride);
+    }
+    uint32_t GetPixelFormat() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_streamConfig ? m_streamConfig->pixelFormat : 0;
+    }
+
+    std::optional<SharedHandleInfo> GetSharedHandle() const override {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        if (!m_sharedHandle.has_value() || m_frameConsumed || !m_sharedFd || *m_sharedFd < 0) {
+            return std::nullopt;
+        }
+
+        if (m_bufferType == SPA_DATA_MemFd) {
+            return std::nullopt;
+        }
+
+        int duplicatedFd = dup(*m_sharedFd);
+        if (duplicatedFd < 0) {
+            return std::nullopt;
+        }
+
+        SharedHandleInfo info = *m_sharedHandle;
+        info.handle = static_cast<uint64_t>(duplicatedFd);
+        m_frameConsumed = true;
+        return info;
+    }
+
+    std::string GetBackendName() const override {
+        return "wayland";
+    }
+
     private:
 
     GMainLoopPtr m_glibLoop;
@@ -935,6 +978,30 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         m_running.store(false);
     }
 
+    int GetWidth() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_sharedHandle ? static_cast<int>(m_sharedHandle->width) : 0;
+    }
+
+    int GetHeight() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_sharedHandle ? static_cast<int>(m_sharedHandle->height) : 0;
+    }
+
+    int GetStride() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_sharedHandle ? static_cast<int>(m_sharedHandle->stride) : 0;
+    }
+
+    uint32_t GetPixelFormat() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_sharedHandle ? m_sharedHandle->pixelFormat : 0;
+    }
+
+    std::string GetBackendName() const override {
+        return "x11";
+    }
+
     private:
     void CaptureLoop() {
         std::cerr << "[X11] Uruchamiam proces przechwytywania (CaptureLoop)..." << std::endl;
@@ -1063,6 +1130,36 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         XCloseDisplay(display);
     }
 };
+
+std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData() const {
+    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+    if (!m_sharedFd || *m_sharedFd < 0 || m_frameConsumed || !m_streamConfig) {
+        return std::nullopt;
+    }
+
+    if (m_streamConfig->width == 0 || m_streamConfig->height == 0) {
+        return std::nullopt;
+    }
+
+    size_t dataSize = m_planeSize ? static_cast<size_t>(m_planeSize)
+        : static_cast<size_t>(m_stride) * static_cast<size_t>(m_streamConfig->height);
+    if (dataSize == 0) {
+        return std::nullopt;
+    }
+
+    size_t mapSize = m_planeSize ? static_cast<size_t>(m_planeSize) : dataSize + static_cast<size_t>(m_offset);
+    void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, *m_sharedFd, 0);
+    if (mapped == MAP_FAILED) {
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> buffer(dataSize);
+    memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(m_offset), dataSize);
+    munmap(mapped, mapSize);
+
+    m_frameConsumed = true;
+    return buffer;
+}
 
 bool IsWayland() {
     const char* waylandDisplay = std::getenv("WAYLAND_DISPLAY");

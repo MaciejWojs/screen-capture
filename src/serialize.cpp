@@ -1,5 +1,6 @@
 #include <string>
 #include <iostream>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -111,4 +112,11 @@ Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<Shared
 
     obj.Set("handle", handle);
     return obj;
+}
+
+Napi::Value SerializePixelData(Napi::Env env, const std::optional<std::vector<uint8_t>>& pixels) {
+    if (!pixels.has_value()) {
+        return env.Null();
+    }
+    return Napi::Buffer<uint8_t>::Copy(env, pixels->data(), pixels->size());
 }

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -124,6 +125,26 @@ class WinPlatformCapture final : public IPlatformCapture {
         info.width = m_width;
         info.height = m_height;
         return info;
+    }
+
+    int GetWidth() const override {
+        return static_cast<int>(m_width);
+    }
+
+    int GetHeight() const override {
+        return static_cast<int>(m_height);
+    }
+
+    int GetStride() const override {
+        return static_cast<int>(m_width * 4);
+    }
+
+    uint32_t GetPixelFormat() const override {
+        return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+    }
+
+    std::string GetBackendName() const override {
+        return "winrt";
     }
 
     private:

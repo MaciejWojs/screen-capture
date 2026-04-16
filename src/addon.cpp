@@ -2,6 +2,7 @@
 
 #include <exception>
 #include <memory>
+#include <string>
 
 #include "platform_capture.hpp"
 #include "serialize.hpp"
@@ -15,6 +16,12 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             InstanceMethod("stop", &ScreenCapture::Stop),
             InstanceMethod("getSharedHandle", &ScreenCapture::GetSharedHandleLegacy),
             InstanceMethod("getSharedTextureInfo", &ScreenCapture::GetSharedTextureInfo),
+            InstanceMethod("getPixelData", &ScreenCapture::GetPixelData),
+            InstanceMethod("getBackend", &ScreenCapture::GetBackend),
+            InstanceMethod("getWidth", &ScreenCapture::GetWidth),
+            InstanceMethod("getHeight", &ScreenCapture::GetHeight),
+            InstanceMethod("getStride", &ScreenCapture::GetStride),
+            InstanceMethod("getPixelFormat", &ScreenCapture::GetPixelFormat),
             InstanceMethod("getFps", &ScreenCapture::GetFps)
             });
 
@@ -64,6 +71,51 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     Napi::Value GetSharedTextureInfo(const Napi::CallbackInfo& info) {
         auto shared = m_backend->GetSharedHandle();
         return SerializeSharedTextureInfo(info.Env(), shared);
+    }
+
+    Napi::Value GetPixelData(const Napi::CallbackInfo& info) {
+        auto pixels = m_backend->GetPixelData();
+        return SerializePixelData(info.Env(), pixels);
+    }
+
+    Napi::Value GetBackend(const Napi::CallbackInfo& info) {
+        std::string backend = "unknown";
+        if (m_backend) {
+            backend = m_backend->GetBackendName();
+        }
+        return Napi::String::New(info.Env(), backend);
+    }
+
+    Napi::Value GetWidth(const Napi::CallbackInfo& info) {
+        int width = 0;
+        if (m_backend) {
+            width = m_backend->GetWidth();
+        }
+        return Napi::Number::New(info.Env(), width);
+    }
+
+    Napi::Value GetHeight(const Napi::CallbackInfo& info) {
+        int height = 0;
+        if (m_backend) {
+            height = m_backend->GetHeight();
+        }
+        return Napi::Number::New(info.Env(), height);
+    }
+
+    Napi::Value GetStride(const Napi::CallbackInfo& info) {
+        int stride = 0;
+        if (m_backend) {
+            stride = m_backend->GetStride();
+        }
+        return Napi::Number::New(info.Env(), stride);
+    }
+
+    Napi::Value GetPixelFormat(const Napi::CallbackInfo& info) {
+        uint32_t pixelFormat = 0;
+        if (m_backend) {
+            pixelFormat = m_backend->GetPixelFormat();
+        }
+        return Napi::Number::New(info.Env(), pixelFormat);
     }
 };
 
