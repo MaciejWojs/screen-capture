@@ -13,6 +13,7 @@
 #include <spa/utils/result.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -168,6 +169,11 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
     UniqueFd m_sharedFd;
     mutable std::atomic<bool> m_frameConsumed{ false };
 
+    std::mutex m_fpsMutex;
+    std::atomic<int64_t> m_frameCount{ 0 };
+    std::atomic<int> m_lastFps{ 0 };
+    std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
+
     public:
     virtual ~BaseLinuxPlatformCapture() = default;
 
@@ -186,6 +192,22 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
         info.handle = static_cast<uint64_t>(duplicatedFd);
         m_frameConsumed = true;
         return info;
+    }
+
+    int GetFps() const override {
+        return m_lastFps.load();
+    }
+
+    void RecordFrame() {
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(m_fpsMutex);
+        m_frameCount.fetch_add(1, std::memory_order_relaxed);
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
+        if (elapsed >= 1) {
+            m_lastFps.store(static_cast<int>(m_frameCount.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+            m_frameCount.store(0, std::memory_order_relaxed);
+            m_lastFpsTime = now;
+        }
     }
 };
 
@@ -826,6 +848,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 self->m_loggedNonDmabuf = true;
                 std::cerr << "[PipeWire] Non-DMA buffer type received: " << data.type << std::endl;
             }
+
+            self->RecordFrame();
         }
 
         pw_stream_queue_buffer(self->m_streamState.stream.get(), buffer);
@@ -1108,6 +1132,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 if (frameCounter % 120 == 0) {
                     std::cerr << "[X11] Pomyślnie zrzucono klatkę, nr: " << frameCounter << std::endl;
                 }
+                RecordFrame();
             } else {
                 std::cerr << "[X11] Błąd pobierania XShmGetImage!" << std::endl;
             }
