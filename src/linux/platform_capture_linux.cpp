@@ -57,6 +57,35 @@ namespace {
         return ss.str();
     }
 
+    static std::string PixelFormatToString(uint32_t pixelFormat) {
+        switch (pixelFormat) {
+        case SPA_VIDEO_FORMAT_BGRA:
+            return "bgra";
+        case SPA_VIDEO_FORMAT_RGBA:
+            return "rgba";
+        case SPA_VIDEO_FORMAT_BGRx:
+            return "bgrx";
+        case SPA_VIDEO_FORMAT_RGBx:
+            return "rgbx";
+        case SPA_VIDEO_FORMAT_xBGR:
+            return "xbgr";
+        case SPA_VIDEO_FORMAT_xRGB:
+            return "xrgb";
+        case SPA_VIDEO_FORMAT_NV12:
+            return "nv12";
+        case SPA_VIDEO_FORMAT_I420:
+            return "i420";
+        case SPA_VIDEO_FORMAT_YUY2:
+            return "yuy2";
+        case SPA_VIDEO_FORMAT_AYUV:
+            return "ayuv";
+        case SPA_VIDEO_FORMAT_UYVY:
+            return "uyvy";
+        default:
+            return "unknown";
+        }
+    }
+
     template <typename T, auto FreeFunc>
     struct GenericDeleter {
         void operator()(T* ptr) const { if (ptr) FreeFunc(ptr); }
@@ -475,7 +504,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 SPA_FORMAT_mediaSubtype,
                 SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
                 SPA_FORMAT_VIDEO_format,
-                SPA_POD_CHOICE_ENUM_Id(7, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
+                SPA_POD_CHOICE_ENUM_Id(6, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
                 SPA_FORMAT_VIDEO_size,
                 SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
                 SPA_FORMAT_VIDEO_framerate,
@@ -490,7 +519,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 SPA_FORMAT_mediaSubtype,
                 SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
                 SPA_FORMAT_VIDEO_format,
-                SPA_POD_CHOICE_ENUM_Id(7, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
+                SPA_POD_CHOICE_ENUM_Id(6, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
                 SPA_FORMAT_VIDEO_size,
                 SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
                 SPA_FORMAT_VIDEO_framerate,
@@ -629,6 +658,13 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
         bool forceMemFd = IsNvidiaGPU();
         bool hasModifier = (info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
+
+        std::cerr << "[PipeWire] Chosen stream format: " << PixelFormatToString(info.format)
+            << " (" << info.format << ")"
+            << ", size=" << info.size.width << "x" << info.size.height
+            << ", modifier=" << (hasModifier ? std::to_string(info.modifier) : "none")
+            << ", forceMemFd=" << (forceMemFd ? "yes" : "no")
+            << std::endl;
 
         {
             std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);

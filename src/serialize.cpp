@@ -1,8 +1,61 @@
+#include <string>
+#include <iostream>
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
+#ifdef __linux__
+#include <spa/param/video/format-utils.h>
+#endif
+
 #include "serialize.hpp"
+
+static std::string PixelFormatToString(uint32_t pixelFormat) {
+#ifdef __linux__
+    switch (pixelFormat) {
+    case SPA_VIDEO_FORMAT_BGRA:
+        std::cerr << "Pixel format: BGRA" << std::endl;
+        return "bgra";
+    case SPA_VIDEO_FORMAT_RGBA:
+        std::cerr << "Pixel format: RGBA" << std::endl;
+        return "rgba";
+    case SPA_VIDEO_FORMAT_BGRx:
+        std::cerr << "Pixel format: BGRx" << std::endl;
+        return "bgrx";
+    case SPA_VIDEO_FORMAT_RGBx:
+        std::cerr << "Pixel format: RGBx" << std::endl;
+        return "rgbx";
+    case SPA_VIDEO_FORMAT_xBGR:
+        std::cerr << "Pixel format: xBGR" << std::endl;
+        return "xbgr";
+    case SPA_VIDEO_FORMAT_xRGB:
+        std::cerr << "Pixel format: xRGB" << std::endl;
+        return "xrgb";
+    case SPA_VIDEO_FORMAT_NV12:
+        std::cerr << "Pixel format: NV12" << std::endl;
+        return "nv12";
+    case SPA_VIDEO_FORMAT_I420:
+        std::cerr << "Pixel format: I420" << std::endl;
+        return "i420";
+    case SPA_VIDEO_FORMAT_YUY2:
+        std::cerr << "Pixel format: YUY2" << std::endl;
+        return "yuy2";
+    case SPA_VIDEO_FORMAT_AYUV:
+        std::cerr << "Pixel format: AYUV" << std::endl;
+        return "ayuv";
+    case SPA_VIDEO_FORMAT_UYVY:
+        std::cerr << "Pixel format: UYVY" << std::endl;
+        return "uyvy";
+    default:
+        std::cerr << "Unknown pixel format: " << pixelFormat << " Falling back to BGRA" << std::endl;
+        return "bgra";
+    }
+#else
+    std::cerr << "Windows platform, defaulting to BGRA pixel format" << std::endl;
+    return "bgra";
+#endif
+}
 
 Napi::Value SerializeSharedHandleLegacy(Napi::Env env, const std::optional<SharedHandleInfo>& shared) {
     if (!shared.has_value()) return env.Null();
@@ -26,7 +79,7 @@ Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<Shared
 
     Napi::Object obj = Napi::Object::New(env);
 
-    obj.Set("pixelFormat", Napi::String::New(env, "bgra")); // We use B8G8R8A8 on Windows
+    obj.Set("pixelFormat", Napi::String::New(env, PixelFormatToString(shared->pixelFormat)));
 
     Napi::Object codedSize = Napi::Object::New(env);
     codedSize.Set("width", shared->width);
