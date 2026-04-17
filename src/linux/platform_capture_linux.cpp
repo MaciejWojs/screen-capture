@@ -316,6 +316,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     uint32_t m_bufferType = 0;
     uint32_t m_chunkSize = 0;
     bool m_loggedNonDmabuf = false;
+    std::chrono::steady_clock::time_point m_lastMemFdLogTime = std::chrono::steady_clock::time_point::min();
 
     std::atomic<int> m_pendingPipewireFd{ -1 };
 
@@ -819,14 +820,12 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             spa_data& data = spaBuffer->datas[0];
             const uint32_t chunkSize = data.chunk ? data.chunk->size : 0;
             if ((data.type == SPA_DATA_DmaBuf || data.type == SPA_DATA_MemFd) && data.fd >= 0) {
-                // Logowanie typu bufora
-                if (data.type == SPA_DATA_DmaBuf) {
-                    std::cerr << "[PipeWire] Używam DMA-BUF (zerowe kopiowanie) – świetnie!" << std::endl;
-                } else if (data.type == SPA_DATA_MemFd) {
-                    std::cerr << "[PipeWire] Używam MemFd (kopiowanie przez CPU) – typowe dla NVIDIA Wayland." << std::endl;
-                }
+                const auto now = std::chrono::steady_clock::now();
+                bool shouldLogDmaBuf = false;
+                bool shouldLogMemFd = false;
                 {
                     std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
+                    const uint32_t previousType = self->m_bufferType;
                     self->m_bufferType = static_cast<uint32_t>(data.type);
                     self->m_chunkSize = chunkSize;
                     if (data.chunk) {
@@ -838,7 +837,24 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                         self->m_offset = 0;
                         self->m_planeSize = data.maxsize;
                     }
+
+                    if (data.type == SPA_DATA_DmaBuf) {
+                        shouldLogDmaBuf = previousType != SPA_DATA_DmaBuf;
+                    } else {
+                        shouldLogMemFd = previousType != SPA_DATA_MemFd
+                            || (now - self->m_lastMemFdLogTime >= std::chrono::seconds(1));
+                        if (shouldLogMemFd) {
+                            self->m_lastMemFdLogTime = now;
+                        }
+                    }
                 }
+
+                if (shouldLogDmaBuf) {
+                    std::cerr << "[PipeWire] Używam DMA-BUF (zerowe kopiowanie) – świetnie!" << std::endl;
+                } else if (shouldLogMemFd) {
+                    std::cerr << "[PipeWire] Używam MemFd (kopiowanie przez CPU) – typowe dla NVIDIA Wayland." << std::endl;
+                }
+
                 self->UpdateSharedHandleFromFd(data.fd);
                 self->m_loggedNonDmabuf = false;
             } else {
