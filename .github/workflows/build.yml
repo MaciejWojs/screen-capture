@@ -11,6 +11,9 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
+        arch: [x64, arm64]
+      max-parallel: 3
+
     runs-on: ${{ matrix.os }}
     
     steps:
