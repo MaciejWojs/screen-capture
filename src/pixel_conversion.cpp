@@ -9,7 +9,9 @@
 #include <cctype>
 #include <cstring>
 #include <iostream>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
 #if defined(__linux__) && defined(__arm__)
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
@@ -257,6 +259,7 @@ namespace {
         return width >= 256;
     }
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     static inline void PrefetchIfNeeded(const uint8_t* ptr, bool enabled) {
         if (enabled) {
             _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T0);
@@ -279,6 +282,9 @@ namespace {
         }
         return _mm512_loadu_si512(buffer);
     }
+#endif
+#else
+    static inline void PrefetchIfNeeded(const uint8_t*, bool) {}
 #endif
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
