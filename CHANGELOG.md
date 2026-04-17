@@ -1,3 +1,11 @@
+## <small>0.3.3 (2026-04-17)</small>
+
+* fix: add fallback implementation for convertRow_avx2 when AVX2 is not defined ([5894293](https://github.com/MaciejWojs/screen-capture/commit/5894293))
+* fix: correct artifact name to use matrix.os in prebuilds upload step ([0c54a06](https://github.com/MaciejWojs/screen-capture/commit/0c54a06))
+* fix: declaration duplication error convertRow_avx2 ([3e43335](https://github.com/MaciejWojs/screen-capture/commit/3e43335))
+* fix: enhance build workflow by adding Node.js setup and caching for build output ([d9ce262](https://github.com/MaciejWojs/screen-capture/commit/d9ce262))
+* fix: update architecture checks and add TARGET_ATTR for SIMD functions in pixel conversion ([32e76cd](https://github.com/MaciejWojs/screen-capture/commit/32e76cd))
+
 ## <small>0.3.2 (2026-04-17)</small>
 
 * fix: correct artifact name to use matrix.os in prebuilds upload step ([0c54a06](https://github.com/MaciejWojs/screen-capture/commit/0c54a06))
