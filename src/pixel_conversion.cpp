@@ -177,7 +177,7 @@ namespace {
         int cpuInfo[4];
         __cpuid(cpuInfo, 1);
         return (cpuInfo[2] & (1 << 9)) != 0;
-#elif defined(__GNUC__) || defined(__clang__)
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
         return __builtin_cpu_supports("ssse3");
 #else
         return false;
@@ -199,7 +199,7 @@ namespace {
         }
         __cpuid(cpuInfo, 7);
         return (cpuInfo[1] & (1 << 5)) != 0;
-#elif defined(__GNUC__) || defined(__clang__)
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
         return __builtin_cpu_supports("avx2");
 #else
         return false;
