@@ -10,6 +10,13 @@
 #include <cstring>
 #include <iostream>
 #include <immintrin.h>
+#if defined(__linux__) && defined(__arm__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -193,11 +200,67 @@ namespace {
 #endif
     }
 
+#if defined(__AVX512BW__)
+    static bool SupportsAVX512() {
+#if defined(_MSC_VER)
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 1);
+        bool osUsesXSAVE_XRSTORE = (cpuInfo[2] & (1 << 27)) != 0;
+        bool cpuAVXSupport = (cpuInfo[2] & (1 << 28)) != 0;
+        if (!osUsesXSAVE_XRSTORE || !cpuAVXSupport) {
+            return false;
+        }
+        unsigned long long xcrFeatureMask = _xgetbv(_XCR_XFEATURE_ENABLED_MASK);
+        if ((xcrFeatureMask & 0x6ull) != 0x6ull) {
+            return false;
+        }
+        __cpuid(cpuInfo, 7);
+        return (cpuInfo[1] & (1 << 30)) != 0; // AVX512BW
+#elif defined(__GNUC__) || defined(__clang__)
+        return __builtin_cpu_supports("avx512bw");
+#else
+        return false;
+#endif
+    }
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static bool SupportsNEON() {
+#if defined(__aarch64__)
+        // AArch64 always has Advanced SIMD
+        return true;
+#elif defined(__arm__)
+#if defined(__linux__)
+        unsigned long hwcaps = getauxval(AT_HWCAP);
+#ifdef HWCAP_NEON
+        return (hwcaps & HWCAP_NEON) != 0;
+#else
+        return false;
+#endif
+#else
+        return false;
+#endif
+#else
+        return false;
+#endif
+    }
+#endif
+
     static inline bool NeedsAlphaFill(PixelLayout layout) {
         return layout == PixelLayout::RGBX
             || layout == PixelLayout::BGRX
             || layout == PixelLayout::XRGB
             || layout == PixelLayout::XBGR;
+    }
+
+    static inline bool ShouldPrefetch(size_t width) {
+        return width >= 256;
+    }
+
+    static inline void PrefetchIfNeeded(const uint8_t* ptr, bool enabled) {
+        if (enabled) {
+            _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T0);
+        }
     }
 
     static inline __m128i LoadShuffleMask(const signed char mask[16]) {
@@ -207,6 +270,32 @@ namespace {
     static inline __m256i BroadcastShuffleMask(const signed char mask[16]) {
         return _mm256_broadcastsi128_si256(LoadShuffleMask(mask));
     }
+
+#if defined(__AVX512BW__)
+    static inline __m512i BroadcastShuffleMask512(const signed char mask[16]) {
+        alignas(64) unsigned char buffer[64];
+        for (int i = 0; i < 4; ++i) {
+            std::memcpy(buffer + i * 16, mask, 16);
+        }
+        return _mm512_loadu_si512(buffer);
+    }
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static inline uint8x16_t LoadNeonShuffleMask(const signed char mask[16]) {
+        return vld1q_u8(reinterpret_cast<const uint8_t*>(mask));
+    }
+
+    static inline uint8x16_t LoadNeonAlphaMask() {
+        static const uint8_t alphaValues[16] = {
+            0x00, 0x00, 0x00, 0xFF,
+            0x00, 0x00, 0x00, 0xFF,
+            0x00, 0x00, 0x00, 0xFF,
+            0x00, 0x00, 0x00, 0xFF,
+        };
+        return vld1q_u8(alphaValues);
+    }
+#endif
 
     static const signed char kSrcToRgbaMask[6][16] = {
         { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
@@ -238,12 +327,42 @@ namespace {
 #if defined(__SSSE3__)
     static void convertRow_ssse3(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
+        const bool prefetch = ShouldPrefetch(width);
         const __m128i srcMask = LoadShuffleMask(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
         const __m128i dstMask = LoadShuffleMask(kRgbaToDstMask[static_cast<size_t>(dstLayout)]);
         const __m128i alphaMask = _mm_set1_epi32(0xFF000000u);
+        const uint8_t* end = src + width * 4;
+        const uint8_t* prefetchPtr = src + 64;
 
         size_t pixelsRemaining = width;
+        while (pixelsRemaining >= 8) {
+            if (prefetch && prefetchPtr < end) {
+                PrefetchIfNeeded(prefetchPtr, true);
+                prefetchPtr += 32;
+            }
+
+            __m128i source0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+            __m128i source1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16));
+            __m128i rgba0 = _mm_shuffle_epi8(source0, srcMask);
+            __m128i rgba1 = _mm_shuffle_epi8(source1, srcMask);
+            if (needAlphaFill) {
+                rgba0 = _mm_or_si128(rgba0, alphaMask);
+                rgba1 = _mm_or_si128(rgba1, alphaMask);
+            }
+            __m128i result0 = _mm_shuffle_epi8(rgba0, dstMask);
+            __m128i result1 = _mm_shuffle_epi8(rgba1, dstMask);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), result0);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 16), result1);
+            src += 32;
+            dst += 32;
+            pixelsRemaining -= 8;
+        }
+
         while (pixelsRemaining >= 4) {
+            if (prefetch && prefetchPtr < end) {
+                PrefetchIfNeeded(prefetchPtr, true);
+                prefetchPtr += 16;
+            }
             __m128i source = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
             __m128i rgba = _mm_shuffle_epi8(source, srcMask);
             if (needAlphaFill) {
@@ -263,14 +382,128 @@ namespace {
 #endif
 
 #if defined(__AVX2__)
-    static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
+    static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout);
+#endif
+
+#if defined(__AVX512BW__)
+    static void convertRow_avx512(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
-        const __m256i srcMask = BroadcastShuffleMask(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
-        const __m256i dstMask = BroadcastShuffleMask(kRgbaToDstMask[static_cast<size_t>(dstLayout)]);
-        const __m256i alphaMask = _mm256_set1_epi32(0xFF000000u);
+        const bool prefetch = ShouldPrefetch(width);
+        const __m512i srcMask = BroadcastShuffleMask512(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
+        const __m512i dstMask = BroadcastShuffleMask512(kRgbaToDstMask[static_cast<size_t>(dstLayout)]);
+        const __m512i alphaMask = _mm512_set1_epi32(0xFF000000u);
+        const uint8_t* end = src + width * 4;
+        const uint8_t* prefetchPtr = src + 64;
+
+        size_t pixelsRemaining = width;
+        while (pixelsRemaining >= 16) {
+            if (prefetch && prefetchPtr < end) {
+                PrefetchIfNeeded(prefetchPtr, true);
+                prefetchPtr += 64;
+            }
+
+            __m512i source = _mm512_loadu_si512(reinterpret_cast<const void*>(src));
+            __m512i rgba = _mm512_shuffle_epi8(source, srcMask);
+            if (needAlphaFill) {
+                rgba = _mm512_or_si512(rgba, alphaMask);
+            }
+            __m512i result = _mm512_shuffle_epi8(rgba, dstMask);
+            _mm512_storeu_si512(reinterpret_cast<void*>(dst), result);
+            src += 64;
+            dst += 64;
+            pixelsRemaining -= 16;
+        }
+
+        if (pixelsRemaining > 0) {
+            convertRow_avx2(src, dst, pixelsRemaining, srcLayout, dstLayout);
+        }
+    }
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static void convertRow_neon(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
+        const bool needAlphaFill = NeedsAlphaFill(srcLayout);
+        const uint8x16_t srcMask = LoadNeonShuffleMask(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
+        const uint8x16_t dstMask = LoadNeonShuffleMask(kRgbaToDstMask[static_cast<size_t>(dstLayout)]);
+        const uint8x16_t alphaMask = LoadNeonAlphaMask();
 
         size_t pixelsRemaining = width;
         while (pixelsRemaining >= 8) {
+            uint8x16_t source0 = vld1q_u8(src);
+            uint8x16_t source1 = vld1q_u8(src + 16);
+            uint8x16_t rgba0 = vqtbl1q_u8(source0, srcMask);
+            uint8x16_t rgba1 = vqtbl1q_u8(source1, srcMask);
+            if (needAlphaFill) {
+                rgba0 = vorrq_u8(rgba0, alphaMask);
+                rgba1 = vorrq_u8(rgba1, alphaMask);
+            }
+            uint8x16_t result0 = vqtbl1q_u8(rgba0, dstMask);
+            uint8x16_t result1 = vqtbl1q_u8(rgba1, dstMask);
+            vst1q_u8(dst, result0);
+            vst1q_u8(dst + 16, result1);
+            src += 32;
+            dst += 32;
+            pixelsRemaining -= 8;
+        }
+
+        while (pixelsRemaining >= 4) {
+            uint8x16_t source = vld1q_u8(src);
+            uint8x16_t rgba = vqtbl1q_u8(source, srcMask);
+            if (needAlphaFill) {
+                rgba = vorrq_u8(rgba, alphaMask);
+            }
+            uint8x16_t result = vqtbl1q_u8(rgba, dstMask);
+            vst1q_u8(dst, result);
+            src += 16;
+            dst += 16;
+            pixelsRemaining -= 4;
+        }
+
+        if (pixelsRemaining > 0) {
+            convertRow_scalar(src, dst, pixelsRemaining, srcLayout, dstLayout);
+        }
+    }
+#endif
+
+#if defined(__AVX2__)
+    static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
+        const bool needAlphaFill = NeedsAlphaFill(srcLayout);
+        const bool prefetch = ShouldPrefetch(width);
+        const __m256i srcMask = BroadcastShuffleMask(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
+        const __m256i dstMask = BroadcastShuffleMask(kRgbaToDstMask[static_cast<size_t>(dstLayout)]);
+        const __m256i alphaMask = _mm256_set1_epi32(0xFF000000u);
+        const uint8_t* end = src + width * 4;
+        const uint8_t* prefetchPtr = src + 64;
+
+        size_t pixelsRemaining = width;
+        while (pixelsRemaining >= 16) {
+            if (prefetch && prefetchPtr < end) {
+                PrefetchIfNeeded(prefetchPtr, true);
+                prefetchPtr += 64;
+            }
+
+            __m256i source0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+            __m256i source1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 32));
+            __m256i rgba0 = _mm256_shuffle_epi8(source0, srcMask);
+            __m256i rgba1 = _mm256_shuffle_epi8(source1, srcMask);
+            if (needAlphaFill) {
+                rgba0 = _mm256_or_si256(rgba0, alphaMask);
+                rgba1 = _mm256_or_si256(rgba1, alphaMask);
+            }
+            __m256i result0 = _mm256_shuffle_epi8(rgba0, dstMask);
+            __m256i result1 = _mm256_shuffle_epi8(rgba1, dstMask);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), result0);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 32), result1);
+            src += 64;
+            dst += 64;
+            pixelsRemaining -= 16;
+        }
+
+        while (pixelsRemaining >= 8) {
+            if (prefetch && prefetchPtr < end) {
+                PrefetchIfNeeded(prefetchPtr, true);
+                prefetchPtr += 32;
+            }
             __m256i source = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
             __m256i rgba = _mm256_shuffle_epi8(source, srcMask);
             if (needAlphaFill) {
@@ -316,41 +549,60 @@ std::vector<uint8_t> ConvertPixelBuffer(
     std::vector<uint8_t> dst(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
     const size_t srcRowBytes = stride;
     const size_t dstRowBytes = static_cast<size_t>(width) * 4;
+    const size_t totalPixels = static_cast<size_t>(width) * height;
+    const bool isPacked = srcRowBytes == dstRowBytes;
 
     RowConverterFunc converter = convertRow_scalar;
     const char* converterName = "scalar";
-#if defined(__AVX2__)
-    if (SupportsAVX2()) {
-        converter = convertRow_avx2;
-        converterName = "avx2";
+#if defined(__AVX512BW__)
+    if (SupportsAVX512()) {
+        converter = convertRow_avx512;
+        converterName = "avx512";
     } else
 #endif
+#if defined(__AVX2__)
+        if (SupportsAVX2()) {
+            converter = convertRow_avx2;
+            converterName = "avx2";
+        } else
+#endif
 #if defined(__SSSE3__)
-        if (SupportsSSSE3()) {
-            converter = convertRow_ssse3;
-            converterName = "ssse3";
+            if (SupportsSSSE3()) {
+                converter = convertRow_ssse3;
+                converterName = "ssse3";
+            }
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        if (converter == convertRow_scalar && SupportsNEON()) {
+            converter = convertRow_neon;
+            converterName = "neon";
         }
 #endif
 
-    LogConverterMethodOnce(converterName);
-
-    for (uint32_t row = 0; row < height; ++row) {
-        const uint8_t* srcRow = src + static_cast<size_t>(row) * srcRowBytes;
-        uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
+        LogConverterMethodOnce(converterName);
 
         if (srcLayout == dstLayout) {
-            if (srcRowBytes == dstRowBytes) {
-                std::memcpy(dstRow, srcRow, dstRowBytes);
+            if (isPacked) {
+                std::memcpy(dst.data(), src, totalPixels * 4);
             } else {
-                for (uint32_t col = 0; col < width; ++col) {
-                    StoreUInt32(dstRow + static_cast<size_t>(col) * 4,
-                        LoadUInt32(srcRow + static_cast<size_t>(col) * 4));
+                for (uint32_t row = 0; row < height; ++row) {
+                    const uint8_t* srcRow = src + static_cast<size_t>(row) * srcRowBytes;
+                    uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
+                    for (uint32_t col = 0; col < width; ++col) {
+                        StoreUInt32(dstRow + static_cast<size_t>(col) * 4,
+                            LoadUInt32(srcRow + static_cast<size_t>(col) * 4));
+                    }
                 }
             }
+        } else if (isPacked) {
+            converter(src, dst.data(), totalPixels, srcLayout, dstLayout);
         } else {
-            converter(srcRow, dstRow, width, srcLayout, dstLayout);
+            for (uint32_t row = 0; row < height; ++row) {
+                const uint8_t* srcRow = src + static_cast<size_t>(row) * srcRowBytes;
+                uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
+                converter(srcRow, dstRow, width, srcLayout, dstLayout);
+            }
         }
-    }
 
-    return dst;
+        return dst;
 }
