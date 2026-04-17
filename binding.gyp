@@ -68,13 +68,6 @@
             "<!@(pkg-config --libs gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3 x11 xext)"
           ],
           "conditions": [
-            ["target_arch=='x64'", {
-              "cflags_cc+": [
-                "-mssse3",
-                "-mavx2",
-                "-mavx512bw"
-              ]
-            }],
             ["target_arch=='arm64'", {
               "cflags_cc+": [
                 "-march=armv8-a"

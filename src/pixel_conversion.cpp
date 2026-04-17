@@ -23,6 +23,18 @@
 #include <intrin.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define TARGET_ATTR(x) __attribute__((target(x)))
+#else
+#define TARGET_ATTR(x)
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 namespace {
     enum class PixelLayout {
         RGBA,
@@ -330,8 +342,8 @@ namespace {
         }
     }
 
-#if defined(__SSSE3__)
-    static void convertRow_ssse3(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    TARGET_ATTR("ssse3") static void convertRow_ssse3(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
         const bool prefetch = ShouldPrefetch(width);
         const __m128i srcMask = LoadShuffleMask(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
@@ -391,8 +403,8 @@ namespace {
     static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout);
 #endif
 
-#if defined(__AVX512BW__)
-    static void convertRow_avx512(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    TARGET_ATTR("avx512bw") static void convertRow_avx512(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
         const bool prefetch = ShouldPrefetch(width);
         const __m512i srcMask = BroadcastShuffleMask512(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
@@ -471,8 +483,8 @@ namespace {
     }
 #endif
 
-#if defined(__AVX2__)
-    static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    TARGET_ATTR("avx2") static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
         const bool prefetch = ShouldPrefetch(width);
         const __m256i srcMask = BroadcastShuffleMask(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
