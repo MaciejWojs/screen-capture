@@ -1,18 +1,12 @@
 ## <small>0.3.4 (2026-04-17)</small>
 
 * fix: add AVX2 target attribute to BroadcastShuffleMask and declare convertRow_avx2 function ([ad5362d](https://github.com/MaciejWojs/screen-capture/commit/ad5362d))
-* fix: add fallback implementation for convertRow_avx2 when AVX2 is not defined ([5894293](https://github.com/MaciejWojs/screen-capture/commit/5894293))
-* fix: correct artifact name to use matrix.os in prebuilds upload step ([0c54a06](https://github.com/MaciejWojs/screen-capture/commit/0c54a06))
 * fix: declaration duplication error convertRow_avx2 ([3e43335](https://github.com/MaciejWojs/screen-capture/commit/3e43335))
-* fix: enhance build workflow by adding Node.js setup and caching for build output ([d9ce262](https://github.com/MaciejWojs/screen-capture/commit/d9ce262))
 * fix: refactor AVX2 support checks and implementation in pixel conversion ([ab4b3cf](https://github.com/MaciejWojs/screen-capture/commit/ab4b3cf))
 * fix: refine CPU feature checks for SSSE3 and AVX2 support on x86 architectures ([ab537c6](https://github.com/MaciejWojs/screen-capture/commit/ab537c6))
 * fix: streamline AVX512 support checks and improve fallback handling in pixel conversion ([4c1f509](https://github.com/MaciejWojs/screen-capture/commit/4c1f509))
-* fix: update architecture checks and add TARGET_ATTR for SIMD functions in pixel conversion ([32e76cd](https://github.com/MaciejWojs/screen-capture/commit/32e76cd))
 * fix: update cache key to use matrix.os for build artifacts ([f599282](https://github.com/MaciejWojs/screen-capture/commit/f599282))
 * fix: update upload-artifact action to version 7.0.1 in build workflow ([bff7065](https://github.com/MaciejWojs/screen-capture/commit/bff7065))
-* v0.3.2 ([9f12946](https://github.com/MaciejWojs/screen-capture/commit/9f12946))
-* v0.3.3 ([ea85f85](https://github.com/MaciejWojs/screen-capture/commit/ea85f85))
 
 ## <small>0.3.3 (2026-04-17)</small>
 
