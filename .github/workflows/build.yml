@@ -18,6 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v6.3.0
+        with:
+          node-version: 24
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2.2.0
         with:
@@ -26,6 +31,14 @@ jobs:
       - name: install linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt update && sudo apt install -y build-essential pkg-config libx11-dev libxext-dev libglib2.0-dev libpipewire-0.3-dev libspa-0.2-dev libsystemd-dev
+
+      - name: Cache build output
+        uses: actions/cache@v5
+        with:
+          path: build/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/*.cpp', '**/*.h') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
 
       - name: Install Dependencies
         run: bun install --frozen-lockfile --ignore-scripts
