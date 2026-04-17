@@ -36,9 +36,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/
-          key: ${{ runner.os }}-build-${{ hashFiles('**/*.cpp', '**/*.h') }}
+          key: ${{ matrix.os }}-build-${{ hashFiles('**/*.cpp', '**/*.h') }}
           restore-keys: |
-            ${{ runner.os }}-build-
+            ${{ matrix.os }}-build-
 
       - name: Install Dependencies
         run: bun install --frozen-lockfile --ignore-scripts
