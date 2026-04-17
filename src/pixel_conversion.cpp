@@ -278,7 +278,7 @@ namespace {
         return _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask));
     }
 
-    static inline __m256i BroadcastShuffleMask(const signed char mask[16]) {
+    TARGET_ATTR("avx2") static inline __m256i BroadcastShuffleMask(const signed char mask[16]) {
         return _mm256_broadcastsi128_si256(LoadShuffleMask(mask));
     }
 
@@ -394,6 +394,7 @@ namespace {
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout);
     TARGET_ATTR("avx512bw") static void convertRow_avx512(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
         const bool prefetch = ShouldPrefetch(width);
