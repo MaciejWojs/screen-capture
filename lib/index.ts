@@ -34,6 +34,12 @@ export interface SharedHandleInfo {
 /**
  * Interface for controlling the screen capture process and accessing captured frames.
  */
+export type Backend = "winrt" | "dxgi" | "gdi" | "wayland" | "x11" | "stub" | "unknown";
+
+
+/** The format of the pixel data to retrieve. */
+export type PixelDataFormat = "rgba" | "bgra" | "rgbx" | "bgrx" | "xrgb" | "xbgr";
+
 export interface IScreenCapture {
     /** Starts the screen capture process. */
     start(): void;
@@ -44,6 +50,33 @@ export interface IScreenCapture {
      * @returns The shared handle info if available, otherwise null.
      */
     getSharedHandle(): SharedHandleInfo | null;
+    /**
+     * Retrieves raw pixel data for the latest captured frame.
+     * The returned pixel buffer is normalized to RGBA by default.
+     * @param format Optional target color layout, e.g. 'rgba' or 'bgra'.
+     * @returns A Buffer containing pixel bytes, or null if unavailable.
+     */
+    getPixelData(format?: PixelDataFormat): Buffer | null;
+    /**
+     * Returns the backend identifier used for the current capture implementation.
+     */
+    getBackend(): Backend;
+    /**
+     * Returns the width of the current frame, or 0 if unavailable.
+     */
+    getWidth(): number;
+    /**
+     * Returns the height of the current frame, or 0 if unavailable.
+     */
+    getHeight(): number;
+    /**
+     * Returns the stride/pitch of the current frame, or 0 if unavailable.
+     */
+    getStride(): number;
+    /**
+     * Returns the pixel format code of the current frame, or 0 if unavailable.
+     */
+    getPixelFormat(): number;
     /**
      * Retrieves the texture info formulated for Electron's shared-texture.
      * @returns The shared texture info if available, otherwise null.

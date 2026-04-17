@@ -58,7 +58,8 @@
         }],
         ["OS=='linux'", {
           "sources": [
-            "src/linux/platform_capture_linux.cpp"
+            "src/linux/platform_capture_linux.cpp",
+            "src/pixel_conversion.cpp"
           ],
           "cflags_cc": [
             "<!@(pkg-config --cflags gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3 x11 xext)"

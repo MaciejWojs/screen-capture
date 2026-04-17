@@ -22,6 +22,9 @@ const textureInfo = capture.getSharedTextureInfo();
 // Or get the raw handle data (legacy):
 const rawHandle = capture.getSharedHandle();
 
+// On Wayland with NVIDIA MemFd, getPixelData() can copy the frame through CPU:
+const frameData = capture.getPixelData();
+
 capture.stop();
 ```
 

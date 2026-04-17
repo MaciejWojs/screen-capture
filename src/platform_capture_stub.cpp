@@ -3,6 +3,7 @@
 #include "platform_capture.hpp"
 
 #include <stdexcept>
+#include <string>
 
 class StubPlatformCapture final : public IPlatformCapture {
     public:
@@ -14,6 +15,10 @@ class StubPlatformCapture final : public IPlatformCapture {
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
         return std::nullopt;
+    }
+
+    std::string GetBackendName() const override {
+        return "stub";
     }
 };
 

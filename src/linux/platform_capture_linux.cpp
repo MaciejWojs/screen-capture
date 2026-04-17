@@ -1,6 +1,7 @@
 #ifdef __linux__
 
 #include "../platform_capture.hpp"
+#include "../pixel_conversion.hpp"
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
@@ -12,7 +13,10 @@
 #include <spa/pod/builder.h>
 #include <spa/utils/result.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -38,64 +42,101 @@
 
 #include <fstream>
 
-namespace {
-
-std::string gen_token() {
-    static std::mt19937 rng(std::random_device{}());
-    static std::uniform_int_distribution<int> dist(0, 15);
-    std::stringstream ss;
-    ss << std::hex;
-    for (int i = 0; i < 8; i++) ss << dist(rng);
-    return ss.str();
+static bool IsNvidiaGPU() {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    std::ifstream nvidia("/proc/driver/nvidia/version");
+    cached = nvidia.good() ? 1 : 0;
+    return cached;
 }
 
-template <typename T, auto FreeFunc>
-struct GenericDeleter {
-    void operator()(T* ptr) const { if (ptr) FreeFunc(ptr); }
-};
+namespace {
 
-struct GObjectDeleter {
-    void operator()(void* ptr) const { if (ptr) g_object_unref(ptr); }
-};
+    std::string gen_token() {
+        static std::mt19937 rng(std::random_device{}());
+        static std::uniform_int_distribution<int> dist(0, 15);
+        std::stringstream ss;
+        ss << std::hex;
+        for (int i = 0; i < 8; i++) ss << dist(rng);
+        return ss.str();
+    }
 
-struct FdDeleter {
-    void operator()(int* fd) const { if (fd && *fd >= 0) { close(*fd); delete fd; } }
-};
+    static std::string PixelFormatToString(uint32_t pixelFormat) {
+        switch (pixelFormat) {
+        case SPA_VIDEO_FORMAT_BGRA:
+            return "bgra";
+        case SPA_VIDEO_FORMAT_RGBA:
+            return "rgba";
+        case SPA_VIDEO_FORMAT_BGRx:
+            return "bgrx";
+        case SPA_VIDEO_FORMAT_RGBx:
+            return "rgbx";
+        case SPA_VIDEO_FORMAT_xBGR:
+            return "xbgr";
+        case SPA_VIDEO_FORMAT_xRGB:
+            return "xrgb";
+        case SPA_VIDEO_FORMAT_NV12:
+            return "nv12";
+        case SPA_VIDEO_FORMAT_I420:
+            return "i420";
+        case SPA_VIDEO_FORMAT_YUY2:
+            return "yuy2";
+        case SPA_VIDEO_FORMAT_AYUV:
+            return "ayuv";
+        case SPA_VIDEO_FORMAT_UYVY:
+            return "uyvy";
+        default:
+            return "unknown";
+        }
+    }
 
-using GMainLoopPtr = std::unique_ptr<GMainLoop, GenericDeleter<GMainLoop, g_main_loop_unref>>;
-using GMainContextPtr = std::unique_ptr<GMainContext, GenericDeleter<GMainContext, g_main_context_unref>>;
-using GDBusConnectionPtr = std::unique_ptr<GDBusConnection, GObjectDeleter>;
-using PwThreadLoopPtr = std::unique_ptr<pw_thread_loop, GenericDeleter<pw_thread_loop, pw_thread_loop_destroy>>;
-using PwContextPtr = std::unique_ptr<pw_context, GenericDeleter<pw_context, pw_context_destroy>>;
-using PwCorePtr = std::unique_ptr<pw_core, GenericDeleter<pw_core, pw_core_disconnect>>;
-using PwStreamPtr = std::unique_ptr<pw_stream, GenericDeleter<pw_stream, pw_stream_destroy>>;
-using GVariantPtr = std::unique_ptr<GVariant, GenericDeleter<GVariant, g_variant_unref>>;
-using GErrorPtr = std::unique_ptr<GError, GenericDeleter<GError, g_error_free>>;
-using GUnixFDListPtr = std::unique_ptr<GUnixFDList, GObjectDeleter>;
-using UniqueFd = std::unique_ptr<int, FdDeleter>;
+    template <typename T, auto FreeFunc>
+    struct GenericDeleter {
+        void operator()(T* ptr) const { if (ptr) FreeFunc(ptr); }
+    };
 
-struct GVariantBuilderWrapper {
-    GVariantBuilder builder;
-    GVariantBuilderWrapper() { g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}")); }
-    ~GVariantBuilderWrapper() { g_variant_builder_clear(&builder); }
-    operator GVariantBuilder*() { return &builder; }
-};
+    struct GObjectDeleter {
+        void operator()(void* ptr) const { if (ptr) g_object_unref(ptr); }
+    };
 
-struct StreamState {
-    PwThreadLoopPtr pw_loop;
-    PwContextPtr context;
-    PwCorePtr core;
-    PwStreamPtr stream;
-    spa_hook stream_listener{};
-};
+    struct FdDeleter {
+        void operator()(int* fd) const { if (fd && *fd >= 0) { close(*fd); delete fd; } }
+    };
 
-enum class PortalStage {
-    Idle,
-    CreatingSession,
-    SelectingSources,
-    StartingSession,
-    OpeningRemote,
-};
+    using GMainLoopPtr = std::unique_ptr<GMainLoop, GenericDeleter<GMainLoop, g_main_loop_unref>>;
+    using GMainContextPtr = std::unique_ptr<GMainContext, GenericDeleter<GMainContext, g_main_context_unref>>;
+    using GDBusConnectionPtr = std::unique_ptr<GDBusConnection, GObjectDeleter>;
+    using PwThreadLoopPtr = std::unique_ptr<pw_thread_loop, GenericDeleter<pw_thread_loop, pw_thread_loop_destroy>>;
+    using PwContextPtr = std::unique_ptr<pw_context, GenericDeleter<pw_context, pw_context_destroy>>;
+    using PwCorePtr = std::unique_ptr<pw_core, GenericDeleter<pw_core, pw_core_disconnect>>;
+    using PwStreamPtr = std::unique_ptr<pw_stream, GenericDeleter<pw_stream, pw_stream_destroy>>;
+    using GVariantPtr = std::unique_ptr<GVariant, GenericDeleter<GVariant, g_variant_unref>>;
+    using GErrorPtr = std::unique_ptr<GError, GenericDeleter<GError, g_error_free>>;
+    using GUnixFDListPtr = std::unique_ptr<GUnixFDList, GObjectDeleter>;
+    using UniqueFd = std::unique_ptr<int, FdDeleter>;
+
+    struct GVariantBuilderWrapper {
+        GVariantBuilder builder;
+        GVariantBuilderWrapper() { g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}")); }
+        ~GVariantBuilderWrapper() { g_variant_builder_clear(&builder); }
+        operator GVariantBuilder* () { return &builder; }
+    };
+
+    struct StreamState {
+        PwThreadLoopPtr pw_loop;
+        PwContextPtr context;
+        PwCorePtr core;
+        PwStreamPtr stream;
+        spa_hook stream_listener{};
+    };
+
+    enum class PortalStage {
+        Idle,
+        CreatingSession,
+        SelectingSources,
+        StartingSession,
+        OpeningRemote,
+    };
 
 } // namespace
 
@@ -119,19 +160,24 @@ namespace Config {
 }
 
 class BaseLinuxPlatformCapture : public IPlatformCapture {
-protected:
+    protected:
     mutable std::shared_mutex m_stateMutex;
     std::thread m_worker;
-    std::atomic<bool> m_running{false};
-    std::atomic<bool> m_stopRequested{false};
+    std::atomic<bool> m_running{ false };
+    std::atomic<bool> m_stopRequested{ false };
     std::mutex m_captureMutex;
     std::condition_variable m_captureCv;
 
     std::optional<SharedHandleInfo> m_sharedHandle;
     UniqueFd m_sharedFd;
-    mutable std::atomic<bool> m_frameConsumed{false};
+    mutable std::atomic<bool> m_frameConsumed{ false };
 
-public:
+    std::mutex m_fpsMutex;
+    std::atomic<int64_t> m_frameCount{ 0 };
+    std::atomic<int> m_lastFps{ 0 };
+    std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
+
+    public:
     virtual ~BaseLinuxPlatformCapture() = default;
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
@@ -149,6 +195,22 @@ public:
         info.handle = static_cast<uint64_t>(duplicatedFd);
         m_frameConsumed = true;
         return info;
+    }
+
+    int GetFps() const override {
+        return m_lastFps.load();
+    }
+
+    void RecordFrame() {
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(m_fpsMutex);
+        m_frameCount.fetch_add(1, std::memory_order_relaxed);
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
+        if (elapsed >= 1) {
+            m_lastFps.store(static_cast<int>(m_frameCount.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+            m_frameCount.store(0, std::memory_order_relaxed);
+            m_lastFpsTime = now;
+        }
     }
 };
 
@@ -194,17 +256,60 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_running.store(false);
     }
 
+    std::optional<std::vector<uint8_t>> GetPixelData(const std::string& desiredFormat = "rgba") const override;
+    int GetWidth() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_streamConfig ? static_cast<int>(m_streamConfig->width) : 0;
+    }
+    int GetHeight() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_streamConfig ? static_cast<int>(m_streamConfig->height) : 0;
+    }
+    int GetStride() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return static_cast<int>(m_stride);
+    }
+    uint32_t GetPixelFormat() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_streamConfig ? m_streamConfig->pixelFormat : 0;
+    }
+
+    std::optional<SharedHandleInfo> GetSharedHandle() const override {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        if (!m_sharedHandle.has_value() || m_frameConsumed || !m_sharedFd || *m_sharedFd < 0) {
+            return std::nullopt;
+        }
+
+        if (m_bufferType == SPA_DATA_MemFd) {
+            return std::nullopt;
+        }
+
+        int duplicatedFd = dup(*m_sharedFd);
+        if (duplicatedFd < 0) {
+            return std::nullopt;
+        }
+
+        SharedHandleInfo info = *m_sharedHandle;
+        info.handle = static_cast<uint64_t>(duplicatedFd);
+        m_frameConsumed = true;
+        return info;
+    }
+
+    std::string GetBackendName() const override {
+        return "wayland";
+    }
+
     private:
 
     GMainLoopPtr m_glibLoop;
     GDBusConnectionPtr m_connection;
 
     StreamState m_streamState{};
-    std::atomic<PortalStage> m_stage{PortalStage::Idle};
+    std::atomic<PortalStage> m_stage{ PortalStage::Idle };
 
     std::string m_sessionHandle;
     std::optional<StreamConfig> m_streamConfig;
-    std::atomic<uint32_t> m_streamNodeId{PW_ID_ANY};
+    std::atomic<uint32_t> m_streamNodeId{ PW_ID_ANY };
     uint32_t m_stride = 0;
     uint32_t m_offset = 0;
     uint64_t m_planeSize = 0;
@@ -212,7 +317,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     uint32_t m_chunkSize = 0;
     bool m_loggedNonDmabuf = false;
 
-    std::atomic<int> m_pendingPipewireFd{-1};
+    std::atomic<int> m_pendingPipewireFd{ -1 };
 
     void RunCaptureFlow() {
         int pipewireFd = -1;
@@ -306,7 +411,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         }
 
         m_glibLoop.reset();
-        
+
         m_stopRequested.store(false);
         m_running.store(false);
     }
@@ -396,7 +501,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
         gint32 fdIndex = -1;
         g_variant_get(result.get(), "(h)", &fdIndex);
-        
+
         GError* rawFdError = nullptr;
         int fd = g_unix_fd_list_get(outFdList.get(), fdIndex, &rawFdError);
         GErrorPtr fdError(rawFdError);
@@ -455,29 +560,57 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         const spa_fraction defaultFramerate = SPA_FRACTION(60, 1);
         const spa_fraction maxFramerate = SPA_FRACTION(144, 1);
 
-        params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-            &builder,
-            SPA_TYPE_OBJECT_Format,
-            SPA_PARAM_EnumFormat,
-            SPA_FORMAT_mediaType,
-            SPA_POD_Id(SPA_MEDIA_TYPE_video),
-            SPA_FORMAT_mediaSubtype,
-            SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-            SPA_FORMAT_VIDEO_format,
-            SPA_POD_CHOICE_ENUM_Id(7, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
-            SPA_FORMAT_VIDEO_size,
-            SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
-            SPA_FORMAT_VIDEO_framerate,
-            SPA_POD_CHOICE_RANGE_Fraction(&defaultFramerate, &minFramerate, &maxFramerate),
-            SPA_FORMAT_VIDEO_modifier,
-            SPA_POD_CHOICE_ENUM_Long(3, 0ULL, 0ULL, 0x00ffffffffffffffULL)));
+        bool forceMemFd = IsNvidiaGPU();
 
-        params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-            &builder,
-            SPA_TYPE_OBJECT_ParamBuffers,
-            SPA_PARAM_Buffers,
-            SPA_PARAM_BUFFERS_dataType,
-            SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
+        if (forceMemFd) {
+            params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_Format,
+                SPA_PARAM_EnumFormat,
+                SPA_FORMAT_mediaType,
+                SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype,
+                SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                SPA_FORMAT_VIDEO_format,
+                SPA_POD_CHOICE_ENUM_Id(6, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
+                SPA_FORMAT_VIDEO_size,
+                SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
+                SPA_FORMAT_VIDEO_framerate,
+                SPA_POD_CHOICE_RANGE_Fraction(&defaultFramerate, &minFramerate, &maxFramerate)));
+        } else {
+            params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_Format,
+                SPA_PARAM_EnumFormat,
+                SPA_FORMAT_mediaType,
+                SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype,
+                SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                SPA_FORMAT_VIDEO_format,
+                SPA_POD_CHOICE_ENUM_Id(6, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
+                SPA_FORMAT_VIDEO_size,
+                SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
+                SPA_FORMAT_VIDEO_framerate,
+                SPA_POD_CHOICE_RANGE_Fraction(&defaultFramerate, &minFramerate, &maxFramerate),
+                SPA_FORMAT_VIDEO_modifier,
+                SPA_POD_CHOICE_ENUM_Long(3, 0ULL, 0ULL, 0x00ffffffffffffffULL)));
+        }
+
+        if (forceMemFd) {
+            params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_ParamBuffers,
+                SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_dataType,
+                SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd)));
+        } else {
+            params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_ParamBuffers,
+                SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_dataType,
+                SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
+        }
 
         pw_stream_add_listener(
             m_streamState.stream.get(),
@@ -491,7 +624,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             m_streamState.stream.get(),
             PW_DIRECTION_INPUT,
             targetId,
-            static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT),
+            static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
             params,
             2);
 
@@ -504,7 +637,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
     void CleanupPortal() {
         m_connection.reset();
-        
+
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
             m_sessionHandle.clear();
@@ -591,7 +724,15 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             return;
         }
 
+        bool forceMemFd = IsNvidiaGPU();
         bool hasModifier = (info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
+
+        std::cerr << "[PipeWire] Chosen stream format: " << PixelFormatToString(info.format)
+            << " (" << info.format << ")"
+            << ", size=" << info.size.width << "x" << info.size.height
+            << ", modifier=" << (hasModifier ? std::to_string(info.modifier) : "none")
+            << ", forceMemFd=" << (forceMemFd ? "yes" : "no")
+            << std::endl;
 
         {
             std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
@@ -609,7 +750,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
         const spa_pod* params[2];
 
-        if (hasModifier) {
+        if (hasModifier && !forceMemFd) {
             params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
                 &builder,
                 SPA_TYPE_OBJECT_Format,
@@ -643,12 +784,21 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 SPA_POD_Fraction(&info.framerate)));
         }
 
-        params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-            &builder,
-            SPA_TYPE_OBJECT_ParamBuffers,
-            SPA_PARAM_Buffers,
-            SPA_PARAM_BUFFERS_dataType,
-            SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
+        if (forceMemFd) {
+            params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_ParamBuffers,
+                SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_dataType,
+                SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd)));
+        } else {
+            params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_ParamBuffers,
+                SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_dataType,
+                SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
+        }
 
         pw_stream_update_params(self->m_streamState.stream.get(), params, 2);
     }
@@ -669,6 +819,12 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             spa_data& data = spaBuffer->datas[0];
             const uint32_t chunkSize = data.chunk ? data.chunk->size : 0;
             if ((data.type == SPA_DATA_DmaBuf || data.type == SPA_DATA_MemFd) && data.fd >= 0) {
+                // Logowanie typu bufora
+                if (data.type == SPA_DATA_DmaBuf) {
+                    std::cerr << "[PipeWire] Używam DMA-BUF (zerowe kopiowanie) – świetnie!" << std::endl;
+                } else if (data.type == SPA_DATA_MemFd) {
+                    std::cerr << "[PipeWire] Używam MemFd (kopiowanie przez CPU) – typowe dla NVIDIA Wayland." << std::endl;
+                }
                 {
                     std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
                     self->m_bufferType = static_cast<uint32_t>(data.type);
@@ -695,6 +851,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 self->m_loggedNonDmabuf = true;
                 std::cerr << "[PipeWire] Non-DMA buffer type received: " << data.type << std::endl;
             }
+
+            self->RecordFrame();
         }
 
         pw_stream_queue_buffer(self->m_streamState.stream.get(), buffer);
@@ -713,13 +871,13 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         guint32 responseCode = 1;
         GVariantIter* results = nullptr;
         g_variant_get(parameters, "(ua{sv})", &responseCode, &results);
-        
+
         auto freeResults = [&results]() {
             if (results) {
                 g_variant_iter_free(results);
                 results = nullptr;
             }
-        };
+            };
 
         if (responseCode != 0) {
             freeResults();
@@ -818,7 +976,7 @@ const pw_stream_events WaylandPlatformCapture::kStreamEvents = [] {
     events.param_changed = WaylandPlatformCapture::OnStreamParamChanged;
     events.process = WaylandPlatformCapture::OnStreamProcess;
     return events;
-}();
+    }();
 
 
 class X11PlatformCapture final : public BaseLinuxPlatformCapture {
@@ -845,6 +1003,30 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
             m_worker.join();
         }
         m_running.store(false);
+    }
+
+    int GetWidth() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_sharedHandle ? static_cast<int>(m_sharedHandle->width) : 0;
+    }
+
+    int GetHeight() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_sharedHandle ? static_cast<int>(m_sharedHandle->height) : 0;
+    }
+
+    int GetStride() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_sharedHandle ? static_cast<int>(m_sharedHandle->stride) : 0;
+    }
+
+    uint32_t GetPixelFormat() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        return m_sharedHandle ? m_sharedHandle->pixelFormat : 0;
+    }
+
+    std::string GetBackendName() const override {
+        return "x11";
     }
 
     private:
@@ -953,6 +1135,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 if (frameCounter % 120 == 0) {
                     std::cerr << "[X11] Pomyślnie zrzucono klatkę, nr: " << frameCounter << std::endl;
                 }
+                RecordFrame();
             } else {
                 std::cerr << "[X11] Błąd pobierania XShmGetImage!" << std::endl;
             }
@@ -976,13 +1159,59 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     }
 };
 
+std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const std::string& desiredFormat) const {
+    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+    if (!m_sharedFd || *m_sharedFd < 0 || m_frameConsumed || !m_streamConfig) {
+        return std::nullopt;
+    }
+
+    if (m_streamConfig->width == 0 || m_streamConfig->height == 0) {
+        return std::nullopt;
+    }
+
+    size_t dataSize = m_planeSize ? static_cast<size_t>(m_planeSize)
+        : static_cast<size_t>(m_stride) * static_cast<size_t>(m_streamConfig->height);
+    if (dataSize == 0) {
+        return std::nullopt;
+    }
+
+    size_t mapSize = m_planeSize ? static_cast<size_t>(m_planeSize) : dataSize + static_cast<size_t>(m_offset);
+    void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, *m_sharedFd, 0);
+    if (mapped == MAP_FAILED) {
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> buffer(dataSize);
+    memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(m_offset), dataSize);
+    munmap(mapped, mapSize);
+
+    std::string format = desiredFormat;
+    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+        });
+
+    uint32_t stride = m_stride ? m_stride : static_cast<uint32_t>(m_streamConfig->width * 4);
+    std::vector<uint8_t> result = ConvertPixelBuffer(
+        buffer.data(),
+        buffer.size(),
+        static_cast<uint32_t>(m_streamConfig->width),
+        static_cast<uint32_t>(m_streamConfig->height),
+        stride,
+        m_streamConfig->pixelFormat,
+        format
+    );
+
+    m_frameConsumed = true;
+    return result;
+}
+
 bool IsWayland() {
     const char* waylandDisplay = std::getenv("WAYLAND_DISPLAY");
     if (waylandDisplay && waylandDisplay[0] != '\0') return true;
-    
+
     const char* sessionType = std::getenv("XDG_SESSION_TYPE");
     if (sessionType && std::string(sessionType) == "wayland") return true;
-    
+
     return false;
 }
 
