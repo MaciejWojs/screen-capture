@@ -1,3 +1,7 @@
+## <small>0.3.2 (2026-04-17)</small>
+
+* fix: correct artifact name to use matrix.os in prebuilds upload step ([0c54a06](https://github.com/MaciejWojs/screen-capture/commit/0c54a06))
+
 ## 0.3.0 (2026-04-17)
 * fix: conditionally define PrefetchIfNeeded for non-x86 architectures ([0fdcd71](https://github.com/MaciejWojs/screen-capture/commit/0fdcd71))
 * fix: correct syntax errors in pixel layout parsing and AVX support checks ([1d76bea](https://github.com/MaciejWojs/screen-capture/commit/1d76bea))
