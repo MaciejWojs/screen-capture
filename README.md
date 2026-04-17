@@ -6,6 +6,7 @@ Native Node.js addon for screen capture. Packages are published to NPM with prov
 
 - Windows backend is implemented with `Windows.Graphics.Capture` + D3D11.
 - Linux backend is implemented with `xdg-desktop-portal` (D-Bus) and PipeWire stream, supporting modern desktop environments (Wayland/X11).
+- On Wayland with NVIDIA, the capture may use MemFd and CPU copy when DMA-BUF zero-copy is unavailable.
 - Runtime loading uses `node-gyp-build`, so local build and `prebuilds/` binaries are both supported.
 
 ## Usage
@@ -24,6 +25,9 @@ const rawHandle = capture.getSharedHandle();
 
 // On Wayland with NVIDIA MemFd, getPixelData() can copy the frame through CPU:
 const frameData = capture.getPixelData();
+
+// You can request output format conversion for supported 4-byte layouts:
+const rgbaData = capture.getPixelData('rgba'); // only on wayland
 
 capture.stop();
 ```
@@ -80,6 +84,7 @@ Practical architecture:
 	- `src/win/capture_gdi.cpp` - Windows GDI capture backend
 	- `src/win/capture_factory.cpp` - Windows backend selection and helper logic
 	- `src/linux/platform_capture_linux.cpp` - Linux portal / PipeWire implementation
+	- `src/pixel_conversion.cpp` - color conversion helper for supported pixel layouts
 	- `src/platform_capture_stub.cpp` - compile-time fallback for unsupported systems
 	- `src/platform_capture.hpp` - common backend interface and shared definitions
 - `binding.gyp` also supports `force_api` build flags (`winrt`, `dxgi`, `gdi`) for Windows variants.
