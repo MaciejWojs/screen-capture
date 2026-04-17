@@ -399,11 +399,16 @@ namespace {
     }
 #endif
 
-#if defined(__AVX2__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout);
+#if !defined(__AVX2__)
+    static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
+        convertRow_scalar(src, dst, width, srcLayout, dstLayout);
+    }
+#endif
 #endif
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__AVX512BW__)
     TARGET_ATTR("avx512bw") static void convertRow_avx512(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
         const bool prefetch = ShouldPrefetch(width);
