@@ -62,6 +62,8 @@
             "src/pixel_conversion.cpp"
           ],
           "cflags_cc": [
+            "-mssse3",
+            "-mavx2",
             "<!@(pkg-config --cflags gio-2.0 gio-unix-2.0 glib-2.0 gobject-2.0 libpipewire-0.3 x11 xext)"
           ],
           "libraries": [
