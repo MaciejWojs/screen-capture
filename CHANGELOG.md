@@ -1,3 +1,27 @@
+## 0.3.0 (2026-04-17)
+
+* feat: add CHANGELOG.md for version 0.2.5 with updates on X11 screen capture functionality ([4daa70c](https://github.com/MaciejWojs/screen-capture/commit/4daa70c))
+* feat: add FPS counter and GetFps method to DXGIPlatformCapture class ([68e8e69](https://github.com/MaciejWojs/screen-capture/commit/68e8e69))
+* feat: add FPS counter and GetFps method to WinPlatformCapture class ([9b29f10](https://github.com/MaciejWojs/screen-capture/commit/9b29f10))
+* feat: add FPS tracking and RecordFrame method to BaseLinuxPlatformCapture class ([d3fd46c](https://github.com/MaciejWojs/screen-capture/commit/d3fd46c))
+* feat: add getFps method to IScreenCapture interface and implement in ScreenCapture class ([ab6d6c5](https://github.com/MaciejWojs/screen-capture/commit/ab6d6c5))
+* feat: add pixel data retrieval and backend information methods for platform capture ([2425b46](https://github.com/MaciejWojs/screen-capture/commit/2425b46))
+* feat: add pixel format conversion and update GetPixelData method to support format specification ([0c61817](https://github.com/MaciejWojs/screen-capture/commit/0c61817))
+* feat: add PixelFormatToString function for improved pixel format handling in Linux ([077f62b](https://github.com/MaciejWojs/screen-capture/commit/077f62b))
+* feat: add workspace instructions for native addon build and debugging ([c16a9c9](https://github.com/MaciejWojs/screen-capture/commit/c16a9c9))
+* feat: enhance pixel format conversion with architecture-specific optimizations and prefetching suppo ([09d1d04](https://github.com/MaciejWojs/screen-capture/commit/09d1d04))
+* feat: enhance task details and commands in tasks.json for improved clarity and functionality ([d3fd87e](https://github.com/MaciejWojs/screen-capture/commit/d3fd87e))
+* feat: implement FPS counter and GetFps method in LegacyWinPlatformCapture class ([0c227bd](https://github.com/MaciejWojs/screen-capture/commit/0c227bd))
+* feat: optimize pixel format conversion with AVX2 and SSSE3 support ([39f9e2e](https://github.com/MaciejWojs/screen-capture/commit/39f9e2e))
+* feat: update build strategy to include architecture-specific optimizations ([646a42c](https://github.com/MaciejWojs/screen-capture/commit/646a42c))
+* feat: update package.json to include README.md and CHANGELOG.md in files and scripts ([b5c7d66](https://github.com/MaciejWojs/screen-capture/commit/b5c7d66))
+* feat: WIP enhance WaylandPlatformCapture to support Nvidia GPU detection and buffer type logging ([eb8c1b4](https://github.com/MaciejWojs/screen-capture/commit/eb8c1b4))
+* fix: improve cleanup command in tasks.json for better artifact removal ([fb627fb](https://github.com/MaciejWojs/screen-capture/commit/fb627fb))
+* fix: reduce logging for buffer types in WaylandPlatformCapture class ([b0ff2f1](https://github.com/MaciejWojs/screen-capture/commit/b0ff2f1))
+* fix: update cleanup commands in tasks.json for consistency ([b51852e](https://github.com/MaciejWojs/screen-capture/commit/b51852e))
+* fix: update devDependencies and peerDependencies for compatibility ([acd0335](https://github.com/MaciejWojs/screen-capture/commit/acd0335))
+* fix: update prebuildify scripts for improved compatibility and functionality ([c84c122](https://github.com/MaciejWojs/screen-capture/commit/c84c122))
+* docs: update README.md with detailed architecture and backend implementation for screen capture ([8baa356](https://github.com/MaciejWojs/screen-capture/commit/8baa356))
 
 ## <small>0.2.5 (2026-04-11)</small>
 
