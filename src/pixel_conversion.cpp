@@ -189,7 +189,6 @@ namespace {
     }
 
     static bool SupportsAVX2() {
-#if defined(__AVX2__)
 #if defined(_MSC_VER)
         int cpuInfo[4];
         __cpuid(cpuInfo, 1);
@@ -206,9 +205,6 @@ namespace {
         return (cpuInfo[1] & (1 << 5)) != 0;
 #elif defined(__GNUC__) || defined(__clang__)
         return __builtin_cpu_supports("avx2");
-#else
-        return false;
-#endif
 #else
         return false;
 #endif
@@ -480,8 +476,63 @@ namespace {
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#if defined(__AVX2__)
+#if defined(__GNUC__) || defined(__clang__)
     TARGET_ATTR("avx2") static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
+        const bool needAlphaFill = NeedsAlphaFill(srcLayout);
+        const bool prefetch = ShouldPrefetch(width);
+        const __m256i srcMask = BroadcastShuffleMask(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
+        const __m256i dstMask = BroadcastShuffleMask(kRgbaToDstMask[static_cast<size_t>(dstLayout)]);
+        const __m256i alphaMask = _mm256_set1_epi32(0xFF000000u);
+        const uint8_t* end = src + width * 4;
+        const uint8_t* prefetchPtr = src + 64;
+
+        size_t pixelsRemaining = width;
+        while (pixelsRemaining >= 16) {
+            if (prefetch && prefetchPtr < end) {
+                PrefetchIfNeeded(prefetchPtr, true);
+                prefetchPtr += 64;
+            }
+
+            __m256i source0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+            __m256i source1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 32));
+            __m256i rgba0 = _mm256_shuffle_epi8(source0, srcMask);
+            __m256i rgba1 = _mm256_shuffle_epi8(source1, srcMask);
+            if (needAlphaFill) {
+                rgba0 = _mm256_or_si256(rgba0, alphaMask);
+                rgba1 = _mm256_or_si256(rgba1, alphaMask);
+            }
+            __m256i result0 = _mm256_shuffle_epi8(rgba0, dstMask);
+            __m256i result1 = _mm256_shuffle_epi8(rgba1, dstMask);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), result0);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 32), result1);
+            src += 64;
+            dst += 64;
+            pixelsRemaining -= 16;
+        }
+
+        while (pixelsRemaining >= 8) {
+            if (prefetch && prefetchPtr < end) {
+                PrefetchIfNeeded(prefetchPtr, true);
+                prefetchPtr += 32;
+            }
+            __m256i source = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+            __m256i rgba = _mm256_shuffle_epi8(source, srcMask);
+            if (needAlphaFill) {
+                rgba = _mm256_or_si256(rgba, alphaMask);
+            }
+            __m256i result = _mm256_shuffle_epi8(rgba, dstMask);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), result);
+            src += 32;
+            dst += 32;
+            pixelsRemaining -= 8;
+        }
+
+        if (pixelsRemaining > 0) {
+            convertRow_ssse3(src, dst, pixelsRemaining, srcLayout, dstLayout);
+        }
+    }
+#elif defined(__AVX2__)
+    static void convertRow_avx2(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
         const bool prefetch = ShouldPrefetch(width);
         const __m256i srcMask = BroadcastShuffleMask(kSrcToRgbaMask[static_cast<size_t>(srcLayout)]);
@@ -580,7 +631,7 @@ std::vector<uint8_t> ConvertPixelBuffer(
         converterName = "avx512";
     } else
 #endif
-#if defined(__AVX2__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
         if (SupportsAVX2()) {
             converter = convertRow_avx2;
             converterName = "avx2";
