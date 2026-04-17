@@ -173,16 +173,12 @@ namespace {
     }
 
     static bool SupportsSSSE3() {
-#if defined(__SSSE3__)
 #if defined(_MSC_VER)
         int cpuInfo[4];
         __cpuid(cpuInfo, 1);
         return (cpuInfo[2] & (1 << 9)) != 0;
 #elif defined(__GNUC__) || defined(__clang__)
         return __builtin_cpu_supports("ssse3");
-#else
-        return false;
-#endif
 #else
         return false;
 #endif
@@ -210,7 +206,7 @@ namespace {
 #endif
     }
 
-#if defined(__AVX512BW__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     static bool SupportsAVX512() {
 #if defined(_MSC_VER)
         int cpuInfo[4];
@@ -231,6 +227,10 @@ namespace {
 #else
         return false;
 #endif
+    }
+#else
+    static bool SupportsAVX512() {
+        return false;
     }
 #endif
 
@@ -282,15 +282,13 @@ namespace {
         return _mm256_broadcastsi128_si256(LoadShuffleMask(mask));
     }
 
-#if defined(__AVX512BW__)
-    static inline __m512i BroadcastShuffleMask512(const signed char mask[16]) {
+    TARGET_ATTR("avx512bw") static inline __m512i BroadcastShuffleMask512(const signed char mask[16]) {
         alignas(64) unsigned char buffer[64];
         for (int i = 0; i < 4; ++i) {
             std::memcpy(buffer + i * 16, mask, 16);
         }
         return _mm512_loadu_si512(buffer);
     }
-#endif
 #else
     static inline void PrefetchIfNeeded(const uint8_t*, bool) {}
 #endif
@@ -395,7 +393,7 @@ namespace {
     }
 #endif
 
-#if defined(__AVX512BW__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     TARGET_ATTR("avx512bw") static void convertRow_avx512(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout) {
         const bool needAlphaFill = NeedsAlphaFill(srcLayout);
         const bool prefetch = ShouldPrefetch(width);
@@ -625,7 +623,7 @@ std::vector<uint8_t> ConvertPixelBuffer(
 
     RowConverterFunc converter = convertRow_scalar;
     const char* converterName = "scalar";
-#if defined(__AVX512BW__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     if (SupportsAVX512()) {
         converter = convertRow_avx512;
         converterName = "avx512";
@@ -637,7 +635,7 @@ std::vector<uint8_t> ConvertPixelBuffer(
             converterName = "avx2";
         } else
 #endif
-#if defined(__SSSE3__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
             if (SupportsSSSE3()) {
                 converter = convertRow_ssse3;
                 converterName = "ssse3";
