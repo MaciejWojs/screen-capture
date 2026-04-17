@@ -1,4 +1,10 @@
 ## 0.3.0 (2026-04-17)
+* fix: conditionally define PrefetchIfNeeded for non-x86 architectures ([0fdcd71](https://github.com/MaciejWojs/screen-capture/commit/0fdcd71))
+* fix: correct syntax errors in pixel layout parsing and AVX support checks ([1d76bea](https://github.com/MaciejWojs/screen-capture/commit/1d76bea))
+* docs: update README to include details on Wayland NVIDIA capture and pixel format conversion ([4b6dd9b](https://github.com/MaciejWojs/screen-capture/commit/4b6dd9b))
+* feat: enhance pixel format conversion with architecture-specific optimizations and prefetching suppo ([09d1d04](https://github.com/MaciejWojs/screen-capture/commit/09d1d04))
+
+## 0.3.0 (2026-04-17)
 
 * feat: add CHANGELOG.md for version 0.2.5 with updates on X11 screen capture functionality ([4daa70c](https://github.com/MaciejWojs/screen-capture/commit/4daa70c))
 * feat: add FPS counter and GetFps method to DXGIPlatformCapture class ([68e8e69](https://github.com/MaciejWojs/screen-capture/commit/68e8e69))
