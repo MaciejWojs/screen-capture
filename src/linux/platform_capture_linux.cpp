@@ -564,6 +564,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         bool forceMemFd = IsNvidiaGPU();
 
         if (forceMemFd) {
+            // On some NVIDIA drivers DMA-BUFs are problematic
+            // if DMA-BUFs are not working, we should use raw getPixelData with format conversion (which is slower), instead of completely failing to capture
             params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
                 &builder,
                 SPA_TYPE_OBJECT_Format,
@@ -1041,6 +1043,8 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         return m_sharedHandle ? m_sharedHandle->pixelFormat : 0;
     }
 
+    std::optional<std::vector<uint8_t>> GetPixelData(const std::string& desiredFormat = "rgba") const override;
+
     std::string GetBackendName() const override {
         return "x11";
     }
@@ -1214,6 +1218,53 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
         static_cast<uint32_t>(m_streamConfig->height),
         stride,
         m_streamConfig->pixelFormat,
+        format
+    );
+
+    m_frameConsumed = true;
+    return result;
+}
+
+std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::string& desiredFormat) const {
+    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+    if (!m_sharedFd || *m_sharedFd < 0 || m_frameConsumed || !m_sharedHandle.has_value()) {
+        return std::nullopt;
+    }
+
+    if (m_sharedHandle->width == 0 || m_sharedHandle->height == 0) {
+        return std::nullopt;
+    }
+
+    size_t dataSize = m_sharedHandle->planeSize ? static_cast<size_t>(m_sharedHandle->planeSize)
+        : static_cast<size_t>(m_sharedHandle->stride) * static_cast<size_t>(m_sharedHandle->height);
+    if (dataSize == 0) {
+        return std::nullopt;
+    }
+
+    size_t mapSize = m_sharedHandle->planeSize ? static_cast<size_t>(m_sharedHandle->planeSize)
+        : dataSize + static_cast<size_t>(m_sharedHandle->offset);
+    void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, *m_sharedFd, 0);
+    if (mapped == MAP_FAILED) {
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> buffer(dataSize);
+    memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(m_sharedHandle->offset), dataSize);
+    munmap(mapped, mapSize);
+
+    std::string format = desiredFormat;
+    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+        });
+
+    uint32_t stride = m_sharedHandle->stride ? m_sharedHandle->stride : static_cast<uint32_t>(m_sharedHandle->width * 4);
+    std::vector<uint8_t> result = ConvertPixelBuffer(
+        buffer.data(),
+        buffer.size(),
+        m_sharedHandle->width,
+        m_sharedHandle->height,
+        stride,
+        m_sharedHandle->pixelFormat,
         format
     );
 
