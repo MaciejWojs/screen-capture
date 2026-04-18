@@ -90,6 +90,17 @@ namespace {
         }
     }
 
+    struct MmapDeleter {
+        size_t length = 0;
+        void operator()(void* ptr) const {
+            if (ptr && ptr != MAP_FAILED && length > 0) {
+                munmap(ptr, length);
+            }
+        }
+    };
+
+    using MmapPtr = std::unique_ptr<void, MmapDeleter>;
+
     static std::optional<std::vector<uint8_t>> ReadPixelDataFromSharedFd(
         int fd,
         uint32_t width,
@@ -111,14 +122,13 @@ namespace {
 
         size_t mapSize = planeSize ? static_cast<size_t>(planeSize)
             : dataSize + static_cast<size_t>(offset);
-        void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fd, 0);
-        if (mapped == MAP_FAILED) {
+        MmapPtr mapped(mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fd, 0), MmapDeleter{ mapSize });
+        if (!mapped || mapped.get() == MAP_FAILED) {
             return std::nullopt;
         }
 
         std::vector<uint8_t> buffer(dataSize);
-        memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(offset), dataSize);
-        munmap(mapped, mapSize);
+        memcpy(buffer.data(), static_cast<uint8_t*>(mapped.get()) + static_cast<size_t>(offset), dataSize);
 
         std::string format = desiredFormat;
         std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
@@ -149,6 +159,50 @@ namespace {
         void operator()(int* fd) const { if (fd && *fd >= 0) { close(*fd); delete fd; } }
     };
 
+    struct DisplayDeleter {
+        void operator()(Display* display) const {
+            if (display) {
+                XCloseDisplay(display);
+            }
+        }
+    };
+
+    using DisplayPtr = std::unique_ptr<Display, DisplayDeleter>;
+
+    struct XImageDeleter {
+        void operator()(XImage* image) const {
+            if (image) {
+                XDestroyImage(image);
+            }
+        }
+    };
+
+    using XImagePtr = std::unique_ptr<XImage, XImageDeleter>;
+
+    struct XShmSegmentInfoWrapper {
+        XShmSegmentInfo info{};
+        Display* display = nullptr;
+        bool attached = false;
+
+        bool Attach(Display* display_) {
+            display = display_;
+            attached = XShmAttach(display, &info);
+            return attached;
+        }
+
+        ~XShmSegmentInfoWrapper() {
+            if (attached && display) {
+                XShmDetach(display, &info);
+            }
+            if (info.shmaddr) {
+                shmdt(info.shmaddr);
+            }
+            if (info.shmid >= 0) {
+                shmctl(info.shmid, IPC_RMID, 0);
+            }
+        }
+    };
+
     using GMainLoopPtr = std::unique_ptr<GMainLoop, GenericDeleter<GMainLoop, g_main_loop_unref>>;
     using GMainContextPtr = std::unique_ptr<GMainContext, GenericDeleter<GMainContext, g_main_context_unref>>;
     using GDBusConnectionPtr = std::unique_ptr<GDBusConnection, GObjectDeleter>;
@@ -160,6 +214,23 @@ namespace {
     using GErrorPtr = std::unique_ptr<GError, GenericDeleter<GError, g_error_free>>;
     using GUnixFDListPtr = std::unique_ptr<GUnixFDList, GObjectDeleter>;
     using UniqueFd = std::unique_ptr<int, FdDeleter>;
+
+    struct PipeWireInitializer {
+        bool initialized = false;
+
+        void EnsureInit() {
+            if (!initialized) {
+                pw_init(nullptr, nullptr);
+                initialized = true;
+            }
+        }
+
+        ~PipeWireInitializer() {
+            if (initialized) {
+                pw_deinit();
+            }
+        }
+    };
 
     struct GVariantBuilderWrapper {
         GVariantBuilder builder;
@@ -371,7 +442,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         GMainContextPtr context;
 
         try {
-            pw_init(nullptr, nullptr);
+            static PipeWireInitializer pipewireInitializer;
+            pipewireInitializer.EnsureInit();
 
             context.reset(g_main_context_new());
             g_main_context_push_thread_default(context.get());
@@ -1098,98 +1170,78 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     private:
     void CaptureLoop() {
         std::cerr << "[X11] Uruchamiam proces przechwytywania (CaptureLoop)..." << std::endl;
-        Display* display = XOpenDisplay(nullptr);
+        DisplayPtr display(XOpenDisplay(nullptr));
         if (!display) {
             std::cerr << "[X11] Cannot open display" << std::endl;
             return;
         }
 
-        int screen = DefaultScreen(display);
-        Window root = RootWindow(display, screen);
+        int screen = DefaultScreen(display.get());
+        Window root = RootWindow(display.get(), screen);
 
         XWindowAttributes attr;
-        XGetWindowAttributes(display, root, &attr);
+        XGetWindowAttributes(display.get(), root, &attr);
         int width = attr.width;
         int height = attr.height;
         std::cerr << "[X11] Wymiary okna root: " << width << "x" << height << ", depth=" << attr.depth << std::endl;
 
-        XShmSegmentInfo shminfo;
-        XImage* image = XShmCreateImage(display, attr.visual, attr.depth, ZPixmap, nullptr, &shminfo, width, height);
+        XShmSegmentInfoWrapper shminfo;
+        XImagePtr image(XShmCreateImage(display.get(), attr.visual, attr.depth, ZPixmap, nullptr, &shminfo.info, width, height));
         if (!image) {
             std::cerr << "[X11] Cannot create XShmImage" << std::endl;
-            XCloseDisplay(display);
             return;
         }
 
-        shminfo.shmid = shmget(IPC_PRIVATE, image->bytes_per_line * image->height, IPC_CREAT | 0600);
-        shminfo.shmaddr = image->data = (char*)shmat(shminfo.shmid, 0, 0);
-        shminfo.readOnly = False;
+        shminfo.info.shmid = shmget(IPC_PRIVATE, image->bytes_per_line * image->height, IPC_CREAT | 0600);
+        shminfo.info.shmaddr = image->data = static_cast<char*>(shmat(shminfo.info.shmid, 0, 0));
+        shminfo.info.readOnly = False;
 
-        if (!XShmAttach(display, &shminfo)) {
+        if (!shminfo.Attach(display.get())) {
             std::cerr << "[X11] XShmAttach failed" << std::endl;
-            XDestroyImage(image);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XCloseDisplay(display);
             return;
         }
 
         int memfd = memfd_create("x11_capture", MFD_CLOEXEC);
         if (memfd < 0) {
             std::cerr << "[X11] memfd_create failed" << std::endl;
-            XShmDetach(display, &shminfo);
-            XDestroyImage(image);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XCloseDisplay(display);
             return;
         }
 
+        UniqueFd memfdFd(new int(memfd));
         size_t size = image->bytes_per_line * image->height;
-        if (ftruncate(memfd, size) < 0) {
+        if (ftruncate(*memfdFd, size) < 0) {
             std::cerr << "[X11] ftruncate failed" << std::endl;
-            close(memfd);
-            XShmDetach(display, &shminfo);
-            XDestroyImage(image);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XCloseDisplay(display);
             return;
         }
 
-        void* memfd_ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-        if (memfd_ptr == MAP_FAILED) {
-            close(memfd);
-            XShmDetach(display, &shminfo);
-            XDestroyImage(image);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XCloseDisplay(display);
+        MmapPtr memfd_ptr(mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, *memfdFd, 0), MmapDeleter{ size });
+        if (!memfd_ptr || memfd_ptr.get() == MAP_FAILED) {
             return;
         }
 
-        auto DetectX11PixelFormat = [image]() -> uint32_t {
-            if (!image || image->bits_per_pixel != 32) {
+        XImage* rawImage = image.get();
+        auto DetectX11PixelFormat = [rawImage]() -> uint32_t {
+            if (!rawImage || rawImage->bits_per_pixel != 32) {
                 return SPA_VIDEO_FORMAT_BGRA;
             }
 
-            const unsigned long redMask = image->red_mask;
-            const unsigned long greenMask = image->green_mask;
-            const unsigned long blueMask = image->blue_mask;
-            const unsigned long alphaMask = image->alpha_mask;
+            const unsigned long redMask = rawImage->red_mask;
+            const unsigned long greenMask = rawImage->green_mask;
+            const unsigned long blueMask = rawImage->blue_mask;
+            const unsigned long alphaMask = ~(redMask | greenMask | blueMask);
 
             if (redMask == 0x00ff0000UL && greenMask == 0x0000ff00UL && blueMask == 0x000000ffUL) {
                 if (alphaMask == 0xff000000UL) {
                     return SPA_VIDEO_FORMAT_BGRA;
                 }
-                return image->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_BGRx : SPA_VIDEO_FORMAT_xRGB;
+                return rawImage->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_BGRx : SPA_VIDEO_FORMAT_xRGB;
             }
 
             if (redMask == 0x000000ffUL && greenMask == 0x0000ff00UL && blueMask == 0x00ff0000UL) {
                 if (alphaMask == 0xff000000UL) {
                     return SPA_VIDEO_FORMAT_RGBA;
                 }
-                return image->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_RGBx : SPA_VIDEO_FORMAT_xBGR;
+                return rawImage->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_RGBx : SPA_VIDEO_FORMAT_xBGR;
             }
 
             return SPA_VIDEO_FORMAT_BGRA;
@@ -1222,8 +1274,8 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         while (!m_stopRequested.load()) {
             auto start = std::chrono::steady_clock::now();
 
-            if (XShmGetImage(display, root, image, 0, 0, AllPlanes)) {
-                memcpy(memfd_ptr, image->data, size);
+            if (XShmGetImage(display.get(), root, image.get(), 0, 0, AllPlanes)) {
+                memcpy(memfd_ptr.get(), image->data, size);
 
                 std::unique_lock<std::shared_mutex> lock(m_stateMutex);
                 m_frameConsumed = false;
@@ -1244,14 +1296,10 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         }
         std::cerr << "[X11] Zatrzymywanie pętli CaptureLoop. Sklonowano klatek: " << frameCounter << std::endl;
 
-        // Czyszczenie
-        munmap(memfd_ptr, size);
-        close(memfd);
-        XShmDetach(display, &shminfo);
-        XDestroyImage(image);
-        shmdt(shminfo.shmaddr);
-        shmctl(shminfo.shmid, IPC_RMID, 0);
-        XCloseDisplay(display);
+        // RAII sprząta zasoby: mapowanie, plik, XShm i display.
+        memfd_ptr.reset();
+        (void)memfd_ptr;
+        (void)memfdFd;
     }
 };
 
