@@ -1130,12 +1130,19 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
             const unsigned long redMask = image->red_mask;
             const unsigned long greenMask = image->green_mask;
             const unsigned long blueMask = image->blue_mask;
+            const unsigned long alphaMask = image->alpha_mask;
 
             if (redMask == 0x00ff0000UL && greenMask == 0x0000ff00UL && blueMask == 0x000000ffUL) {
+                if (alphaMask == 0xff000000UL) {
+                    return SPA_VIDEO_FORMAT_BGRA;
+                }
                 return image->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_BGRx : SPA_VIDEO_FORMAT_xRGB;
             }
 
             if (redMask == 0x000000ffUL && greenMask == 0x0000ff00UL && blueMask == 0x00ff0000UL) {
+                if (alphaMask == 0xff000000UL) {
+                    return SPA_VIDEO_FORMAT_RGBA;
+                }
                 return image->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_RGBx : SPA_VIDEO_FORMAT_xBGR;
             }
 
