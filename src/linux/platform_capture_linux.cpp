@@ -90,6 +90,52 @@ namespace {
         }
     }
 
+    static std::optional<std::vector<uint8_t>> ReadPixelDataFromSharedFd(
+        int fd,
+        uint32_t width,
+        uint32_t height,
+        uint32_t stride,
+        uint32_t offset,
+        uint64_t planeSize,
+        uint32_t pixelFormat,
+        const std::string& desiredFormat) {
+        if (fd < 0 || width == 0 || height == 0) {
+            return std::nullopt;
+        }
+
+        size_t dataSize = planeSize ? static_cast<size_t>(planeSize)
+            : static_cast<size_t>(stride) * static_cast<size_t>(height);
+        if (dataSize == 0) {
+            return std::nullopt;
+        }
+
+        size_t mapSize = planeSize ? static_cast<size_t>(planeSize)
+            : dataSize + static_cast<size_t>(offset);
+        void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fd, 0);
+        if (mapped == MAP_FAILED) {
+            return std::nullopt;
+        }
+
+        std::vector<uint8_t> buffer(dataSize);
+        memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(offset), dataSize);
+        munmap(mapped, mapSize);
+
+        std::string format = desiredFormat;
+        std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+            });
+
+        uint32_t actualStride = stride ? stride : static_cast<uint32_t>(width * 4);
+        return ConvertPixelBuffer(
+            buffer.data(),
+            buffer.size(),
+            width,
+            height,
+            actualStride,
+            pixelFormat,
+            format);
+    }
+
     template <typename T, auto FreeFunc>
     struct GenericDeleter {
         void operator()(T* ptr) const { if (ptr) FreeFunc(ptr); }
@@ -1219,39 +1265,19 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
         return std::nullopt;
     }
 
-    size_t dataSize = m_planeSize ? static_cast<size_t>(m_planeSize)
-        : static_cast<size_t>(m_stride) * static_cast<size_t>(m_streamConfig->height);
-    if (dataSize == 0) {
-        return std::nullopt;
-    }
-
-    size_t mapSize = m_planeSize ? static_cast<size_t>(m_planeSize) : dataSize + static_cast<size_t>(m_offset);
-    void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, *m_sharedFd, 0);
-    if (mapped == MAP_FAILED) {
-        return std::nullopt;
-    }
-
-    std::vector<uint8_t> buffer(dataSize);
-    memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(m_offset), dataSize);
-    munmap(mapped, mapSize);
-
-    std::string format = desiredFormat;
-    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-        });
-
-    uint32_t stride = m_stride ? m_stride : static_cast<uint32_t>(m_streamConfig->width * 4);
-    std::vector<uint8_t> result = ConvertPixelBuffer(
-        buffer.data(),
-        buffer.size(),
+    std::optional<std::vector<uint8_t>> result = ReadPixelDataFromSharedFd(
+        *m_sharedFd,
         static_cast<uint32_t>(m_streamConfig->width),
         static_cast<uint32_t>(m_streamConfig->height),
-        stride,
+        m_stride,
+        m_offset,
+        m_planeSize,
         m_streamConfig->pixelFormat,
-        format
-    );
+        desiredFormat);
 
-    m_frameConsumed = true;
+    if (result) {
+        m_frameConsumed = true;
+    }
     return result;
 }
 
@@ -1265,40 +1291,19 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
         return std::nullopt;
     }
 
-    size_t dataSize = m_sharedHandle->planeSize ? static_cast<size_t>(m_sharedHandle->planeSize)
-        : static_cast<size_t>(m_sharedHandle->stride) * static_cast<size_t>(m_sharedHandle->height);
-    if (dataSize == 0) {
-        return std::nullopt;
-    }
-
-    size_t mapSize = m_sharedHandle->planeSize ? static_cast<size_t>(m_sharedHandle->planeSize)
-        : dataSize + static_cast<size_t>(m_sharedHandle->offset);
-    void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, *m_sharedFd, 0);
-    if (mapped == MAP_FAILED) {
-        return std::nullopt;
-    }
-
-    std::vector<uint8_t> buffer(dataSize);
-    memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(m_sharedHandle->offset), dataSize);
-    munmap(mapped, mapSize);
-
-    std::string format = desiredFormat;
-    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-        });
-
-    uint32_t stride = m_sharedHandle->stride ? m_sharedHandle->stride : static_cast<uint32_t>(m_sharedHandle->width * 4);
-    std::vector<uint8_t> result = ConvertPixelBuffer(
-        buffer.data(),
-        buffer.size(),
+    std::optional<std::vector<uint8_t>> result = ReadPixelDataFromSharedFd(
+        *m_sharedFd,
         m_sharedHandle->width,
         m_sharedHandle->height,
-        stride,
+        m_sharedHandle->stride,
+        m_sharedHandle->offset,
+        m_sharedHandle->planeSize,
         m_sharedHandle->pixelFormat,
-        format
-    );
+        desiredFormat);
 
-    m_frameConsumed = true;
+    if (result) {
+        m_frameConsumed = true;
+    }
     return result;
 }
 
