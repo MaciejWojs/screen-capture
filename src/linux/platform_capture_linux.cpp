@@ -1122,10 +1122,33 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
             return;
         }
 
+        auto DetectX11PixelFormat = [image]() -> uint32_t {
+            if (!image || image->bits_per_pixel != 32) {
+                return SPA_VIDEO_FORMAT_BGRA;
+            }
+
+            const unsigned long redMask = image->red_mask;
+            const unsigned long greenMask = image->green_mask;
+            const unsigned long blueMask = image->blue_mask;
+
+            if (redMask == 0x00ff0000UL && greenMask == 0x0000ff00UL && blueMask == 0x000000ffUL) {
+                return image->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_BGRx : SPA_VIDEO_FORMAT_xRGB;
+            }
+
+            if (redMask == 0x000000ffUL && greenMask == 0x0000ff00UL && blueMask == 0x00ff0000UL) {
+                return image->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_RGBx : SPA_VIDEO_FORMAT_xBGR;
+            }
+
+            return SPA_VIDEO_FORMAT_BGRA;
+            };
+
+        uint32_t detectedFormat = DetectX11PixelFormat();
+
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
             m_sharedFd.reset(new int(dup(memfd)));
             std::cerr << "[X11] MemFd utworzony, FD: " << *m_sharedFd << " (size: " << size << ")" << std::endl;
+            std::cerr << "[X11] Wykryty format piksela X11: " << PixelFormatToString(detectedFormat) << " (depth=" << image->depth << ", bpp=" << image->bits_per_pixel << ")" << std::endl;
             m_sharedHandle = SharedHandleInfo{
                 static_cast<uint64_t>(*m_sharedFd),
                 static_cast<uint32_t>(width),
@@ -1133,7 +1156,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 static_cast<uint32_t>(image->bytes_per_line),
                 0, // offset
                 static_cast<uint64_t>(size), // planeSize
-                7, // SPA_VIDEO_FORMAT_BGRA domyślny format wizualizacji X11 dla ZPixmap z głębią 24/32
+                detectedFormat,
                 0, // modifier
                 1, // Przywrócono typ 1 (MemFd), w 'preload' dodano wsparcie dla type=1
                 static_cast<uint32_t>(size) // chunkSize
