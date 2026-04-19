@@ -7,7 +7,8 @@
 #endif
 
 #ifdef __linux__
-#include <spa/param/video/format-utils.h>
+#include <spa/param/video/format.h>
+#include <spa/buffer/buffer.h>
 #endif
 
 #include "serialize.hpp"
@@ -77,6 +78,15 @@ Napi::Value SerializeSharedHandleLegacy(Napi::Env env, const std::optional<Share
 
 Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<SharedHandleInfo>& shared) {
     if (!shared.has_value()) return env.Null();
+
+#ifdef __linux__
+    if (shared->bufferType != SPA_DATA_DmaBuf) {
+        if (shared->bufferType == SPA_DATA_MemFd) {
+            std::cerr << "You should use getPixelData for SPA_DATA_MemFd buffer type, as it is not supported in Electron shared textures." << std::endl;
+        }
+        return env.Null();
+    }
+#endif
 
     Napi::Object obj = Napi::Object::New(env);
 
