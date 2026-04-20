@@ -7,6 +7,7 @@ Native Node.js addon for screen capture. Packages are published to NPM with prov
 - Windows backend is implemented with `Windows.Graphics.Capture` + D3D11.
 - Linux backend is implemented with `xdg-desktop-portal` (D-Bus) and PipeWire stream, supporting modern desktop environments (Wayland/X11).
 - On Wayland with NVIDIA, the capture may use MemFd and CPU copy when DMA-BUF zero-copy is unavailable.
+- In this MemFd CPU fallback, `getSharedTextureInfo()` / shared texture export may be unavailable and `getPixelData()` is the supported path.
 - Runtime loading uses `node-gyp-build`, so local build and `prebuilds/` binaries are both supported.
 
 ## Usage
@@ -19,6 +20,7 @@ capture.start();
 
 // Get texture structure formatted for Electron's shared-texture API:
 const textureInfo = capture.getSharedTextureInfo();
+// On Wayland with NVIDIA MemFd CPU fallback, shared texture info may be unavailable.
 
 // Or get the raw handle data (legacy):
 const rawHandle = capture.getSharedHandle();
