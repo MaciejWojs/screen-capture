@@ -205,26 +205,32 @@ namespace {
         uint32_t height,
         uint32_t stride,
         uint64_t planeSize,
+        size_t availableBytes,
         uint32_t pixelFormat,
         const std::string& desiredFormat) {
         if (!data || width == 0 || height == 0) {
             return std::nullopt;
         }
 
-        size_t expectedSize = planeSize ? static_cast<size_t>(planeSize)
-            : static_cast<size_t>(stride) * static_cast<size_t>(height);
-        if (expectedSize == 0) {
+        const size_t rowBytes = static_cast<size_t>(width) * 4;
+        uint32_t actualStride = stride ? stride : static_cast<uint32_t>(rowBytes);
+        if (static_cast<size_t>(actualStride) < rowBytes) {
             return std::nullopt;
         }
 
-        const size_t rowBytes = static_cast<size_t>(width) * 4;
+        size_t expectedSize = planeSize ? static_cast<size_t>(planeSize)
+            : static_cast<size_t>(actualStride) * static_cast<size_t>(height);
+        if (expectedSize == 0 || expectedSize > availableBytes) {
+            return std::nullopt;
+        }
+
         std::vector<uint8_t> buffer(expectedSize);
 
-        if (stride == rowBytes) {
+        if (actualStride == rowBytes) {
             std::memcpy(buffer.data(), data, expectedSize);
         } else {
             for (uint32_t row = 0; row < height; ++row) {
-                const uint8_t* srcRow = data + static_cast<size_t>(row) * stride;
+                const uint8_t* srcRow = data + static_cast<size_t>(row) * actualStride;
                 uint8_t* dstRow = buffer.data() + static_cast<size_t>(row) * rowBytes;
                 std::memcpy(dstRow, srcRow, rowBytes);
             }
@@ -237,7 +243,7 @@ namespace {
             });
 
         if (normalizedDesired == sourceFormat) {
-            if (stride == rowBytes) {
+            if (actualStride == rowBytes) {
                 return buffer;
             }
             std::vector<uint8_t> packedResult(rowBytes * static_cast<size_t>(height));
@@ -255,7 +261,7 @@ namespace {
             buffer.size(),
             width,
             height,
-            stride,
+            actualStride,
             pixelFormat,
             desiredFormat);
     }
@@ -552,7 +558,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     std::atomic<int> m_pendingPipewireFd{ -1 };
     mutable FrameBufferPool m_frameBuffers;
     mutable MmapPtr m_cachedMapping;
-    mutable int m_cachedFd = -1;
+    mutable SharedFd m_cachedFd;
     mutable size_t m_cachedMapSize = 0;
 
     void RunCaptureFlow() {
@@ -913,7 +919,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_chunkSize = 0;
         m_frameBuffers.Reset();
         m_cachedMapping.reset();
-        m_cachedFd = -1;
+        m_cachedFd.reset();
         m_cachedMapSize = 0;
         m_loggedNonDmabuf = false;
         m_frameConsumed = false;
@@ -952,11 +958,12 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         std::optional<SharedHandleInfo> handle;
         if (m_streamConfig) {
+            uint32_t stride = m_stride ? m_stride : static_cast<uint32_t>(m_streamConfig->width) * 4;
             handle = SharedHandleInfo{
                 static_cast<uint64_t>(bufferFd),
                 m_streamConfig->width,
                 m_streamConfig->height,
-                m_stride,
+                stride,
                 m_offset,
                 m_planeSize,
                 m_streamConfig->pixelFormat,
@@ -968,7 +975,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_frameBuffers.PushFrame(SharedFd(new int(bufferFd), FdDeleter()), std::move(handle));
 
         m_cachedMapping.reset();
-        m_cachedFd = -1;
+        m_cachedFd.reset();
         m_cachedMapSize = 0;
 
         m_sharedFd.reset(new int(sharedFd));
@@ -1099,7 +1106,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                     if (data.chunk) {
                         self->m_stride = data.chunk->stride;
                         self->m_offset = data.chunk->offset;
-                        self->m_planeSize = data.maxsize;
+                        self->m_planeSize = data.chunk->size;
                     } else {
                         self->m_stride = 0;
                         self->m_offset = 0;
@@ -1289,7 +1296,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
             m_cachedMapping.reset();
-            m_cachedFd = -1;
+            m_cachedFd.reset();
             m_cachedMapSize = 0;
             m_frameBuffers.Reset();
             for (auto& mapping : m_captureMappings) {
@@ -1331,7 +1338,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
 
     private:
     mutable MmapPtr m_cachedMapping;
-    mutable int m_cachedFd = -1;
+    mutable SharedFd m_cachedFd;
     mutable size_t m_cachedMapSize = 0;
     mutable FrameBufferPool m_frameBuffers;
     std::array<UniqueFd, 2> m_captureFds;
@@ -1424,7 +1431,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
             m_cachedMapping.reset();
-            m_cachedFd = -1;
+            m_cachedFd.reset();
             m_cachedMapSize = 0;
             if (m_captureFds[0] && *m_captureFds[0] >= 0) {
                 m_sharedFd.reset(new int(dup(*m_captureFds[0])));
@@ -1516,20 +1523,38 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
         return std::nullopt;
     }
 
+    size_t dataSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
+        : static_cast<size_t>(handle.stride) * static_cast<size_t>(handle.height);
     size_t mapSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
-        : static_cast<size_t>(handle.stride) * static_cast<size_t>(handle.height) + static_cast<size_t>(handle.offset);
+        : dataSize + static_cast<size_t>(handle.offset);
+
+    if (static_cast<size_t>(handle.offset) >= mapSize) {
+        std::cerr << "[Wayland] Invalid offset: " << handle.offset << " >= mapSize " << mapSize << std::endl;
+        return std::nullopt;
+    }
+
+    size_t available = mapSize - static_cast<size_t>(handle.offset);
+    if (dataSize > available) {
+        std::cerr << "[Wayland] dataSize " << dataSize << " exceeds available " << available << std::endl;
+        return std::nullopt;
+    }
+
+    std::cerr << "[Wayland] frame: fd=" << handle.handle << " width=" << handle.width << " height=" << handle.height
+        << " stride=" << handle.stride << " offset=" << handle.offset << " planeSize=" << handle.planeSize
+        << " dataSize=" << dataSize << " mapSize=" << mapSize << " available=" << available << std::endl;
+
     const uint8_t* mappedData = nullptr;
 
     {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        if (!m_cachedMapping || m_cachedFd != static_cast<int>(handle.handle) || m_cachedMapSize != mapSize) {
+        if (!m_cachedMapping || m_cachedFd != frame->fd || m_cachedMapSize != mapSize) {
             m_cachedMapping.reset();
             void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, static_cast<int>(handle.handle), 0);
             if (ptr == MAP_FAILED) {
                 return std::nullopt;
             }
             m_cachedMapping = MmapPtr(ptr, MmapDeleter{ mapSize });
-            m_cachedFd = static_cast<int>(handle.handle);
+            m_cachedFd = frame->fd;
             m_cachedMapSize = mapSize;
         }
         mappedData = static_cast<const uint8_t*>(m_cachedMapping.get());
@@ -1544,7 +1569,8 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
         handle.width,
         handle.height,
         handle.stride,
-        handle.planeSize,
+        dataSize,
+        available,
         handle.pixelFormat,
         desiredFormat);
 
@@ -1568,20 +1594,37 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
         return std::nullopt;
     }
 
+    size_t dataSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
+        : static_cast<size_t>(handle.stride) * static_cast<size_t>(handle.height);
     size_t mapSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
-        : static_cast<size_t>(handle.stride) * static_cast<size_t>(handle.height) + static_cast<size_t>(handle.offset);
+        : dataSize + static_cast<size_t>(handle.offset);
+
+    if (static_cast<size_t>(handle.offset) >= mapSize) {
+        std::cerr << "[X11] Invalid offset: " << handle.offset << " >= mapSize " << mapSize << std::endl;
+        return std::nullopt;
+    }
+    size_t available = mapSize - static_cast<size_t>(handle.offset);
+    if (dataSize > available) {
+        std::cerr << "[X11] dataSize " << dataSize << " exceeds available " << available << std::endl;
+        return std::nullopt;
+    }
+
+    std::cerr << "[X11] frame: fd=" << handle.handle << " width=" << handle.width << " height=" << handle.height
+        << " stride=" << handle.stride << " offset=" << handle.offset << " planeSize=" << handle.planeSize
+        << " dataSize=" << dataSize << " mapSize=" << mapSize << " available=" << available << std::endl;
+
     const uint8_t* mappedData = nullptr;
 
     {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        if (!m_cachedMapping || m_cachedFd != static_cast<int>(handle.handle) || m_cachedMapSize != mapSize) {
+        if (!m_cachedMapping || m_cachedFd != frame->fd || m_cachedMapSize != mapSize) {
             m_cachedMapping.reset();
             void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, static_cast<int>(handle.handle), 0);
             if (ptr == MAP_FAILED) {
                 return std::nullopt;
             }
             m_cachedMapping = MmapPtr(ptr, MmapDeleter{ mapSize });
-            m_cachedFd = static_cast<int>(handle.handle);
+            m_cachedFd = frame->fd;
             m_cachedMapSize = mapSize;
         }
         mappedData = static_cast<const uint8_t*>(m_cachedMapping.get());
@@ -1596,7 +1639,8 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
         handle.width,
         handle.height,
         handle.stride,
-        handle.planeSize,
+        dataSize,
+        available,
         handle.pixelFormat,
         desiredFormat);
 
