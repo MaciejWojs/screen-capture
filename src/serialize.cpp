@@ -7,7 +7,8 @@
 #endif
 
 #ifdef __linux__
-#include <spa/param/video/format-utils.h>
+#include <spa/param/video/format.h>
+#include <spa/buffer/buffer.h>
 #endif
 
 #include "serialize.hpp"
@@ -78,9 +79,20 @@ Napi::Value SerializeSharedHandleLegacy(Napi::Env env, const std::optional<Share
 Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<SharedHandleInfo>& shared) {
     if (!shared.has_value()) return env.Null();
 
+#ifdef __linux__
+    if (shared->bufferType != SPA_DATA_DmaBuf) {
+        if (shared->bufferType == SPA_DATA_MemFd) {
+            std::cerr << "You should use getPixelData for SPA_DATA_MemFd buffer type, as it is not supported in Electron shared textures." << std::endl;
+        }
+        return env.Null();
+    }
+#endif
+
     Napi::Object obj = Napi::Object::New(env);
 
-    obj.Set("pixelFormat", Napi::String::New(env, PixelFormatToString(shared->pixelFormat)));
+    std::string pixelFormat = PixelFormatToString(shared->pixelFormat);
+
+    obj.Set("pixelFormat", Napi::String::New(env, pixelFormat));
 
     Napi::Object codedSize = Napi::Object::New(env);
     codedSize.Set("width", shared->width);
@@ -96,7 +108,6 @@ Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<Shared
     handle.Set("ntHandle", buffer);
 #elif defined(__linux__)
     // Linux expects nativePixmap object typically, or fd inside.
-    // For now we assume typical fd mapping if used. If needed, can be mapped into nativePixmap...
     Napi::Object nativePixmap = Napi::Object::New(env);
     Napi::Array planes = Napi::Array::New(env, 1);
     Napi::Object plane = Napi::Object::New(env);
@@ -106,7 +117,7 @@ Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<Shared
     plane.Set("fd", static_cast<uint32_t>(shared->handle));
     planes.Set(uint32_t(0), plane);
     nativePixmap.Set("planes", planes);
-    nativePixmap.Set("modifier", Napi::String::New(env, std::to_string(shared->modifier))); // Just stringified modifier for now
+    nativePixmap.Set("modifier", Napi::BigInt::New(env, shared->modifier));
     handle.Set("nativePixmap", nativePixmap);
 #endif
 

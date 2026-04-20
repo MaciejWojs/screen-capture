@@ -90,6 +90,186 @@ namespace {
         }
     }
 
+    struct MmapDeleter {
+        size_t length = 0;
+        void operator()(void* ptr) const {
+            if (ptr && ptr != MAP_FAILED && length > 0) {
+                munmap(ptr, length);
+            }
+        }
+    };
+
+    using MmapPtr = std::shared_ptr<void>;
+    using SharedFd = std::shared_ptr<int>;
+
+    struct FrameBufferSlot {
+        SharedFd fd;
+        std::optional<SharedHandleInfo> handle;
+        bool ready = false;
+    };
+
+    class FrameBufferPool {
+        public:
+        void Reset() {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (auto& slot : m_slots) {
+                slot.fd.reset();
+                slot.handle.reset();
+                slot.ready = false;
+            }
+            m_writeIndex = 0;
+            m_readIndex = 0;
+        }
+
+        void PushFrame(SharedFd fd, std::optional<SharedHandleInfo> handle) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            size_t writeIdx = m_writeIndex;
+            FrameBufferSlot& slot = m_slots[writeIdx];
+            slot.fd = std::move(fd);
+            slot.handle = std::move(handle);
+            slot.ready = true;
+            m_readIndex = writeIdx;
+            m_writeIndex = (writeIdx + 1) % m_slots.size();
+        }
+
+        std::optional<FrameBufferSlot> AcquireReadFrame() {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            size_t startIdx = m_readIndex;
+            for (size_t i = 0; i < m_slots.size(); ++i) {
+                size_t idx = (startIdx + i) % m_slots.size();
+                if (m_slots[idx].ready) {
+                    FrameBufferSlot result = m_slots[idx];
+                    m_slots[idx].ready = false;
+                    m_readIndex = (idx + 1) % m_slots.size();
+                    return result;
+                }
+            }
+            return std::nullopt;
+        }
+
+        private:
+        std::array<FrameBufferSlot, 4> m_slots;
+        size_t m_writeIndex = 0;
+        size_t m_readIndex = 0;
+        std::mutex m_mutex;
+    };
+
+    static std::optional<std::vector<uint8_t>> ReadPixelDataFromSharedFd(
+        int fd,
+        uint32_t width,
+        uint32_t height,
+        uint32_t stride,
+        uint32_t offset,
+        uint64_t planeSize,
+        uint32_t pixelFormat,
+        const std::string& desiredFormat) {
+        if (fd < 0 || width == 0 || height == 0) {
+            return std::nullopt;
+        }
+
+        size_t dataSize = planeSize ? static_cast<size_t>(planeSize)
+            : static_cast<size_t>(stride) * static_cast<size_t>(height);
+        if (dataSize == 0) {
+            return std::nullopt;
+        }
+
+        size_t mapSize = planeSize ? static_cast<size_t>(planeSize)
+            : dataSize + static_cast<size_t>(offset);
+        MmapPtr mapped(mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fd, 0), MmapDeleter{ mapSize });
+        if (!mapped || mapped.get() == MAP_FAILED) {
+            return std::nullopt;
+        }
+
+        std::vector<uint8_t> buffer(dataSize);
+        memcpy(buffer.data(), static_cast<uint8_t*>(mapped.get()) + static_cast<size_t>(offset), dataSize);
+
+        std::string format = desiredFormat;
+        std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+            });
+
+        uint32_t actualStride = stride ? stride : static_cast<uint32_t>(width * 4);
+        return ConvertPixelBuffer(
+            buffer.data(),
+            buffer.size(),
+            width,
+            height,
+            actualStride,
+            pixelFormat,
+            format);
+    }
+
+    static std::optional<std::vector<uint8_t>> ReadPixelDataFromRawPointer(
+        const uint8_t* data,
+        uint32_t width,
+        uint32_t height,
+        uint32_t stride,
+        uint64_t planeSize,
+        size_t availableBytes,
+        uint32_t pixelFormat,
+        const std::string& desiredFormat) {
+        if (!data || width == 0 || height == 0) {
+            return std::nullopt;
+        }
+
+        const size_t rowBytes = static_cast<size_t>(width) * 4;
+        uint32_t actualStride = stride ? stride : static_cast<uint32_t>(rowBytes);
+        if (static_cast<size_t>(actualStride) < rowBytes) {
+            return std::nullopt;
+        }
+
+        size_t expectedSize = planeSize ? static_cast<size_t>(planeSize)
+            : static_cast<size_t>(actualStride) * static_cast<size_t>(height);
+        if (expectedSize == 0 || expectedSize > availableBytes) {
+            return std::nullopt;
+        }
+
+        std::vector<uint8_t> buffer(expectedSize);
+
+        if (actualStride == rowBytes) {
+            std::memcpy(buffer.data(), data, expectedSize);
+        } else {
+            for (uint32_t row = 0; row < height; ++row) {
+                size_t srcOffset = static_cast<size_t>(row) * actualStride;
+                if (srcOffset + rowBytes > availableBytes) {
+                    return std::nullopt;
+                }
+                const uint8_t* srcRow = data + srcOffset;
+                uint8_t* dstRow = buffer.data() + static_cast<size_t>(row) * rowBytes;
+                std::memcpy(dstRow, srcRow, rowBytes);
+            }
+        }
+
+        std::string sourceFormat = PixelFormatToString(pixelFormat);
+        std::string normalizedDesired = desiredFormat;
+        std::transform(normalizedDesired.begin(), normalizedDesired.end(), normalizedDesired.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+            });
+
+        if (normalizedDesired == sourceFormat) {
+            if (actualStride == rowBytes) {
+                return buffer;
+            }
+            std::vector<uint8_t> packedResult(rowBytes * static_cast<size_t>(height));
+            for (uint32_t row = 0; row < height; ++row) {
+                std::memcpy(
+                    packedResult.data() + static_cast<size_t>(row) * rowBytes,
+                    buffer.data() + static_cast<size_t>(row) * rowBytes,
+                    rowBytes);
+            }
+            return packedResult;
+        }
+
+        return ConvertPixelBuffer(
+            buffer.data(),
+            buffer.size(),
+            width,
+            height,
+            actualStride,
+            pixelFormat,
+            desiredFormat);
+    }
+
     template <typename T, auto FreeFunc>
     struct GenericDeleter {
         void operator()(T* ptr) const { if (ptr) FreeFunc(ptr); }
@@ -103,6 +283,50 @@ namespace {
         void operator()(int* fd) const { if (fd && *fd >= 0) { close(*fd); delete fd; } }
     };
 
+    struct DisplayDeleter {
+        void operator()(Display* display) const {
+            if (display) {
+                XCloseDisplay(display);
+            }
+        }
+    };
+
+    using DisplayPtr = std::unique_ptr<Display, DisplayDeleter>;
+
+    struct XImageDeleter {
+        void operator()(XImage* image) const {
+            if (image) {
+                XDestroyImage(image);
+            }
+        }
+    };
+
+    using XImagePtr = std::unique_ptr<XImage, XImageDeleter>;
+
+    struct XShmSegmentInfoWrapper {
+        XShmSegmentInfo info{};
+        Display* display = nullptr;
+        bool attached = false;
+
+        bool Attach(Display* display_) {
+            display = display_;
+            attached = XShmAttach(display, &info);
+            return attached;
+        }
+
+        ~XShmSegmentInfoWrapper() {
+            if (attached && display) {
+                XShmDetach(display, &info);
+            }
+            if (info.shmaddr) {
+                shmdt(info.shmaddr);
+            }
+            if (info.shmid >= 0) {
+                shmctl(info.shmid, IPC_RMID, 0);
+            }
+        }
+    };
+
     using GMainLoopPtr = std::unique_ptr<GMainLoop, GenericDeleter<GMainLoop, g_main_loop_unref>>;
     using GMainContextPtr = std::unique_ptr<GMainContext, GenericDeleter<GMainContext, g_main_context_unref>>;
     using GDBusConnectionPtr = std::unique_ptr<GDBusConnection, GObjectDeleter>;
@@ -114,6 +338,23 @@ namespace {
     using GErrorPtr = std::unique_ptr<GError, GenericDeleter<GError, g_error_free>>;
     using GUnixFDListPtr = std::unique_ptr<GUnixFDList, GObjectDeleter>;
     using UniqueFd = std::unique_ptr<int, FdDeleter>;
+
+    struct PipeWireInitializer {
+        bool initialized = false;
+
+        void EnsureInit() {
+            if (!initialized) {
+                pw_init(nullptr, nullptr);
+                initialized = true;
+            }
+        }
+
+        ~PipeWireInitializer() {
+            if (initialized) {
+                pw_deinit();
+            }
+        }
+    };
 
     struct GVariantBuilderWrapper {
         GVariantBuilder builder;
@@ -319,13 +560,18 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     std::chrono::steady_clock::time_point m_lastMemFdLogTime = std::chrono::steady_clock::time_point::min();
 
     std::atomic<int> m_pendingPipewireFd{ -1 };
+    mutable FrameBufferPool m_frameBuffers;
+    mutable MmapPtr m_cachedMapping;
+    mutable SharedFd m_cachedFd;
+    mutable size_t m_cachedMapSize = 0;
 
     void RunCaptureFlow() {
         int pipewireFd = -1;
         GMainContextPtr context;
 
         try {
-            pw_init(nullptr, nullptr);
+            static PipeWireInitializer pipewireInitializer;
+            pipewireInitializer.EnsureInit();
 
             context.reset(g_main_context_new());
             g_main_context_push_thread_default(context.get());
@@ -675,6 +921,10 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_planeSize = 0;
         m_bufferType = 0;
         m_chunkSize = 0;
+        m_frameBuffers.Reset();
+        m_cachedMapping.reset();
+        m_cachedFd.reset();
+        m_cachedMapSize = 0;
         m_loggedNonDmabuf = false;
         m_frameConsumed = false;
     }
@@ -699,13 +949,40 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     void UpdateSharedHandleFromFd(int fd) {
-        int duplicatedFd = dup(fd);
-        if (duplicatedFd < 0) {
+        int bufferFd = dup(fd);
+        if (bufferFd < 0) {
+            return;
+        }
+        int sharedFd = dup(fd);
+        if (sharedFd < 0) {
+            close(bufferFd);
             return;
         }
 
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        m_sharedFd.reset(new int(duplicatedFd));
+        std::optional<SharedHandleInfo> handle;
+        if (m_streamConfig) {
+            uint32_t stride = m_stride ? m_stride : static_cast<uint32_t>(m_streamConfig->width) * 4;
+            handle = SharedHandleInfo{
+                static_cast<uint64_t>(bufferFd),
+                m_streamConfig->width,
+                m_streamConfig->height,
+                stride,
+                m_offset,
+                m_planeSize,
+                m_streamConfig->pixelFormat,
+                m_streamConfig->modifier,
+                m_bufferType,
+                m_chunkSize,
+            };
+        }
+        m_frameBuffers.PushFrame(SharedFd(new int(bufferFd), FdDeleter()), std::move(handle));
+
+        m_cachedMapping.reset();
+        m_cachedFd.reset();
+        m_cachedMapSize = 0;
+
+        m_sharedFd.reset(new int(sharedFd));
         m_frameConsumed = false;
         PublishSharedHandleLocked();
     }
@@ -833,7 +1110,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                     if (data.chunk) {
                         self->m_stride = data.chunk->stride;
                         self->m_offset = data.chunk->offset;
-                        self->m_planeSize = data.maxsize;
+                        self->m_planeSize = data.chunk->size;
                     } else {
                         self->m_stride = 0;
                         self->m_offset = 0;
@@ -1020,6 +1297,20 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         if (m_worker.joinable() && std::this_thread::get_id() != m_worker.get_id()) {
             m_worker.join();
         }
+        {
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+            m_cachedMapping.reset();
+            m_cachedFd.reset();
+            m_cachedMapSize = 0;
+            m_frameBuffers.Reset();
+            for (auto& mapping : m_captureMappings) {
+                mapping.reset();
+            }
+            for (auto& fd : m_captureFds) {
+                fd.reset();
+            }
+            m_captureWriteIndex = 0;
+        }
         m_running.store(false);
     }
 
@@ -1050,82 +1341,111 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     private:
+    mutable MmapPtr m_cachedMapping;
+    mutable SharedFd m_cachedFd;
+    mutable size_t m_cachedMapSize = 0;
+    mutable FrameBufferPool m_frameBuffers;
+    std::array<UniqueFd, 2> m_captureFds;
+    std::array<MmapPtr, 2> m_captureMappings;
+    size_t m_captureWriteIndex = 0;
+
     void CaptureLoop() {
         std::cerr << "[X11] Uruchamiam proces przechwytywania (CaptureLoop)..." << std::endl;
-        Display* display = XOpenDisplay(nullptr);
+        DisplayPtr display(XOpenDisplay(nullptr));
         if (!display) {
             std::cerr << "[X11] Cannot open display" << std::endl;
             return;
         }
 
-        int screen = DefaultScreen(display);
-        Window root = RootWindow(display, screen);
+        int screen = DefaultScreen(display.get());
+        Window root = RootWindow(display.get(), screen);
 
         XWindowAttributes attr;
-        XGetWindowAttributes(display, root, &attr);
+        XGetWindowAttributes(display.get(), root, &attr);
         int width = attr.width;
         int height = attr.height;
         std::cerr << "[X11] Wymiary okna root: " << width << "x" << height << ", depth=" << attr.depth << std::endl;
 
-        XShmSegmentInfo shminfo;
-        XImage* image = XShmCreateImage(display, attr.visual, attr.depth, ZPixmap, nullptr, &shminfo, width, height);
+        XShmSegmentInfoWrapper shminfo;
+        XImagePtr image(XShmCreateImage(display.get(), attr.visual, attr.depth, ZPixmap, nullptr, &shminfo.info, width, height));
         if (!image) {
             std::cerr << "[X11] Cannot create XShmImage" << std::endl;
-            XCloseDisplay(display);
             return;
         }
 
-        shminfo.shmid = shmget(IPC_PRIVATE, image->bytes_per_line * image->height, IPC_CREAT | 0600);
-        shminfo.shmaddr = image->data = (char*)shmat(shminfo.shmid, 0, 0);
-        shminfo.readOnly = False;
+        shminfo.info.shmid = shmget(IPC_PRIVATE, image->bytes_per_line * image->height, IPC_CREAT | 0600);
+        shminfo.info.shmaddr = image->data = static_cast<char*>(shmat(shminfo.info.shmid, 0, 0));
+        shminfo.info.readOnly = False;
 
-        if (!XShmAttach(display, &shminfo)) {
+        if (!shminfo.Attach(display.get())) {
             std::cerr << "[X11] XShmAttach failed" << std::endl;
-            XDestroyImage(image);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XCloseDisplay(display);
-            return;
-        }
-
-        int memfd = memfd_create("x11_capture", MFD_CLOEXEC);
-        if (memfd < 0) {
-            std::cerr << "[X11] memfd_create failed" << std::endl;
-            XShmDetach(display, &shminfo);
-            XDestroyImage(image);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XCloseDisplay(display);
             return;
         }
 
         size_t size = image->bytes_per_line * image->height;
-        if (ftruncate(memfd, size) < 0) {
-            std::cerr << "[X11] ftruncate failed" << std::endl;
-            close(memfd);
-            XShmDetach(display, &shminfo);
-            XDestroyImage(image);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XCloseDisplay(display);
-            return;
+        for (size_t i = 0; i < m_captureFds.size(); ++i) {
+            int memfd = memfd_create("x11_capture", MFD_CLOEXEC);
+            if (memfd < 0) {
+                std::cerr << "[X11] memfd_create failed" << std::endl;
+                return;
+            }
+            m_captureFds[i].reset(new int(memfd));
+            if (ftruncate(*m_captureFds[i], size) < 0) {
+                std::cerr << "[X11] ftruncate failed" << std::endl;
+                return;
+            }
+            void* mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, *m_captureFds[i], 0);
+            if (mapping == MAP_FAILED) {
+                std::cerr << "[X11] mmap failed for buffer " << i << std::endl;
+                return;
+            }
+            m_captureMappings[i] = MmapPtr(mapping, MmapDeleter{ size });
         }
 
-        void* memfd_ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-        if (memfd_ptr == MAP_FAILED) {
-            close(memfd);
-            XShmDetach(display, &shminfo);
-            XDestroyImage(image);
-            shmdt(shminfo.shmaddr);
-            shmctl(shminfo.shmid, IPC_RMID, 0);
-            XCloseDisplay(display);
-            return;
-        }
+        XImage* rawImage = image.get();
+        auto DetectX11PixelFormat = [rawImage]() -> uint32_t {
+            if (!rawImage || rawImage->bits_per_pixel != 32) {
+                return SPA_VIDEO_FORMAT_BGRA;
+            }
+
+            const unsigned long redMask = rawImage->red_mask;
+            const unsigned long greenMask = rawImage->green_mask;
+            const unsigned long blueMask = rawImage->blue_mask;
+            const unsigned long alphaMask = ~(redMask | greenMask | blueMask);
+
+            if (redMask == 0x00ff0000UL && greenMask == 0x0000ff00UL && blueMask == 0x000000ffUL) {
+                if (alphaMask == 0xff000000UL) {
+                    return SPA_VIDEO_FORMAT_BGRA;
+                }
+                return rawImage->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_BGRx : SPA_VIDEO_FORMAT_xRGB;
+            }
+
+            if (redMask == 0x000000ffUL && greenMask == 0x0000ff00UL && blueMask == 0x00ff0000UL) {
+                if (alphaMask == 0xff000000UL) {
+                    return SPA_VIDEO_FORMAT_RGBA;
+                }
+                return rawImage->byte_order == LSBFirst ? SPA_VIDEO_FORMAT_RGBx : SPA_VIDEO_FORMAT_xBGR;
+            }
+
+            return SPA_VIDEO_FORMAT_BGRA;
+            };
+
+        uint32_t detectedFormat = DetectX11PixelFormat();
 
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-            m_sharedFd.reset(new int(dup(memfd)));
-            std::cerr << "[X11] MemFd utworzony, FD: " << *m_sharedFd << " (size: " << size << ")" << std::endl;
+            m_cachedMapping.reset();
+            m_cachedFd.reset();
+            m_cachedMapSize = 0;
+            if (m_captureFds[0] && *m_captureFds[0] >= 0) {
+                m_sharedFd.reset(new int(dup(*m_captureFds[0])));
+            } else {
+                m_sharedFd.reset();
+            }
+            if (m_sharedFd && *m_sharedFd >= 0) {
+                std::cerr << "[X11] MemFd utworzony, FD: " << *m_sharedFd << " (size: " << size << ")" << std::endl;
+            }
+            std::cerr << "[X11] Wykryty format piksela X11: " << PixelFormatToString(detectedFormat) << " (depth=" << image->depth << ", bpp=" << image->bits_per_pixel << ")" << std::endl;
             m_sharedHandle = SharedHandleInfo{
                 static_cast<uint64_t>(*m_sharedFd),
                 static_cast<uint32_t>(width),
@@ -1133,7 +1453,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 static_cast<uint32_t>(image->bytes_per_line),
                 0, // offset
                 static_cast<uint64_t>(size), // planeSize
-                7, // SPA_VIDEO_FORMAT_BGRA domyślny format wizualizacji X11 dla ZPixmap z głębią 24/32
+                detectedFormat,
                 0, // modifier
                 1, // Przywrócono typ 1 (MemFd), w 'preload' dodano wsparcie dla type=1
                 static_cast<uint32_t>(size) // chunkSize
@@ -1146,11 +1466,34 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         while (!m_stopRequested.load()) {
             auto start = std::chrono::steady_clock::now();
 
-            if (XShmGetImage(display, root, image, 0, 0, AllPlanes)) {
-                memcpy(memfd_ptr, image->data, size);
+            if (XShmGetImage(display.get(), root, image.get(), 0, 0, AllPlanes)) {
+                size_t writeIndex = m_captureWriteIndex;
+                std::memcpy(m_captureMappings[writeIndex].get(), image->data, size);
 
                 std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-                m_frameConsumed = false;
+                int duplicatedBufferFd = dup(*m_captureFds[writeIndex]);
+                if (duplicatedBufferFd < 0) {
+                    std::cerr << "[X11] dup failed for capture buffer" << std::endl;
+                } else {
+                    SharedHandleInfo handle{
+                        static_cast<uint64_t>(duplicatedBufferFd),
+                        static_cast<uint32_t>(width),
+                        static_cast<uint32_t>(height),
+                        static_cast<uint32_t>(image->bytes_per_line),
+                        0,
+                        static_cast<uint64_t>(size),
+                        detectedFormat,
+                        0,
+                        1,
+                        static_cast<uint32_t>(size),
+                    };
+                    m_frameBuffers.PushFrame(SharedFd(new int(duplicatedBufferFd), FdDeleter()), handle);
+                    m_sharedFd.reset(new int(dup(*m_captureFds[writeIndex])));
+                    m_sharedHandle = handle;
+                    m_frameConsumed = false;
+                }
+
+                m_captureWriteIndex = (writeIndex + 1) % m_captureFds.size();
                 frameCounter++;
                 if (frameCounter % 120 == 0) {
                     std::cerr << "[X11] Pomyślnie zrzucono klatkę, nr: " << frameCounter << std::endl;
@@ -1168,107 +1511,160 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         }
         std::cerr << "[X11] Zatrzymywanie pętli CaptureLoop. Sklonowano klatek: " << frameCounter << std::endl;
 
-        // Czyszczenie
-        munmap(memfd_ptr, size);
-        close(memfd);
-        XShmDetach(display, &shminfo);
-        XDestroyImage(image);
-        shmdt(shminfo.shmaddr);
-        shmctl(shminfo.shmid, IPC_RMID, 0);
-        XCloseDisplay(display);
+        // RAII sprząta zasoby: mapowanie, plik, XShm i display.
     }
 };
 
 std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const std::string& desiredFormat) const {
-    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-    if (!m_sharedFd || *m_sharedFd < 0 || m_frameConsumed || !m_streamConfig) {
+    auto frame = m_frameBuffers.AcquireReadFrame();
+    if (!frame.has_value() || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
     }
 
-    if (m_streamConfig->width == 0 || m_streamConfig->height == 0) {
+    SharedFd retainedFd = frame->fd;
+    const SharedHandleInfo handle = *frame->handle;
+    if (handle.width == 0 || handle.height == 0) {
         return std::nullopt;
     }
 
-    size_t dataSize = m_planeSize ? static_cast<size_t>(m_planeSize)
-        : static_cast<size_t>(m_stride) * static_cast<size_t>(m_streamConfig->height);
-    if (dataSize == 0) {
+    size_t dataSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
+        : static_cast<size_t>(handle.stride) * static_cast<size_t>(handle.height);
+    size_t mapSize = handle.planeSize ? std::max(static_cast<size_t>(handle.planeSize), dataSize + static_cast<size_t>(handle.offset))
+        : dataSize + static_cast<size_t>(handle.offset);
+
+    if (static_cast<size_t>(handle.offset) >= mapSize) {
+        std::cerr << "[Wayland] Invalid offset: " << handle.offset << " >= mapSize " << mapSize << std::endl;
         return std::nullopt;
     }
 
-    size_t mapSize = m_planeSize ? static_cast<size_t>(m_planeSize) : dataSize + static_cast<size_t>(m_offset);
-    void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, *m_sharedFd, 0);
-    if (mapped == MAP_FAILED) {
+    size_t available = mapSize - static_cast<size_t>(handle.offset);
+    if (dataSize > available) {
+        std::cerr << "[Wayland] dataSize " << dataSize << " exceeds available " << available << std::endl;
         return std::nullopt;
     }
 
-    std::vector<uint8_t> buffer(dataSize);
-    memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(m_offset), dataSize);
-    munmap(mapped, mapSize);
+    std::cerr << "[Wayland] frame: fd=" << handle.handle << " width=" << handle.width << " height=" << handle.height
+        << " stride=" << handle.stride << " offset=" << handle.offset << " planeSize=" << handle.planeSize
+        << " dataSize=" << dataSize << " mapSize=" << mapSize << " available=" << available << std::endl;
 
-    std::string format = desiredFormat;
-    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-        });
+    MmapPtr localMapping;
+    const uint8_t* mappedData = nullptr;
 
-    uint32_t stride = m_stride ? m_stride : static_cast<uint32_t>(m_streamConfig->width * 4);
-    std::vector<uint8_t> result = ConvertPixelBuffer(
-        buffer.data(),
-        buffer.size(),
-        static_cast<uint32_t>(m_streamConfig->width),
-        static_cast<uint32_t>(m_streamConfig->height),
-        stride,
-        m_streamConfig->pixelFormat,
-        format
-    );
+    {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        if (!m_cachedMapping || m_cachedFd != frame->fd || m_cachedMapSize != mapSize) {
+            m_cachedMapping.reset();
+            int actualFd = *frame->fd;
+            if (static_cast<uint64_t>(actualFd) != handle.handle) {
+                std::cerr << "[Wayland] Warning: frame FD mismatch handle.handle=" << handle.handle
+                    << " actualFd=" << actualFd << std::endl;
+            }
+            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
+            if (ptr == MAP_FAILED) {
+                return std::nullopt;
+            }
+            m_cachedMapping = MmapPtr(ptr, MmapDeleter{ mapSize });
+            m_cachedFd = frame->fd;
+            m_cachedMapSize = mapSize;
+        }
+        localMapping = m_cachedMapping;
+        mappedData = static_cast<const uint8_t*>(localMapping.get());
+    }
 
-    m_frameConsumed = true;
+    if (!mappedData) {
+        return std::nullopt;
+    }
+
+    std::optional<std::vector<uint8_t>> result = ReadPixelDataFromRawPointer(
+        mappedData + static_cast<size_t>(handle.offset),
+        handle.width,
+        handle.height,
+        handle.stride,
+        dataSize,
+        available,
+        handle.pixelFormat,
+        desiredFormat);
+
+    if (result) {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        m_frameConsumed = true;
+    }
     return result;
 }
 
 std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::string& desiredFormat) const {
-    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-    if (!m_sharedFd || *m_sharedFd < 0 || m_frameConsumed || !m_sharedHandle.has_value()) {
+    auto frame = m_frameBuffers.AcquireReadFrame();
+    if (!frame.has_value() || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
     }
 
-    if (m_sharedHandle->width == 0 || m_sharedHandle->height == 0) {
+    SharedFd retainedFd = frame->fd;
+    const SharedHandleInfo handle = *frame->handle;
+    if (handle.width == 0 || handle.height == 0) {
         return std::nullopt;
     }
 
-    size_t dataSize = m_sharedHandle->planeSize ? static_cast<size_t>(m_sharedHandle->planeSize)
-        : static_cast<size_t>(m_sharedHandle->stride) * static_cast<size_t>(m_sharedHandle->height);
-    if (dataSize == 0) {
+    size_t dataSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
+        : static_cast<size_t>(handle.stride) * static_cast<size_t>(handle.height);
+    size_t mapSize = handle.planeSize ? std::max(static_cast<size_t>(handle.planeSize), dataSize + static_cast<size_t>(handle.offset))
+        : dataSize + static_cast<size_t>(handle.offset);
+
+    if (static_cast<size_t>(handle.offset) >= mapSize) {
+        std::cerr << "[X11] Invalid offset: " << handle.offset << " >= mapSize " << mapSize << std::endl;
+        return std::nullopt;
+    }
+    size_t available = mapSize - static_cast<size_t>(handle.offset);
+    if (dataSize > available) {
+        std::cerr << "[X11] dataSize " << dataSize << " exceeds available " << available << std::endl;
         return std::nullopt;
     }
 
-    size_t mapSize = m_sharedHandle->planeSize ? static_cast<size_t>(m_sharedHandle->planeSize)
-        : dataSize + static_cast<size_t>(m_sharedHandle->offset);
-    void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, *m_sharedFd, 0);
-    if (mapped == MAP_FAILED) {
+    std::cerr << "[X11] frame: fd=" << handle.handle << " width=" << handle.width << " height=" << handle.height
+        << " stride=" << handle.stride << " offset=" << handle.offset << " planeSize=" << handle.planeSize
+        << " dataSize=" << dataSize << " mapSize=" << mapSize << " available=" << available << std::endl;
+
+    MmapPtr localMapping;
+    const uint8_t* mappedData = nullptr;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        if (!m_cachedMapping || m_cachedFd != frame->fd || m_cachedMapSize != mapSize) {
+            m_cachedMapping.reset();
+            int actualFd = *frame->fd;
+            if (static_cast<uint64_t>(actualFd) != handle.handle) {
+                std::cerr << "[X11] Warning: frame FD mismatch handle.handle=" << handle.handle
+                    << " actualFd=" << actualFd << std::endl;
+            }
+            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
+            if (ptr == MAP_FAILED) {
+                return std::nullopt;
+            }
+            m_cachedMapping = MmapPtr(ptr, MmapDeleter{ mapSize });
+            m_cachedFd = frame->fd;
+            m_cachedMapSize = mapSize;
+        }
+        localMapping = m_cachedMapping;
+        mappedData = static_cast<const uint8_t*>(localMapping.get());
+    }
+
+    if (!mappedData) {
         return std::nullopt;
     }
 
-    std::vector<uint8_t> buffer(dataSize);
-    memcpy(buffer.data(), static_cast<uint8_t*>(mapped) + static_cast<size_t>(m_sharedHandle->offset), dataSize);
-    munmap(mapped, mapSize);
+    std::optional<std::vector<uint8_t>> result = ReadPixelDataFromRawPointer(
+        mappedData + static_cast<size_t>(handle.offset),
+        handle.width,
+        handle.height,
+        handle.stride,
+        dataSize,
+        available,
+        handle.pixelFormat,
+        desiredFormat);
 
-    std::string format = desiredFormat;
-    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-        });
-
-    uint32_t stride = m_sharedHandle->stride ? m_sharedHandle->stride : static_cast<uint32_t>(m_sharedHandle->width * 4);
-    std::vector<uint8_t> result = ConvertPixelBuffer(
-        buffer.data(),
-        buffer.size(),
-        m_sharedHandle->width,
-        m_sharedHandle->height,
-        stride,
-        m_sharedHandle->pixelFormat,
-        format
-    );
-
-    m_frameConsumed = true;
+    if (result) {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        m_frameConsumed = true;
+    }
     return result;
 }
 
