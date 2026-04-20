@@ -100,9 +100,10 @@ namespace {
     };
 
     using MmapPtr = std::unique_ptr<void, MmapDeleter>;
+    using SharedFd = std::shared_ptr<int>;
 
     struct FrameBufferSlot {
-        int fd = -1;
+        SharedFd fd;
         std::optional<SharedHandleInfo> handle;
         std::atomic<bool> ready{ false };
     };
@@ -111,10 +112,7 @@ namespace {
         public:
         void Reset() {
             for (auto& slot : m_slots) {
-                if (slot.fd >= 0) {
-                    close(slot.fd);
-                }
-                slot.fd = -1;
+                slot.fd.reset();
                 slot.handle.reset();
                 slot.ready.store(false, std::memory_order_release);
             }
@@ -122,13 +120,10 @@ namespace {
             m_readIndex.store(0, std::memory_order_relaxed);
         }
 
-        void PushFrame(int fd, std::optional<SharedHandleInfo> handle) {
+        void PushFrame(SharedFd fd, std::optional<SharedHandleInfo> handle) {
             size_t writeIdx = m_writeIndex.load(std::memory_order_relaxed);
             FrameBufferSlot& slot = m_slots[writeIdx];
-            if (slot.fd >= 0) {
-                close(slot.fd);
-            }
-            slot.fd = fd;
+            slot.fd = std::move(fd);
             slot.handle = std::move(handle);
             slot.ready.store(true, std::memory_order_release);
             m_readIndex.store(writeIdx, std::memory_order_release);
@@ -154,7 +149,7 @@ namespace {
         }
 
         private:
-        std::array<FrameBufferSlot, 2> m_slots;
+        std::array<FrameBufferSlot, 4> m_slots;
         std::atomic<size_t> m_writeIndex{ 0 };
         std::atomic<size_t> m_readIndex{ 0 };
     };
@@ -970,7 +965,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 m_chunkSize,
             };
         }
-        m_frameBuffers.PushFrame(bufferFd, std::move(handle));
+        m_frameBuffers.PushFrame(SharedFd(new int(bufferFd), FdDeleter()), std::move(handle));
 
         m_cachedMapping.reset();
         m_cachedFd = -1;
@@ -1481,7 +1476,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                         1,
                         static_cast<uint32_t>(size),
                     };
-                    m_frameBuffers.PushFrame(duplicatedBufferFd, handle);
+                    m_frameBuffers.PushFrame(SharedFd(new int(duplicatedBufferFd), FdDeleter()), handle);
                     m_sharedFd.reset(new int(dup(*m_captureFds[writeIndex])));
                     m_sharedHandle = handle;
                     m_frameConsumed = false;
@@ -1511,10 +1506,11 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
 
 std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const std::string& desiredFormat) const {
     auto frame = m_frameBuffers.AcquireReadFrame();
-    if (!frame || !frame->handle.has_value() || frame->fd < 0) {
+    if (!frame || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
     }
 
+    SharedFd retainedFd = frame->fd;
     const SharedHandleInfo handle = *frame->handle;
     if (handle.width == 0 || handle.height == 0) {
         return std::nullopt;
@@ -1562,10 +1558,11 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
 
 std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::string& desiredFormat) const {
     auto frame = m_frameBuffers.AcquireReadFrame();
-    if (!frame || !frame->handle.has_value() || frame->fd < 0) {
+    if (!frame || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
     }
 
+    SharedFd retainedFd = frame->fd;
     const SharedHandleInfo handle = *frame->handle;
     if (handle.width == 0 || handle.height == 0) {
         return std::nullopt;
