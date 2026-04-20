@@ -99,59 +99,59 @@ namespace {
         }
     };
 
-    using MmapPtr = std::unique_ptr<void, MmapDeleter>;
+    using MmapPtr = std::shared_ptr<void>;
     using SharedFd = std::shared_ptr<int>;
 
     struct FrameBufferSlot {
         SharedFd fd;
         std::optional<SharedHandleInfo> handle;
-        std::atomic<bool> ready{ false };
+        bool ready = false;
     };
 
     class FrameBufferPool {
         public:
         void Reset() {
+            std::lock_guard<std::mutex> lock(m_mutex);
             for (auto& slot : m_slots) {
                 slot.fd.reset();
                 slot.handle.reset();
-                slot.ready.store(false, std::memory_order_release);
+                slot.ready = false;
             }
-            m_writeIndex.store(0, std::memory_order_relaxed);
-            m_readIndex.store(0, std::memory_order_relaxed);
+            m_writeIndex = 0;
+            m_readIndex = 0;
         }
 
         void PushFrame(SharedFd fd, std::optional<SharedHandleInfo> handle) {
-            size_t writeIdx = m_writeIndex.load(std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            size_t writeIdx = m_writeIndex;
             FrameBufferSlot& slot = m_slots[writeIdx];
             slot.fd = std::move(fd);
             slot.handle = std::move(handle);
-            slot.ready.store(true, std::memory_order_release);
-            m_readIndex.store(writeIdx, std::memory_order_release);
-            m_writeIndex.store((writeIdx + 1) % m_slots.size(), std::memory_order_relaxed);
+            slot.ready = true;
+            m_readIndex = writeIdx;
+            m_writeIndex = (writeIdx + 1) % m_slots.size();
         }
 
-        FrameBufferSlot* AcquireReadFrame() {
-            size_t startIdx = m_readIndex.load(std::memory_order_acquire);
+        std::optional<FrameBufferSlot> AcquireReadFrame() {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            size_t startIdx = m_readIndex;
             for (size_t i = 0; i < m_slots.size(); ++i) {
                 size_t idx = (startIdx + i) % m_slots.size();
-                if (m_slots[idx].ready.load(std::memory_order_acquire)) {
-                    m_readIndex.store(idx, std::memory_order_release);
-                    return &m_slots[idx];
+                if (m_slots[idx].ready) {
+                    FrameBufferSlot result = m_slots[idx];
+                    m_slots[idx].ready = false;
+                    m_readIndex = (idx + 1) % m_slots.size();
+                    return result;
                 }
             }
-            return nullptr;
-        }
-
-        void ConsumeReadFrame() {
-            size_t readIdx = m_readIndex.load(std::memory_order_relaxed);
-            m_slots[readIdx].ready.store(false, std::memory_order_release);
-            m_readIndex.store((readIdx + 1) % m_slots.size(), std::memory_order_relaxed);
+            return std::nullopt;
         }
 
         private:
         std::array<FrameBufferSlot, 4> m_slots;
-        std::atomic<size_t> m_writeIndex{ 0 };
-        std::atomic<size_t> m_readIndex{ 0 };
+        size_t m_writeIndex = 0;
+        size_t m_readIndex = 0;
+        std::mutex m_mutex;
     };
 
     static std::optional<std::vector<uint8_t>> ReadPixelDataFromSharedFd(
@@ -230,7 +230,11 @@ namespace {
             std::memcpy(buffer.data(), data, expectedSize);
         } else {
             for (uint32_t row = 0; row < height; ++row) {
-                const uint8_t* srcRow = data + static_cast<size_t>(row) * actualStride;
+                size_t srcOffset = static_cast<size_t>(row) * actualStride;
+                if (srcOffset + rowBytes > availableBytes) {
+                    return std::nullopt;
+                }
+                const uint8_t* srcRow = data + srcOffset;
                 uint8_t* dstRow = buffer.data() + static_cast<size_t>(row) * rowBytes;
                 std::memcpy(dstRow, srcRow, rowBytes);
             }
@@ -1513,7 +1517,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
 
 std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const std::string& desiredFormat) const {
     auto frame = m_frameBuffers.AcquireReadFrame();
-    if (!frame || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
+    if (!frame.has_value() || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
     }
 
@@ -1525,7 +1529,7 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
 
     size_t dataSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
         : static_cast<size_t>(handle.stride) * static_cast<size_t>(handle.height);
-    size_t mapSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
+    size_t mapSize = handle.planeSize ? std::max(static_cast<size_t>(handle.planeSize), dataSize + static_cast<size_t>(handle.offset))
         : dataSize + static_cast<size_t>(handle.offset);
 
     if (static_cast<size_t>(handle.offset) >= mapSize) {
@@ -1543,13 +1547,19 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
         << " stride=" << handle.stride << " offset=" << handle.offset << " planeSize=" << handle.planeSize
         << " dataSize=" << dataSize << " mapSize=" << mapSize << " available=" << available << std::endl;
 
+    MmapPtr localMapping;
     const uint8_t* mappedData = nullptr;
 
     {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         if (!m_cachedMapping || m_cachedFd != frame->fd || m_cachedMapSize != mapSize) {
             m_cachedMapping.reset();
-            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, static_cast<int>(handle.handle), 0);
+            int actualFd = *frame->fd;
+            if (static_cast<uint64_t>(actualFd) != handle.handle) {
+                std::cerr << "[Wayland] Warning: frame FD mismatch handle.handle=" << handle.handle
+                    << " actualFd=" << actualFd << std::endl;
+            }
+            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
             if (ptr == MAP_FAILED) {
                 return std::nullopt;
             }
@@ -1557,7 +1567,8 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
             m_cachedFd = frame->fd;
             m_cachedMapSize = mapSize;
         }
-        mappedData = static_cast<const uint8_t*>(m_cachedMapping.get());
+        localMapping = m_cachedMapping;
+        mappedData = static_cast<const uint8_t*>(localMapping.get());
     }
 
     if (!mappedData) {
@@ -1575,7 +1586,6 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
         desiredFormat);
 
     if (result) {
-        m_frameBuffers.ConsumeReadFrame();
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         m_frameConsumed = true;
     }
@@ -1584,7 +1594,7 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
 
 std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::string& desiredFormat) const {
     auto frame = m_frameBuffers.AcquireReadFrame();
-    if (!frame || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
+    if (!frame.has_value() || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
     }
 
@@ -1596,7 +1606,7 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
 
     size_t dataSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
         : static_cast<size_t>(handle.stride) * static_cast<size_t>(handle.height);
-    size_t mapSize = handle.planeSize ? static_cast<size_t>(handle.planeSize)
+    size_t mapSize = handle.planeSize ? std::max(static_cast<size_t>(handle.planeSize), dataSize + static_cast<size_t>(handle.offset))
         : dataSize + static_cast<size_t>(handle.offset);
 
     if (static_cast<size_t>(handle.offset) >= mapSize) {
@@ -1613,13 +1623,19 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
         << " stride=" << handle.stride << " offset=" << handle.offset << " planeSize=" << handle.planeSize
         << " dataSize=" << dataSize << " mapSize=" << mapSize << " available=" << available << std::endl;
 
+    MmapPtr localMapping;
     const uint8_t* mappedData = nullptr;
 
     {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         if (!m_cachedMapping || m_cachedFd != frame->fd || m_cachedMapSize != mapSize) {
             m_cachedMapping.reset();
-            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, static_cast<int>(handle.handle), 0);
+            int actualFd = *frame->fd;
+            if (static_cast<uint64_t>(actualFd) != handle.handle) {
+                std::cerr << "[X11] Warning: frame FD mismatch handle.handle=" << handle.handle
+                    << " actualFd=" << actualFd << std::endl;
+            }
+            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
             if (ptr == MAP_FAILED) {
                 return std::nullopt;
             }
@@ -1627,7 +1643,8 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
             m_cachedFd = frame->fd;
             m_cachedMapSize = mapSize;
         }
-        mappedData = static_cast<const uint8_t*>(m_cachedMapping.get());
+        localMapping = m_cachedMapping;
+        mappedData = static_cast<const uint8_t*>(localMapping.get());
     }
 
     if (!mappedData) {
@@ -1645,7 +1662,6 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
         desiredFormat);
 
     if (result) {
-        m_frameBuffers.ConsumeReadFrame();
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         m_frameConsumed = true;
     }
