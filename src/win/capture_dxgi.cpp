@@ -2,6 +2,7 @@
 #include "win_capture_internal.hpp"
 
 #include <atomic>
+#include <bit>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -77,7 +78,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         if (!handle) return std::nullopt;
 
         SharedHandleInfo info;
-        info.handle = reinterpret_cast<uint64_t>(handle);
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
         info.width = m_width;
         info.height = m_height;
         return info;

@@ -1,3 +1,4 @@
+#include <bit>
 #include <string>
 #include <iostream>
 #include <vector>
@@ -103,7 +104,7 @@ Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<Shared
 
 #ifdef _WIN32
     // Windows expects ntHandle as a Buffer
-    HANDLE rawHandle = reinterpret_cast<HANDLE>(shared->handle);
+    HANDLE rawHandle = std::bit_cast<HANDLE>(static_cast<std::uintptr_t>(shared->handle));
     Napi::Buffer<uint8_t> buffer = Napi::Buffer<uint8_t>::Copy(env, reinterpret_cast<uint8_t*>(&rawHandle), sizeof(HANDLE));
     handle.Set("ntHandle", buffer);
 #elif defined(__linux__)
