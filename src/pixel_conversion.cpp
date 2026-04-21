@@ -2,6 +2,8 @@
 #include <spa/param/video/format-utils.h>
 #endif
 
+#include <span>
+#include <string_view>
 #include "pixel_conversion.hpp"
 
 #include <algorithm>
@@ -48,17 +50,18 @@ namespace {
 
     using RowConverterFunc = void (*)(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout);
 
-    static PixelLayout ParsePixelLayout(std::string format) {
-        std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
+    static PixelLayout ParsePixelLayout(std::string_view format) {
+        std::string normalized(format);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
             });
 
-        if (format == "rgba") return PixelLayout::RGBA;
-        if (format == "bgra") return PixelLayout::BGRA;
-        if (format == "rgbx") return PixelLayout::RGBX;
-        if (format == "bgrx") return PixelLayout::BGRX;
-        if (format == "xrgb") return PixelLayout::XRGB;
-        if (format == "xbgr") return PixelLayout::XBGR;
+        if (normalized == "rgba") return PixelLayout::RGBA;
+        if (normalized == "bgra") return PixelLayout::BGRA;
+        if (normalized == "rgbx") return PixelLayout::RGBX;
+        if (normalized == "bgrx") return PixelLayout::BGRX;
+        if (normalized == "xrgb") return PixelLayout::XRGB;
+        if (normalized == "xbgr") return PixelLayout::XBGR;
         return PixelLayout::UNKNOWN;
     }
 
@@ -603,17 +606,16 @@ static void LogConverterMethodOnce(const char* method) {
 }
 
 std::vector<uint8_t> ConvertPixelBuffer(
-    const uint8_t* src,
-    size_t sourceSize,
+    std::span<const uint8_t> src,
     uint32_t width,
     uint32_t height,
     uint32_t stride,
     uint32_t srcPixelFormat,
-    const std::string& desiredPixelFormat) {
+    std::string_view desiredPixelFormat) {
     PixelLayout dstLayout = ParsePixelLayout(desiredPixelFormat);
     PixelLayout srcLayout = DecodePixelLayout(srcPixelFormat);
     if (dstLayout == PixelLayout::UNKNOWN || srcLayout == PixelLayout::UNKNOWN) {
-        return std::vector<uint8_t>(src, src + sourceSize);
+        return std::vector<uint8_t>(src.data(), src.data() + src.size());
     }
 
     std::vector<uint8_t> dst(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
@@ -653,10 +655,10 @@ std::vector<uint8_t> ConvertPixelBuffer(
 
         if (srcLayout == dstLayout) {
             if (isPacked) {
-                std::memcpy(dst.data(), src, totalPixels * 4);
+                std::memcpy(dst.data(), src.data(), totalPixels * 4);
             } else {
                 for (uint32_t row = 0; row < height; ++row) {
-                    const uint8_t* srcRow = src + static_cast<size_t>(row) * srcRowBytes;
+                    const uint8_t* srcRow = src.data() + static_cast<size_t>(row) * srcRowBytes;
                     uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
                     for (uint32_t col = 0; col < width; ++col) {
                         StoreUInt32(dstRow + static_cast<size_t>(col) * 4,
@@ -665,10 +667,10 @@ std::vector<uint8_t> ConvertPixelBuffer(
                 }
             }
         } else if (isPacked) {
-            converter(src, dst.data(), totalPixels, srcLayout, dstLayout);
+            converter(src.data(), dst.data(), totalPixels, srcLayout, dstLayout);
         } else {
             for (uint32_t row = 0; row < height; ++row) {
-                const uint8_t* srcRow = src + static_cast<size_t>(row) * srcRowBytes;
+                const uint8_t* srcRow = src.data() + static_cast<size_t>(row) * srcRowBytes;
                 uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
                 converter(srcRow, dstRow, width, srcLayout, dstLayout);
             }

@@ -26,9 +26,11 @@
 #include <shared_mutex>
 #include <condition_variable>
 #include <random>
-#include <sstream>
-#include <stdexcept>
+#include <format>
+#include <span>
 #include <string>
+#include <string_view>
+#include <stop_token>
 #include <thread>
 #include <future>
 #include <utility>
@@ -43,10 +45,12 @@
 #include <fstream>
 
 static bool IsNvidiaGPU() {
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    std::ifstream nvidia("/proc/driver/nvidia/version");
-    cached = nvidia.good() ? 1 : 0;
+    static std::once_flag initFlag;
+    static bool cached = false;
+    std::call_once(initFlag, [] {
+        std::ifstream nvidia("/proc/driver/nvidia/version");
+        cached = nvidia.good();
+        });
     return cached;
 }
 
@@ -55,10 +59,12 @@ namespace {
     std::string gen_token() {
         static std::mt19937 rng(std::random_device{}());
         static std::uniform_int_distribution<int> dist(0, 15);
-        std::stringstream ss;
-        ss << std::hex;
-        for (int i = 0; i < 8; i++) ss << dist(rng);
-        return ss.str();
+        std::string token;
+        token.reserve(8);
+        for (int i = 0; i < 8; ++i) {
+            token += std::format("{:x}", dist(rng));
+        }
+        return token;
     }
 
     static std::string PixelFormatToString(uint32_t pixelFormat) {
@@ -154,7 +160,7 @@ namespace {
         std::mutex m_mutex;
     };
 
-    static std::optional<std::vector<uint8_t>> ReadPixelDataFromSharedFd(
+    [[maybe_unused]] static std::optional<std::vector<uint8_t>> ReadPixelDataFromSharedFd(
         int fd,
         uint32_t width,
         uint32_t height,
@@ -162,7 +168,7 @@ namespace {
         uint32_t offset,
         uint64_t planeSize,
         uint32_t pixelFormat,
-        const std::string& desiredFormat) {
+        std::string_view desiredFormat) {
         if (fd < 0 || width == 0 || height == 0) {
             return std::nullopt;
         }
@@ -183,15 +189,14 @@ namespace {
         std::vector<uint8_t> buffer(dataSize);
         memcpy(buffer.data(), static_cast<uint8_t*>(mapped.get()) + static_cast<size_t>(offset), dataSize);
 
-        std::string format = desiredFormat;
+        std::string format = std::string(desiredFormat);
         std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
             });
 
         uint32_t actualStride = stride ? stride : static_cast<uint32_t>(width * 4);
         return ConvertPixelBuffer(
-            buffer.data(),
-            buffer.size(),
+            std::span<const uint8_t>(buffer.data(), buffer.size()),
             width,
             height,
             actualStride,
@@ -200,15 +205,14 @@ namespace {
     }
 
     static std::optional<std::vector<uint8_t>> ReadPixelDataFromRawPointer(
-        const uint8_t* data,
+        std::span<const uint8_t> data,
         uint32_t width,
         uint32_t height,
         uint32_t stride,
         uint64_t planeSize,
-        size_t availableBytes,
         uint32_t pixelFormat,
-        const std::string& desiredFormat) {
-        if (!data || width == 0 || height == 0) {
+        std::string_view desiredFormat) {
+        if (data.empty() || width == 0 || height == 0) {
             return std::nullopt;
         }
 
@@ -220,28 +224,28 @@ namespace {
 
         size_t expectedSize = planeSize ? static_cast<size_t>(planeSize)
             : static_cast<size_t>(actualStride) * static_cast<size_t>(height);
-        if (expectedSize == 0 || expectedSize > availableBytes) {
+        if (expectedSize == 0 || expectedSize > data.size()) {
             return std::nullopt;
         }
 
         std::vector<uint8_t> buffer(expectedSize);
 
         if (actualStride == rowBytes) {
-            std::memcpy(buffer.data(), data, expectedSize);
+            std::memcpy(buffer.data(), data.data(), expectedSize);
         } else {
             for (uint32_t row = 0; row < height; ++row) {
                 size_t srcOffset = static_cast<size_t>(row) * actualStride;
-                if (srcOffset + rowBytes > availableBytes) {
+                if (srcOffset + rowBytes > data.size()) {
                     return std::nullopt;
                 }
-                const uint8_t* srcRow = data + srcOffset;
+                const uint8_t* srcRow = data.data() + srcOffset;
                 uint8_t* dstRow = buffer.data() + static_cast<size_t>(row) * rowBytes;
                 std::memcpy(dstRow, srcRow, rowBytes);
             }
         }
 
         std::string sourceFormat = PixelFormatToString(pixelFormat);
-        std::string normalizedDesired = desiredFormat;
+        std::string normalizedDesired = std::string(desiredFormat);
         std::transform(normalizedDesired.begin(), normalizedDesired.end(), normalizedDesired.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
             });
@@ -261,8 +265,7 @@ namespace {
         }
 
         return ConvertPixelBuffer(
-            buffer.data(),
-            buffer.size(),
+            std::span<const uint8_t>(buffer.data(), buffer.size()),
             width,
             height,
             actualStride,
@@ -403,9 +406,8 @@ namespace Config {
 class BaseLinuxPlatformCapture : public IPlatformCapture {
     protected:
     mutable std::shared_mutex m_stateMutex;
-    std::thread m_worker;
+    std::jthread m_worker;
     std::atomic<bool> m_running{ false };
-    std::atomic<bool> m_stopRequested{ false };
     std::mutex m_captureMutex;
     std::condition_variable m_captureCv;
 
@@ -468,11 +470,15 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         if (!m_running.compare_exchange_strong(expected, true)) {
             return;
         }
-        m_worker = std::thread(&WaylandPlatformCapture::RunCaptureFlow, this);
+        m_worker = std::jthread([this](std::stop_token stopToken) {
+            RunCaptureFlow(stopToken);
+            });
     }
 
     void Stop() override {
-        m_stopRequested.store(true);
+        if (m_worker.joinable()) {
+            m_worker.request_stop();
+        }
 
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
@@ -497,7 +503,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_running.store(false);
     }
 
-    std::optional<std::vector<uint8_t>> GetPixelData(const std::string& desiredFormat = "rgba") const override;
+    std::optional<std::vector<uint8_t>> GetPixelData(std::string_view desiredFormat = "rgba") const override;
     int GetWidth() const override {
         std::shared_lock<std::shared_mutex> lock(m_stateMutex);
         return m_streamConfig ? static_cast<int>(m_streamConfig->width) : 0;
@@ -565,7 +571,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     mutable SharedFd m_cachedFd;
     mutable size_t m_cachedMapSize = 0;
 
-    void RunCaptureFlow() {
+    void RunCaptureFlow(std::stop_token stopToken) {
         int pipewireFd = -1;
         GMainContextPtr context;
 
@@ -627,7 +633,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
             g_main_loop_run(m_glibLoop.get());
 
-            if (m_stopRequested.load()) {
+            if (stopToken.stop_requested()) {
                 throw std::runtime_error("Capture stopped before PipeWire remote was opened");
             }
 
@@ -641,7 +647,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
             {
                 std::unique_lock<std::mutex> waitLock(m_captureMutex);
-                m_captureCv.wait(waitLock, [this]() { return m_stopRequested.load(); });
+                m_captureCv.wait(waitLock, [&stopToken] { return stopToken.stop_requested(); });
             }
 
         } catch (const std::exception& e) {
@@ -659,7 +665,6 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
         m_glibLoop.reset();
 
-        m_stopRequested.store(false);
         m_running.store(false);
     }
 
@@ -1287,11 +1292,15 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         if (!m_running.compare_exchange_strong(expected, true)) {
             return;
         }
-        m_worker = std::thread(&X11PlatformCapture::CaptureLoop, this);
+        m_worker = std::jthread([this](std::stop_token stopToken) {
+            CaptureLoop(stopToken);
+            });
     }
 
     void Stop() override {
-        m_stopRequested.store(true);
+        if (m_worker.joinable()) {
+            m_worker.request_stop();
+        }
         m_captureCv.notify_all();
 
         if (m_worker.joinable() && std::this_thread::get_id() != m_worker.get_id()) {
@@ -1334,7 +1343,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         return m_sharedHandle ? m_sharedHandle->pixelFormat : 0;
     }
 
-    std::optional<std::vector<uint8_t>> GetPixelData(const std::string& desiredFormat = "rgba") const override;
+    std::optional<std::vector<uint8_t>> GetPixelData(std::string_view desiredFormat = "rgba") const override;
 
     std::string GetBackendName() const override {
         return "x11";
@@ -1349,7 +1358,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     std::array<MmapPtr, 2> m_captureMappings;
     size_t m_captureWriteIndex = 0;
 
-    void CaptureLoop() {
+    void CaptureLoop(std::stop_token stopToken) {
         std::cerr << "[X11] Uruchamiam proces przechwytywania (CaptureLoop)..." << std::endl;
         DisplayPtr display(XOpenDisplay(nullptr));
         if (!display) {
@@ -1463,7 +1472,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
 
         uint64_t frameCounter = 0;
         // Pętla przechwytywania (ok. 60 FPS)
-        while (!m_stopRequested.load()) {
+        while (!stopToken.stop_requested()) {
             auto start = std::chrono::steady_clock::now();
 
             if (XShmGetImage(display.get(), root, image.get(), 0, 0, AllPlanes)) {
@@ -1515,7 +1524,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     }
 };
 
-std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const std::string& desiredFormat) const {
+std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(std::string_view desiredFormat) const {
     auto frame = m_frameBuffers.AcquireReadFrame();
     if (!frame.has_value() || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
@@ -1576,12 +1585,11 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
     }
 
     std::optional<std::vector<uint8_t>> result = ReadPixelDataFromRawPointer(
-        mappedData + static_cast<size_t>(handle.offset),
+        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), available),
         handle.width,
         handle.height,
         handle.stride,
         dataSize,
-        available,
         handle.pixelFormat,
         desiredFormat);
 
@@ -1592,7 +1600,7 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
     return result;
 }
 
-std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::string& desiredFormat) const {
+std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string_view desiredFormat) const {
     auto frame = m_frameBuffers.AcquireReadFrame();
     if (!frame.has_value() || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
@@ -1652,12 +1660,11 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
     }
 
     std::optional<std::vector<uint8_t>> result = ReadPixelDataFromRawPointer(
-        mappedData + static_cast<size_t>(handle.offset),
+        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), available),
         handle.width,
         handle.height,
         handle.stride,
         dataSize,
-        available,
         handle.pixelFormat,
         desiredFormat);
 
