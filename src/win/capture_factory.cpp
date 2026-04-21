@@ -60,15 +60,36 @@ bool IsWinRTCaptureAvailable() {
 #endif
 }
 
-std::unique_ptr<IPlatformCapture> CreatePlatformCapture() {
+static std::string NormalizeBackendName(std::string backend) {
+    std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return backend;
+}
+
+std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& forceBackend) {
+    const std::string backend = NormalizeBackendName(forceBackend);
+
 #ifdef FORCE_API_GDI
     OutputDebugStringA("[ScreenCapture] INFO: Initializing with FORCED API = GDI (Compilation)\n");
+    if (!backend.empty() && backend != "gdi") {
+        OutputDebugStringA("[ScreenCapture] WARN: Requested backend does not match compile-time forced GDI.\n");
+        return nullptr;
+    }
     return CreateGDICapture();
 #elif defined(FORCE_API_DXGI)
     OutputDebugStringA("[ScreenCapture] INFO: Initializing with FORCED API = DXGI Desktop Duplication (Compilation)\n");
+    if (!backend.empty() && backend != "dxgi") {
+        OutputDebugStringA("[ScreenCapture] WARN: Requested backend does not match compile-time forced DXGI.\n");
+        return nullptr;
+    }
     return CreateDXGICapture();
 #elif defined(FORCE_API_WINRT)
     OutputDebugStringA("[ScreenCapture] INFO: Initializing with FORCED API = WinRT Graphics Capture (Compilation)\n");
+    if (!backend.empty() && backend != "winrt") {
+        OutputDebugStringA("[ScreenCapture] WARN: Requested backend does not match compile-time forced WinRT.\n");
+        return nullptr;
+    }
 #if HAS_WINRT_CAPTURE
     return CreateWinRTCapture();
 #else
@@ -76,6 +97,28 @@ std::unique_ptr<IPlatformCapture> CreatePlatformCapture() {
     return nullptr;
 #endif
 #else
+    if (!backend.empty()) {
+        if (backend == "winrt") {
+#if HAS_WINRT_CAPTURE
+            return CreateWinRTCapture();
+#else
+            OutputDebugStringA("[ScreenCapture] WARN: Requested WinRT backend but WinRT support is unavailable.\n");
+            return nullptr;
+#endif
+        }
+
+        if (backend == "dxgi") {
+            return CreateDXGICapture();
+        }
+
+        if (backend == "gdi") {
+            return CreateGDICapture();
+        }
+
+        OutputDebugStringA("[ScreenCapture] WARN: Unknown requested backend.\n");
+        return nullptr;
+    }
+
     // Automatic, standard fallback
     OutputDebugStringA("[ScreenCapture] INFO: Initializing in AUTO mode...\n");
 #if HAS_WINRT_CAPTURE

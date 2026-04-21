@@ -38,4 +38,4 @@ class IPlatformCapture {
     virtual int GetFps() const { return -1; }
 };
 
-std::unique_ptr<IPlatformCapture> CreatePlatformCapture();
+std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& forceBackend = "");

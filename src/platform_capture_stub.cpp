@@ -22,7 +22,7 @@ class StubPlatformCapture final : public IPlatformCapture {
     }
 };
 
-std::unique_ptr<IPlatformCapture> CreatePlatformCapture() {
+std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& /*forceBackend*/) {
     return std::make_unique<StubPlatformCapture>();
 }
 
