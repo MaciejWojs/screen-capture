@@ -1,5 +1,6 @@
 #ifdef __linux__
 #include <spa/param/video/format-utils.h>
+#include "logger.hpp"
 #endif
 
 #include <span>
@@ -602,7 +603,7 @@ static std::atomic<bool> s_converterMethodLogged{ false };
 static void LogConverterMethodOnce(const char* method) {
     bool expected = false;
     if (s_converterMethodLogged.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        std::cerr << "[PixelConversion] Using converter: " << method << std::endl;
+        sc_logger::Info("Using converter: {}", method);
     }
 }
 
@@ -678,4 +679,4 @@ std::vector<uint8_t> ConvertPixelBuffer(
         }
 
         return dst;
-}
+};
