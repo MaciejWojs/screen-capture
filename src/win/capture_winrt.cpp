@@ -1,9 +1,11 @@
 #ifdef _WIN32
+#include "../logger.hpp"
 #include "win_capture_internal.hpp"
 
 #if HAS_WINRT_CAPTURE
 
 #include <atomic>
+#include <bit>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -57,12 +59,7 @@ class WinPlatformCapture final : public IPlatformCapture {
 
         m_env = env;
 
-        // Logging to JS console (Electron/Node.js)
-        try {
-            auto console = env.Global().Get("console").As<Napi::Object>();
-            auto log = console.Get("log").As<Napi::Function>();
-            log.Call(console, { Napi::String::New(env, "[ScreenCapture] INFO: Screen capture started via WinRT Graphics Capture") });
-        } catch (...) {}
+        sc_logger::Info("Screen capture started via WinRT Graphics Capture");
 
         napi_add_env_cleanup_hook(m_env, CleanupHook, this);
 
@@ -103,11 +100,11 @@ class WinPlatformCapture final : public IPlatformCapture {
                 CleanupCapture();
 
             } catch (const hresult_error& e) {
-                OutputDebugStringW(e.message().c_str());
+                sc_logger::Error("WinRT capture thread error: {}", winrt::to_string(e.message()));
             } catch (const std::exception& e) {
-                OutputDebugStringA(e.what());
+                sc_logger::Error("WinRT capture thread error: {}", e.what());
             } catch (...) {
-                OutputDebugStringA("Capture thread error");
+                sc_logger::Error("Capture thread error");
             }
             });
     }
@@ -121,7 +118,7 @@ class WinPlatformCapture final : public IPlatformCapture {
         if (!handle) return std::nullopt;
 
         SharedHandleInfo info;
-        info.handle = reinterpret_cast<uint64_t>(handle);
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
         info.width = m_width;
         info.height = m_height;
         return info;
@@ -312,9 +309,9 @@ class WinPlatformCapture final : public IPlatformCapture {
             }
 
         } catch (const std::exception& e) {
-            OutputDebugStringA(e.what());
+            sc_logger::Error("Unknown error in OnFrame: {}", e.what());
         } catch (...) {
-            OutputDebugStringA("Unknown error in OnFrame");
+            sc_logger::Error("Unknown error in OnFrame");
         }
     }
 

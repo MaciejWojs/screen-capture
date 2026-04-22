@@ -1,7 +1,9 @@
 #ifdef _WIN32
+#include "../logger.hpp"
 #include "win_capture_internal.hpp"
 
 #include <atomic>
+#include <bit>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -31,12 +33,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
 
         m_env = env;
 
-        // Logging to JS console (Electron/Node.js)
-        try {
-            auto console = env.Global().Get("console").As<Napi::Object>();
-            auto log = console.Get("log").As<Napi::Function>();
-            log.Call(console, { Napi::String::New(env, "[ScreenCapture] INFO: Screen capture started via GDI BitBlt fallback") });
-        } catch (...) {}
+        sc_logger::Info("Screen capture started via GDI BitBlt fallback");
 
         napi_add_env_cleanup_hook(m_env, CleanupHook, this);
 
@@ -71,7 +68,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         if (!handle) return std::nullopt;
 
         SharedHandleInfo info;
-        info.handle = reinterpret_cast<uint64_t>(handle);
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
         info.width = m_width;
         info.height = m_height;
         return info;

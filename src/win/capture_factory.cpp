@@ -1,4 +1,5 @@
 #ifdef _WIN32
+#include "../logger.hpp"
 #include "win_capture_internal.hpp"
 #include <windows.h>
 #include <stdio.h>
@@ -29,7 +30,7 @@ bool IsWinRTCaptureAvailable() {
     // Optional safeguard: ensure the core Graphics library is actually present in system
     HMODULE mod = LoadLibraryW(L"Windows.Graphics.dll");
     if (!mod) {
-        OutputDebugStringA("[ScreenCapture] WARN: Windows.Graphics.dll not found on the system!\n");
+        sc_logger::Warn("Windows.Graphics.dll not found on the system!");
         return false;
     }
     FreeLibrary(mod);
@@ -49,10 +50,10 @@ bool IsWinRTCaptureAvailable() {
 
         return isPresent;
     } catch (const winrt::hresult_error& e) {
-        OutputDebugStringA("[ScreenCapture] WARN: WinRT Exception during IsTypePresent check.\n");
+        sc_logger::Warn("WinRT Exception during IsTypePresent check: {}", winrt::to_string(e.message()));
         return false;
     } catch (...) {
-        OutputDebugStringA("[ScreenCapture] WARN: Unknown C++ exception during IsTypePresent check.\n");
+        sc_logger::Warn("Unknown C++ exception during IsTypePresent check.");
         return false;
     }
 #else
@@ -71,29 +72,32 @@ std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& force
     const std::string backend = NormalizeBackendName(forceBackend);
 
 #ifdef FORCE_API_GDI
-    OutputDebugStringA("[ScreenCapture] INFO: Initializing with FORCED API = GDI (Compilation)\n");
+    sc_logger::Info("Initializing with FORCED API = GDI (Compilation)");
     if (!backend.empty() && backend != "gdi") {
-        OutputDebugStringA("[ScreenCapture] WARN: Requested backend does not match compile-time forced GDI.\n");
+        sc_logger::Warn("Requested backend does not match compile-time forced GDI.");
         return nullptr;
     }
     return CreateGDICapture();
+
 #elif defined(FORCE_API_DXGI)
-    OutputDebugStringA("[ScreenCapture] INFO: Initializing with FORCED API = DXGI Desktop Duplication (Compilation)\n");
+    sc_logger::Info("Initializing with FORCED API = DXGI Desktop Duplication (Compilation)");
     if (!backend.empty() && backend != "dxgi") {
-        OutputDebugStringA("[ScreenCapture] WARN: Requested backend does not match compile-time forced DXGI.\n");
+        sc_logger::Warn("Requested backend does not match compile-time forced DXGI.");
         return nullptr;
     }
     return CreateDXGICapture();
+
 #elif defined(FORCE_API_WINRT)
-    OutputDebugStringA("[ScreenCapture] INFO: Initializing with FORCED API = WinRT Graphics Capture (Compilation)\n");
+    sc_logger::Info("Initializing with FORCED API = WinRT Graphics Capture (Compilation)");
     if (!backend.empty() && backend != "winrt") {
-        OutputDebugStringA("[ScreenCapture] WARN: Requested backend does not match compile-time forced WinRT.\n");
+        sc_logger::Warn("Requested backend does not match compile-time forced WinRT.");
         return nullptr;
     }
+
 #if HAS_WINRT_CAPTURE
     return CreateWinRTCapture();
 #else
-    OutputDebugStringA("[ScreenCapture] WARN: WinRT not available in compiler. Returning nullptr.\n");
+    sc_logger::Warn("WinRT not available in compiler. Returning nullptr.");
     return nullptr;
 #endif
 #else
@@ -120,27 +124,27 @@ std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& force
     }
 
     // Automatic, standard fallback
-    OutputDebugStringA("[ScreenCapture] INFO: Initializing in AUTO mode...\n");
+    sc_logger::Info("Initializing in AUTO mode...");
 #if HAS_WINRT_CAPTURE
     if (IsWinRTCaptureAvailable()) {
-        OutputDebugStringA("[ScreenCapture] INFO: WinRT support detected - using WinRT capture.\n");
+        sc_logger::Info("WinRT support detected - using WinRT capture.");
         if (auto cap = CreateWinRTCapture()) {
             return cap;
         }
     } else {
-        OutputDebugStringA("[ScreenCapture] INFO: WinRT is not available on this Windows version.\n");
+        sc_logger::Info("WinRT is not available on this Windows version.");
     }
 #endif
 
     // Fallback to DXGI Desktop Duplication API (Works great on Windows 8 and older builds of Windows 10)
-    OutputDebugStringA("[ScreenCapture] INFO: Starting DXGI Desktop Duplication API...\n");
+    sc_logger::Info("Starting DXGI Desktop Duplication API...");
     if (auto cap = CreateDXGICapture()) {
-        OutputDebugStringA("[ScreenCapture] INFO: Success. Using DXGI Desktop Duplication.\n");
+        sc_logger::Info("Success. Using DXGI Desktop Duplication.");
         return cap;
     }
 
     // Oldest fallback (Windows 7 / XP)
-    OutputDebugStringA("[ScreenCapture] INFO: Old system or DXGI failure detected. Last resort. Using GDI BitBlt.\n");
+    sc_logger::Info("Old system or DXGI failure detected. Last resort. Using GDI BitBlt.");
     return CreateGDICapture();
 #endif
 }

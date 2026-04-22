@@ -53,6 +53,16 @@ export type Backend = WindowsBackend | LinuxBackend | "stub" | "unknown";
 /** The format of the pixel data to retrieve. */
 export type PixelDataFormat = "rgba" | "bgra" | "rgbx" | "bgrx" | "xrgb" | "xbgr";
 
+/**
+ * Configuration options for creating a `ScreenCapture` instance.
+ */
+export interface ScreenCaptureOptions {
+    /** Set to `true` to disable all internal ScreenCapture logs. */
+    disableLogging?: boolean;
+    /** Set explicit log level. Defaults to `info`. */
+    logLevel?: "none" | "error" | "warn" | "info" | "debug";
+}
+
 export interface IScreenCapture {
     /** Starts the screen capture process. */
     start(): void;
@@ -135,7 +145,7 @@ export interface SharedTextureImportTextureInfo {
  * Interface representing the native addon exports.
  */
 export interface INativeAddon {
-    ScreenCapture: new () => IScreenCapture;
+    ScreenCapture: new (options?: ScreenCaptureOptions) => IScreenCapture;
 }
 
 const rootDir = path.resolve(__dirname, '..');

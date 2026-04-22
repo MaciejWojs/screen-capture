@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include "logger.hpp"
 #include "platform_capture.hpp"
 #include "serialize.hpp"
 
@@ -39,6 +40,20 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     explicit ScreenCapture(const Napi::CallbackInfo& info)
         : Napi::ObjectWrap<ScreenCapture>(info),
         m_backend(CreatePlatformCapture()) {
+        if (info.Length() > 0 && info[0].IsObject()) {
+            auto options = info[0].As<Napi::Object>();
+            bool disableLogging = false;
+            if (options.Has("disableLogging") && options.Get("disableLogging").IsBoolean()) {
+                disableLogging = options.Get("disableLogging").As<Napi::Boolean>().Value();
+            }
+
+            if (disableLogging) {
+                sc_logger::SetLogLevel(sc_logger::LogLevel::None);
+            } else if (options.Has("logLevel") && options.Get("logLevel").IsString()) {
+                const std::string levelName = options.Get("logLevel").As<Napi::String>().Utf8Value();
+                sc_logger::SetLogLevel(sc_logger::ParseLogLevel(levelName));
+            }
+        }
     }
 
     private:
