@@ -20,6 +20,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             InstanceMethod("getSharedHandle", &ScreenCapture::GetSharedHandleLegacy),
             InstanceMethod("getSharedTextureInfo", &ScreenCapture::GetSharedTextureInfo),
             InstanceMethod("getPixelData", &ScreenCapture::GetPixelData),
+            InstanceMethod("forceBackend", &ScreenCapture::ForceBackend),
             InstanceMethod("getBackend", &ScreenCapture::GetBackend),
             InstanceMethod("getWidth", &ScreenCapture::GetWidth),
             InstanceMethod("getHeight", &ScreenCapture::GetHeight),
@@ -88,6 +89,38 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     Napi::Value GetSharedTextureInfo(const Napi::CallbackInfo& info) {
         auto shared = m_backend->GetSharedHandle();
         return SerializeSharedTextureInfo(info.Env(), shared);
+    }
+
+    Napi::Value ForceBackend(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+
+        if (info.Length() == 0 || !info[0].IsString()) {
+            Napi::TypeError::New(env, "forceBackend requires a backend name string").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        std::string backend = info[0].As<Napi::String>().Utf8Value();
+        std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+            });
+
+#ifndef _WIN32
+        Napi::Error::New(env, "forceBackend is only supported on Windows").ThrowAsJavaScriptException();
+        return env.Undefined();
+#endif
+
+        auto nextBackend = CreatePlatformCapture(backend);
+        if (!nextBackend) {
+            Napi::Error::New(env, "Requested backend is unavailable or unsupported").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        if (m_backend) {
+            m_backend->Stop();
+        }
+
+        m_backend = std::move(nextBackend);
+        return env.Undefined();
     }
 
     Napi::Value GetPixelData(const Napi::CallbackInfo& info) {

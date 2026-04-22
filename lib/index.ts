@@ -32,9 +32,22 @@ export interface SharedHandleInfo {
 }
 
 /**
- * Interface for controlling the screen capture process and accessing captured frames.
+ * Windows-only capture backends:
+ * - `winrt`: modern Graphics Capture API with best performance and support for protected content when available,
+ * - `dxgi`: desktop duplication API good for most desktops but may fail with exclusive fullscreen or older drivers,
+ * - `gdi`: legacy BitBlt fallback compatible with older Windows versions but slower and less efficient.
  */
-export type Backend = "winrt" | "dxgi" | "gdi" | "wayland" | "x11" | "stub" | "unknown";
+export type WindowsBackend = "winrt" | "dxgi" | "gdi";
+
+/**
+ * Linux-only capture backends: `wayland` for Wayland compositors and `x11` for X11.
+ */
+export type LinuxBackend = "wayland" | "x11";
+
+/**
+ * All supported capture backends across platforms.
+ */
+export type Backend = WindowsBackend | LinuxBackend | "stub" | "unknown";
 
 
 /** The format of the pixel data to retrieve. */
@@ -67,6 +80,12 @@ export interface IScreenCapture {
      * @returns A Buffer containing pixel bytes, or null if unavailable.
      */
     getPixelData(format?: PixelDataFormat): Buffer | null;
+    /**
+     * Forces a Windows capture backend.
+     * @throws When called on non-Windows systems or when the requested backend is unavailable.
+     * @param backend The Windows-only backend to use: 'winrt', 'dxgi', or 'gdi'.
+     */
+    forceBackend(backend: WindowsBackend): void;
     /**
      * Returns the backend identifier used for the current capture implementation.
      */

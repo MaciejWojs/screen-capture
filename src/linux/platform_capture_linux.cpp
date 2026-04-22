@@ -1700,7 +1700,7 @@ bool IsWayland() {
     return false;
 }
 
-std::unique_ptr<IPlatformCapture> CreatePlatformCapture() {
+std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& /*forceBackend*/) {
     if (IsWayland()) {
         sc_logger::Info("Detected Wayland environment");
         return std::make_unique<WaylandPlatformCapture>();
