@@ -1,11 +1,15 @@
 #ifdef __linux__
 #include <spa/param/video/format-utils.h>
+#include "logger.hpp"
 #endif
 
+#include <span>
+#include <string_view>
 #include "pixel_conversion.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <cstring>
 #include <iostream>
@@ -48,17 +52,18 @@ namespace {
 
     using RowConverterFunc = void (*)(const uint8_t* src, uint8_t* dst, size_t width, PixelLayout srcLayout, PixelLayout dstLayout);
 
-    static PixelLayout ParsePixelLayout(std::string format) {
-        std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
+    static PixelLayout ParsePixelLayout(std::string_view format) {
+        std::string normalized(format);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
             });
 
-        if (format == "rgba") return PixelLayout::RGBA;
-        if (format == "bgra") return PixelLayout::BGRA;
-        if (format == "rgbx") return PixelLayout::RGBX;
-        if (format == "bgrx") return PixelLayout::BGRX;
-        if (format == "xrgb") return PixelLayout::XRGB;
-        if (format == "xbgr") return PixelLayout::XBGR;
+        if (normalized == "rgba") return PixelLayout::RGBA;
+        if (normalized == "bgra") return PixelLayout::BGRA;
+        if (normalized == "rgbx") return PixelLayout::RGBX;
+        if (normalized == "bgrx") return PixelLayout::BGRX;
+        if (normalized == "xrgb") return PixelLayout::XRGB;
+        if (normalized == "xbgr") return PixelLayout::XBGR;
         return PixelLayout::UNKNOWN;
     }
 
@@ -270,12 +275,12 @@ namespace {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     static inline void PrefetchIfNeeded(const uint8_t* ptr, bool enabled) {
         if (enabled) {
-            _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T0);
+            _mm_prefetch(std::bit_cast<const char*>(ptr), _MM_HINT_T0);
         }
     }
 
     static inline __m128i LoadShuffleMask(const signed char mask[16]) {
-        return _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask));
+        return _mm_loadu_si128(std::bit_cast<const __m128i*>(mask));
     }
 
     TARGET_ATTR("avx2") static inline __m256i BroadcastShuffleMask(const signed char mask[16]) {
@@ -295,7 +300,7 @@ namespace {
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     static inline uint8x16_t LoadNeonShuffleMask(const signed char mask[16]) {
-        return vld1q_u8(reinterpret_cast<const uint8_t*>(mask));
+        return vld1q_u8(std::bit_cast<const uint8_t*>(mask));
     }
 
     static inline uint8x16_t LoadNeonAlphaMask() {
@@ -353,8 +358,8 @@ namespace {
                 prefetchPtr += 32;
             }
 
-            __m128i source0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
-            __m128i source1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16));
+            __m128i source0 = _mm_loadu_si128(std::bit_cast<const __m128i*>(src));
+            __m128i source1 = _mm_loadu_si128(std::bit_cast<const __m128i*>(src + 16));
             __m128i rgba0 = _mm_shuffle_epi8(source0, srcMask);
             __m128i rgba1 = _mm_shuffle_epi8(source1, srcMask);
             if (needAlphaFill) {
@@ -363,8 +368,8 @@ namespace {
             }
             __m128i result0 = _mm_shuffle_epi8(rgba0, dstMask);
             __m128i result1 = _mm_shuffle_epi8(rgba1, dstMask);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), result0);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 16), result1);
+            _mm_storeu_si128(std::bit_cast<__m128i*>(dst), result0);
+            _mm_storeu_si128(std::bit_cast<__m128i*>(dst + 16), result1);
             src += 32;
             dst += 32;
             pixelsRemaining -= 8;
@@ -375,13 +380,13 @@ namespace {
                 PrefetchIfNeeded(prefetchPtr, true);
                 prefetchPtr += 16;
             }
-            __m128i source = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+            __m128i source = _mm_loadu_si128(std::bit_cast<const __m128i*>(src));
             __m128i rgba = _mm_shuffle_epi8(source, srcMask);
             if (needAlphaFill) {
                 rgba = _mm_or_si128(rgba, alphaMask);
             }
             __m128i result = _mm_shuffle_epi8(rgba, dstMask);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), result);
+            _mm_storeu_si128(std::bit_cast<__m128i*>(dst), result);
             src += 16;
             dst += 16;
             pixelsRemaining -= 4;
@@ -411,13 +416,13 @@ namespace {
                 prefetchPtr += 64;
             }
 
-            __m512i source = _mm512_loadu_si512(reinterpret_cast<const void*>(src));
+            __m512i source = _mm512_loadu_si512(std::bit_cast<const void*>(src));
             __m512i rgba = _mm512_shuffle_epi8(source, srcMask);
             if (needAlphaFill) {
                 rgba = _mm512_or_si512(rgba, alphaMask);
             }
             __m512i result = _mm512_shuffle_epi8(rgba, dstMask);
-            _mm512_storeu_si512(reinterpret_cast<void*>(dst), result);
+            _mm512_storeu_si512(std::bit_cast<void*>(dst), result);
             src += 64;
             dst += 64;
             pixelsRemaining -= 16;
@@ -492,8 +497,8 @@ namespace {
                 prefetchPtr += 64;
             }
 
-            __m256i source0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
-            __m256i source1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 32));
+            __m256i source0 = _mm256_loadu_si256(std::bit_cast<const __m256i*>(src));
+            __m256i source1 = _mm256_loadu_si256(std::bit_cast<const __m256i*>(src + 32));
             __m256i rgba0 = _mm256_shuffle_epi8(source0, srcMask);
             __m256i rgba1 = _mm256_shuffle_epi8(source1, srcMask);
             if (needAlphaFill) {
@@ -502,8 +507,8 @@ namespace {
             }
             __m256i result0 = _mm256_shuffle_epi8(rgba0, dstMask);
             __m256i result1 = _mm256_shuffle_epi8(rgba1, dstMask);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), result0);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 32), result1);
+            _mm256_storeu_si256(std::bit_cast<__m256i*>(dst), result0);
+            _mm256_storeu_si256(std::bit_cast<__m256i*>(dst + 32), result1);
             src += 64;
             dst += 64;
             pixelsRemaining -= 16;
@@ -514,13 +519,13 @@ namespace {
                 PrefetchIfNeeded(prefetchPtr, true);
                 prefetchPtr += 32;
             }
-            __m256i source = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+            __m256i source = _mm256_loadu_si256(std::bit_cast<const __m256i*>(src));
             __m256i rgba = _mm256_shuffle_epi8(source, srcMask);
             if (needAlphaFill) {
                 rgba = _mm256_or_si256(rgba, alphaMask);
             }
             __m256i result = _mm256_shuffle_epi8(rgba, dstMask);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), result);
+            _mm256_storeu_si256(std::bit_cast<__m256i*>(dst), result);
             src += 32;
             dst += 32;
             pixelsRemaining -= 8;
@@ -547,8 +552,8 @@ namespace {
                 prefetchPtr += 64;
             }
 
-            __m256i source0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
-            __m256i source1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 32));
+            __m256i source0 = _mm256_loadu_si256(std::bit_cast<const __m256i*>(src));
+            __m256i source1 = _mm256_loadu_si256(std::bit_cast<const __m256i*>(src + 32));
             __m256i rgba0 = _mm256_shuffle_epi8(source0, srcMask);
             __m256i rgba1 = _mm256_shuffle_epi8(source1, srcMask);
             if (needAlphaFill) {
@@ -557,8 +562,8 @@ namespace {
             }
             __m256i result0 = _mm256_shuffle_epi8(rgba0, dstMask);
             __m256i result1 = _mm256_shuffle_epi8(rgba1, dstMask);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), result0);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 32), result1);
+            _mm256_storeu_si256(std::bit_cast<__m256i*>(dst), result0);
+            _mm256_storeu_si256(std::bit_cast<__m256i*>(dst + 32), result1);
             src += 64;
             dst += 64;
             pixelsRemaining -= 16;
@@ -569,13 +574,13 @@ namespace {
                 PrefetchIfNeeded(prefetchPtr, true);
                 prefetchPtr += 32;
             }
-            __m256i source = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+            __m256i source = _mm256_loadu_si256(std::bit_cast<const __m256i*>(src));
             __m256i rgba = _mm256_shuffle_epi8(source, srcMask);
             if (needAlphaFill) {
                 rgba = _mm256_or_si256(rgba, alphaMask);
             }
             __m256i result = _mm256_shuffle_epi8(rgba, dstMask);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), result);
+            _mm256_storeu_si256(std::bit_cast<__m256i*>(dst), result);
             src += 32;
             dst += 32;
             pixelsRemaining -= 8;
@@ -598,22 +603,21 @@ static std::atomic<bool> s_converterMethodLogged{ false };
 static void LogConverterMethodOnce(const char* method) {
     bool expected = false;
     if (s_converterMethodLogged.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        std::cerr << "[PixelConversion] Using converter: " << method << std::endl;
+        sc_logger::Info("Using converter: {}", method);
     }
 }
 
 std::vector<uint8_t> ConvertPixelBuffer(
-    const uint8_t* src,
-    size_t sourceSize,
+    std::span<const uint8_t> src,
     uint32_t width,
     uint32_t height,
     uint32_t stride,
     uint32_t srcPixelFormat,
-    const std::string& desiredPixelFormat) {
+    std::string_view desiredPixelFormat) {
     PixelLayout dstLayout = ParsePixelLayout(desiredPixelFormat);
     PixelLayout srcLayout = DecodePixelLayout(srcPixelFormat);
     if (dstLayout == PixelLayout::UNKNOWN || srcLayout == PixelLayout::UNKNOWN) {
-        return std::vector<uint8_t>(src, src + sourceSize);
+        return std::vector<uint8_t>(src.data(), src.data() + src.size());
     }
 
     std::vector<uint8_t> dst(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
@@ -653,10 +657,10 @@ std::vector<uint8_t> ConvertPixelBuffer(
 
         if (srcLayout == dstLayout) {
             if (isPacked) {
-                std::memcpy(dst.data(), src, totalPixels * 4);
+                std::memcpy(dst.data(), src.data(), totalPixels * 4);
             } else {
                 for (uint32_t row = 0; row < height; ++row) {
-                    const uint8_t* srcRow = src + static_cast<size_t>(row) * srcRowBytes;
+                    const uint8_t* srcRow = src.data() + static_cast<size_t>(row) * srcRowBytes;
                     uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
                     for (uint32_t col = 0; col < width; ++col) {
                         StoreUInt32(dstRow + static_cast<size_t>(col) * 4,
@@ -665,14 +669,14 @@ std::vector<uint8_t> ConvertPixelBuffer(
                 }
             }
         } else if (isPacked) {
-            converter(src, dst.data(), totalPixels, srcLayout, dstLayout);
+            converter(src.data(), dst.data(), totalPixels, srcLayout, dstLayout);
         } else {
             for (uint32_t row = 0; row < height; ++row) {
-                const uint8_t* srcRow = src + static_cast<size_t>(row) * srcRowBytes;
+                const uint8_t* srcRow = src.data() + static_cast<size_t>(row) * srcRowBytes;
                 uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
                 converter(srcRow, dstRow, width, srcLayout, dstLayout);
             }
         }
 
         return dst;
-}
+};

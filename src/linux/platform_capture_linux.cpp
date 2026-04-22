@@ -2,6 +2,7 @@
 
 #include "../platform_capture.hpp"
 #include "../pixel_conversion.hpp"
+#include "../logger.hpp"
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
@@ -26,9 +27,11 @@
 #include <shared_mutex>
 #include <condition_variable>
 #include <random>
-#include <sstream>
-#include <stdexcept>
+#include <format>
+#include <span>
 #include <string>
+#include <string_view>
+#include <stop_token>
 #include <thread>
 #include <future>
 #include <utility>
@@ -43,10 +46,12 @@
 #include <fstream>
 
 static bool IsNvidiaGPU() {
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    std::ifstream nvidia("/proc/driver/nvidia/version");
-    cached = nvidia.good() ? 1 : 0;
+    static std::once_flag initFlag;
+    static bool cached = false;
+    std::call_once(initFlag, [] {
+        std::ifstream nvidia("/proc/driver/nvidia/version");
+        cached = nvidia.good();
+        });
     return cached;
 }
 
@@ -55,10 +60,12 @@ namespace {
     std::string gen_token() {
         static std::mt19937 rng(std::random_device{}());
         static std::uniform_int_distribution<int> dist(0, 15);
-        std::stringstream ss;
-        ss << std::hex;
-        for (int i = 0; i < 8; i++) ss << dist(rng);
-        return ss.str();
+        std::string token;
+        token.reserve(8);
+        for (int i = 0; i < 8; ++i) {
+            token += std::format("{:x}", dist(rng));
+        }
+        return token;
     }
 
     static std::string PixelFormatToString(uint32_t pixelFormat) {
@@ -154,7 +161,7 @@ namespace {
         std::mutex m_mutex;
     };
 
-    static std::optional<std::vector<uint8_t>> ReadPixelDataFromSharedFd(
+    [[maybe_unused]] static std::optional<std::vector<uint8_t>> ReadPixelDataFromSharedFd(
         int fd,
         uint32_t width,
         uint32_t height,
@@ -162,7 +169,7 @@ namespace {
         uint32_t offset,
         uint64_t planeSize,
         uint32_t pixelFormat,
-        const std::string& desiredFormat) {
+        std::string_view desiredFormat) {
         if (fd < 0 || width == 0 || height == 0) {
             return std::nullopt;
         }
@@ -183,15 +190,14 @@ namespace {
         std::vector<uint8_t> buffer(dataSize);
         memcpy(buffer.data(), static_cast<uint8_t*>(mapped.get()) + static_cast<size_t>(offset), dataSize);
 
-        std::string format = desiredFormat;
+        std::string format = std::string(desiredFormat);
         std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
             });
 
         uint32_t actualStride = stride ? stride : static_cast<uint32_t>(width * 4);
         return ConvertPixelBuffer(
-            buffer.data(),
-            buffer.size(),
+            std::span<const uint8_t>(buffer.data(), buffer.size()),
             width,
             height,
             actualStride,
@@ -200,15 +206,14 @@ namespace {
     }
 
     static std::optional<std::vector<uint8_t>> ReadPixelDataFromRawPointer(
-        const uint8_t* data,
+        std::span<const uint8_t> data,
         uint32_t width,
         uint32_t height,
         uint32_t stride,
         uint64_t planeSize,
-        size_t availableBytes,
         uint32_t pixelFormat,
-        const std::string& desiredFormat) {
-        if (!data || width == 0 || height == 0) {
+        std::string_view desiredFormat) {
+        if (data.empty() || width == 0 || height == 0) {
             return std::nullopt;
         }
 
@@ -220,28 +225,28 @@ namespace {
 
         size_t expectedSize = planeSize ? static_cast<size_t>(planeSize)
             : static_cast<size_t>(actualStride) * static_cast<size_t>(height);
-        if (expectedSize == 0 || expectedSize > availableBytes) {
+        if (expectedSize == 0 || expectedSize > data.size()) {
             return std::nullopt;
         }
 
         std::vector<uint8_t> buffer(expectedSize);
 
         if (actualStride == rowBytes) {
-            std::memcpy(buffer.data(), data, expectedSize);
+            std::memcpy(buffer.data(), data.data(), expectedSize);
         } else {
             for (uint32_t row = 0; row < height; ++row) {
                 size_t srcOffset = static_cast<size_t>(row) * actualStride;
-                if (srcOffset + rowBytes > availableBytes) {
+                if (srcOffset + rowBytes > data.size()) {
                     return std::nullopt;
                 }
-                const uint8_t* srcRow = data + srcOffset;
+                const uint8_t* srcRow = data.data() + srcOffset;
                 uint8_t* dstRow = buffer.data() + static_cast<size_t>(row) * rowBytes;
                 std::memcpy(dstRow, srcRow, rowBytes);
             }
         }
 
         std::string sourceFormat = PixelFormatToString(pixelFormat);
-        std::string normalizedDesired = desiredFormat;
+        std::string normalizedDesired = std::string(desiredFormat);
         std::transform(normalizedDesired.begin(), normalizedDesired.end(), normalizedDesired.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
             });
@@ -261,8 +266,7 @@ namespace {
         }
 
         return ConvertPixelBuffer(
-            buffer.data(),
-            buffer.size(),
+            std::span<const uint8_t>(buffer.data(), buffer.size()),
             width,
             height,
             actualStride,
@@ -403,9 +407,8 @@ namespace Config {
 class BaseLinuxPlatformCapture : public IPlatformCapture {
     protected:
     mutable std::shared_mutex m_stateMutex;
-    std::thread m_worker;
+    std::jthread m_worker;
     std::atomic<bool> m_running{ false };
-    std::atomic<bool> m_stopRequested{ false };
     std::mutex m_captureMutex;
     std::condition_variable m_captureCv;
 
@@ -468,11 +471,15 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         if (!m_running.compare_exchange_strong(expected, true)) {
             return;
         }
-        m_worker = std::thread(&WaylandPlatformCapture::RunCaptureFlow, this);
+        m_worker = std::jthread([this](std::stop_token stopToken) {
+            RunCaptureFlow(stopToken);
+            });
     }
 
     void Stop() override {
-        m_stopRequested.store(true);
+        if (m_worker.joinable()) {
+            m_worker.request_stop();
+        }
 
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
@@ -497,7 +504,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_running.store(false);
     }
 
-    std::optional<std::vector<uint8_t>> GetPixelData(const std::string& desiredFormat = "rgba") const override;
+    std::optional<std::vector<uint8_t>> GetPixelData(std::string_view desiredFormat = "rgba") const override;
     int GetWidth() const override {
         std::shared_lock<std::shared_mutex> lock(m_stateMutex);
         return m_streamConfig ? static_cast<int>(m_streamConfig->width) : 0;
@@ -565,7 +572,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     mutable SharedFd m_cachedFd;
     mutable size_t m_cachedMapSize = 0;
 
-    void RunCaptureFlow() {
+    void RunCaptureFlow(std::stop_token stopToken) {
         int pipewireFd = -1;
         GMainContextPtr context;
 
@@ -627,7 +634,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
             g_main_loop_run(m_glibLoop.get());
 
-            if (m_stopRequested.load()) {
+            if (stopToken.stop_requested()) {
                 throw std::runtime_error("Capture stopped before PipeWire remote was opened");
             }
 
@@ -641,11 +648,11 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
             {
                 std::unique_lock<std::mutex> waitLock(m_captureMutex);
-                m_captureCv.wait(waitLock, [this]() { return m_stopRequested.load(); });
+                m_captureCv.wait(waitLock, [&stopToken] { return stopToken.stop_requested(); });
             }
 
         } catch (const std::exception& e) {
-            std::cerr << "[Linux capture] " << e.what() << std::endl;
+            sc_logger::Error("Linux capture error: {}", e.what());
             if (pipewireFd >= 0) close(pipewireFd);
         }
 
@@ -659,7 +666,6 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
         m_glibLoop.reset();
 
-        m_stopRequested.store(false);
         m_running.store(false);
     }
 
@@ -989,7 +995,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
     static void OnStreamStateChanged(void*, pw_stream_state oldState, pw_stream_state state, const char* error) {
         if (state == PW_STREAM_STATE_ERROR && error) {
-            std::cerr << "[PipeWire] Stream error: " << error << std::endl;
+            sc_logger::Error("PipeWire stream error: {}", error);
         }
     }
 
@@ -1007,12 +1013,13 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         bool forceMemFd = IsNvidiaGPU();
         bool hasModifier = (info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
 
-        std::cerr << "[PipeWire] Chosen stream format: " << PixelFormatToString(info.format)
-            << " (" << info.format << ")"
-            << ", size=" << info.size.width << "x" << info.size.height
-            << ", modifier=" << (hasModifier ? std::to_string(info.modifier) : "none")
-            << ", forceMemFd=" << (forceMemFd ? "yes" : "no")
-            << std::endl;
+        sc_logger::Info("Chosen stream format: {} ({}) , size={}x{} , modifier={} , forceMemFd={}",
+            PixelFormatToString(info.format),
+            static_cast<uint32_t>(info.format),
+            info.size.width,
+            info.size.height,
+            (hasModifier ? std::to_string(info.modifier) : std::string("none")),
+            (forceMemFd ? "yes" : "no"));
 
         {
             std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
@@ -1129,9 +1136,9 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 }
 
                 if (shouldLogDmaBuf) {
-                    std::cerr << "[PipeWire] Używam DMA-BUF (zerowe kopiowanie) – świetnie!" << std::endl;
+                    sc_logger::Info("Using DMA-BUF zero-copy buffer");
                 } else if (shouldLogMemFd) {
-                    std::cerr << "[PipeWire] Używam MemFd (kopiowanie przez CPU) – typowe dla NVIDIA Wayland." << std::endl;
+                    sc_logger::Info("Using MemFd CPU-copy buffer, common for NVIDIA Wayland");
                 }
 
                 self->UpdateSharedHandleFromFd(data.fd);
@@ -1144,7 +1151,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
             if (data.type != SPA_DATA_DmaBuf && data.type != SPA_DATA_MemFd && !self->m_loggedNonDmabuf) {
                 self->m_loggedNonDmabuf = true;
-                std::cerr << "[PipeWire] Non-DMA buffer type received: " << data.type << std::endl;
+                sc_logger::Warn("Non-DMA buffer type received: {}", data.type);
             }
 
             self->RecordFrame();
@@ -1252,7 +1259,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             }
         } catch (const std::exception& e) {
             freeResults();
-            std::cerr << "[Portal] " << e.what() << std::endl;
+            sc_logger::Error("Portal error: {}", e.what());
             if (self->m_glibLoop) {
                 g_main_loop_quit(self->m_glibLoop.get());
                 GMainContext* ctx = g_main_loop_get_context(self->m_glibLoop.get());
@@ -1287,11 +1294,15 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         if (!m_running.compare_exchange_strong(expected, true)) {
             return;
         }
-        m_worker = std::thread(&X11PlatformCapture::CaptureLoop, this);
+        m_worker = std::jthread([this](std::stop_token stopToken) {
+            CaptureLoop(stopToken);
+            });
     }
 
     void Stop() override {
-        m_stopRequested.store(true);
+        if (m_worker.joinable()) {
+            m_worker.request_stop();
+        }
         m_captureCv.notify_all();
 
         if (m_worker.joinable() && std::this_thread::get_id() != m_worker.get_id()) {
@@ -1334,7 +1345,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         return m_sharedHandle ? m_sharedHandle->pixelFormat : 0;
     }
 
-    std::optional<std::vector<uint8_t>> GetPixelData(const std::string& desiredFormat = "rgba") const override;
+    std::optional<std::vector<uint8_t>> GetPixelData(std::string_view desiredFormat = "rgba") const override;
 
     std::string GetBackendName() const override {
         return "x11";
@@ -1349,11 +1360,11 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     std::array<MmapPtr, 2> m_captureMappings;
     size_t m_captureWriteIndex = 0;
 
-    void CaptureLoop() {
-        std::cerr << "[X11] Uruchamiam proces przechwytywania (CaptureLoop)..." << std::endl;
+    void CaptureLoop(std::stop_token stopToken) {
+        sc_logger::Info("Starting X11 capture loop");
         DisplayPtr display(XOpenDisplay(nullptr));
         if (!display) {
-            std::cerr << "[X11] Cannot open display" << std::endl;
+            sc_logger::Error("Cannot open X11 display");
             return;
         }
 
@@ -1364,12 +1375,12 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         XGetWindowAttributes(display.get(), root, &attr);
         int width = attr.width;
         int height = attr.height;
-        std::cerr << "[X11] Wymiary okna root: " << width << "x" << height << ", depth=" << attr.depth << std::endl;
+        sc_logger::Info("X11 root window size: {}x{} depth={}", width, height, attr.depth);
 
         XShmSegmentInfoWrapper shminfo;
         XImagePtr image(XShmCreateImage(display.get(), attr.visual, attr.depth, ZPixmap, nullptr, &shminfo.info, width, height));
         if (!image) {
-            std::cerr << "[X11] Cannot create XShmImage" << std::endl;
+            sc_logger::Error("Cannot create XShmImage");
             return;
         }
 
@@ -1378,7 +1389,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         shminfo.info.readOnly = False;
 
         if (!shminfo.Attach(display.get())) {
-            std::cerr << "[X11] XShmAttach failed" << std::endl;
+            sc_logger::Error("XShmAttach failed");
             return;
         }
 
@@ -1386,17 +1397,17 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         for (size_t i = 0; i < m_captureFds.size(); ++i) {
             int memfd = memfd_create("x11_capture", MFD_CLOEXEC);
             if (memfd < 0) {
-                std::cerr << "[X11] memfd_create failed" << std::endl;
+                sc_logger::Error("X11 memfd_create failed");
                 return;
             }
             m_captureFds[i].reset(new int(memfd));
             if (ftruncate(*m_captureFds[i], size) < 0) {
-                std::cerr << "[X11] ftruncate failed" << std::endl;
+                sc_logger::Error("X11 ftruncate failed");
                 return;
             }
             void* mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, *m_captureFds[i], 0);
             if (mapping == MAP_FAILED) {
-                std::cerr << "[X11] mmap failed for buffer " << i << std::endl;
+                sc_logger::Error("X11 mmap failed for buffer {}", i);
                 return;
             }
             m_captureMappings[i] = MmapPtr(mapping, MmapDeleter{ size });
@@ -1443,9 +1454,10 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 m_sharedFd.reset();
             }
             if (m_sharedFd && *m_sharedFd >= 0) {
-                std::cerr << "[X11] MemFd utworzony, FD: " << *m_sharedFd << " (size: " << size << ")" << std::endl;
+                sc_logger::Info("X11 MemFd created, FD={} size={}", *m_sharedFd, size);
             }
-            std::cerr << "[X11] Wykryty format piksela X11: " << PixelFormatToString(detectedFormat) << " (depth=" << image->depth << ", bpp=" << image->bits_per_pixel << ")" << std::endl;
+            sc_logger::Info("X11 pixel format: {} (depth={}, bpp={})",
+                PixelFormatToString(detectedFormat), image->depth, image->bits_per_pixel);
             m_sharedHandle = SharedHandleInfo{
                 static_cast<uint64_t>(*m_sharedFd),
                 static_cast<uint32_t>(width),
@@ -1463,7 +1475,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
 
         uint64_t frameCounter = 0;
         // Pętla przechwytywania (ok. 60 FPS)
-        while (!m_stopRequested.load()) {
+        while (!stopToken.stop_requested()) {
             auto start = std::chrono::steady_clock::now();
 
             if (XShmGetImage(display.get(), root, image.get(), 0, 0, AllPlanes)) {
@@ -1473,7 +1485,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 std::unique_lock<std::shared_mutex> lock(m_stateMutex);
                 int duplicatedBufferFd = dup(*m_captureFds[writeIndex]);
                 if (duplicatedBufferFd < 0) {
-                    std::cerr << "[X11] dup failed for capture buffer" << std::endl;
+                    sc_logger::Error("X11 dup failed for capture buffer");
                 } else {
                     SharedHandleInfo handle{
                         static_cast<uint64_t>(duplicatedBufferFd),
@@ -1496,11 +1508,11 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 m_captureWriteIndex = (writeIndex + 1) % m_captureFds.size();
                 frameCounter++;
                 if (frameCounter % 120 == 0) {
-                    std::cerr << "[X11] Pomyślnie zrzucono klatkę, nr: " << frameCounter << std::endl;
+                    sc_logger::Info("Captured X11 frame number {}", frameCounter);
                 }
                 RecordFrame();
             } else {
-                std::cerr << "[X11] Błąd pobierania XShmGetImage!" << std::endl;
+                sc_logger::Warn("X11 failed to grab XShmGetImage");
             }
 
             auto end = std::chrono::steady_clock::now();
@@ -1509,13 +1521,13 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 std::this_thread::sleep_for(std::chrono::milliseconds(16) - duration);
             }
         }
-        std::cerr << "[X11] Zatrzymywanie pętli CaptureLoop. Sklonowano klatek: " << frameCounter << std::endl;
+        sc_logger::Info("Stopping X11 capture loop. Frames cloned: {}", frameCounter);
 
         // RAII sprząta zasoby: mapowanie, plik, XShm i display.
     }
 };
 
-std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const std::string& desiredFormat) const {
+std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(std::string_view desiredFormat) const {
     auto frame = m_frameBuffers.AcquireReadFrame();
     if (!frame.has_value() || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
@@ -1533,19 +1545,26 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
         : dataSize + static_cast<size_t>(handle.offset);
 
     if (static_cast<size_t>(handle.offset) >= mapSize) {
-        std::cerr << "[Wayland] Invalid offset: " << handle.offset << " >= mapSize " << mapSize << std::endl;
+        sc_logger::Warn("Wayland invalid offset: {} >= mapSize {}", handle.offset, mapSize);
         return std::nullopt;
     }
 
     size_t available = mapSize - static_cast<size_t>(handle.offset);
     if (dataSize > available) {
-        std::cerr << "[Wayland] dataSize " << dataSize << " exceeds available " << available << std::endl;
+        sc_logger::Warn("Wayland dataSize {} exceeds available {}", dataSize, available);
         return std::nullopt;
     }
 
-    std::cerr << "[Wayland] frame: fd=" << handle.handle << " width=" << handle.width << " height=" << handle.height
-        << " stride=" << handle.stride << " offset=" << handle.offset << " planeSize=" << handle.planeSize
-        << " dataSize=" << dataSize << " mapSize=" << mapSize << " available=" << available << std::endl;
+    sc_logger::Debug("Wayland frame: fd={} width={} height={} stride={} offset={} planeSize={} dataSize={} mapSize={} available={}",
+        handle.handle,
+        handle.width,
+        handle.height,
+        handle.stride,
+        handle.offset,
+        handle.planeSize,
+        dataSize,
+        mapSize,
+        available);
 
     MmapPtr localMapping;
     const uint8_t* mappedData = nullptr;
@@ -1556,8 +1575,7 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
             m_cachedMapping.reset();
             int actualFd = *frame->fd;
             if (static_cast<uint64_t>(actualFd) != handle.handle) {
-                std::cerr << "[Wayland] Warning: frame FD mismatch handle.handle=" << handle.handle
-                    << " actualFd=" << actualFd << std::endl;
+                sc_logger::Warn("Wayland frame FD mismatch handle.handle={} actualFd={}", handle.handle, actualFd);
             }
             void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
             if (ptr == MAP_FAILED) {
@@ -1576,12 +1594,11 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
     }
 
     std::optional<std::vector<uint8_t>> result = ReadPixelDataFromRawPointer(
-        mappedData + static_cast<size_t>(handle.offset),
+        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), available),
         handle.width,
         handle.height,
         handle.stride,
         dataSize,
-        available,
         handle.pixelFormat,
         desiredFormat);
 
@@ -1592,7 +1609,7 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(const s
     return result;
 }
 
-std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::string& desiredFormat) const {
+std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string_view desiredFormat) const {
     auto frame = m_frameBuffers.AcquireReadFrame();
     if (!frame.has_value() || !frame->handle.has_value() || !frame->fd || *frame->fd < 0) {
         return std::nullopt;
@@ -1610,18 +1627,25 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
         : dataSize + static_cast<size_t>(handle.offset);
 
     if (static_cast<size_t>(handle.offset) >= mapSize) {
-        std::cerr << "[X11] Invalid offset: " << handle.offset << " >= mapSize " << mapSize << std::endl;
+        sc_logger::Warn("X11 invalid offset: {} >= mapSize {}", handle.offset, mapSize);
         return std::nullopt;
     }
     size_t available = mapSize - static_cast<size_t>(handle.offset);
     if (dataSize > available) {
-        std::cerr << "[X11] dataSize " << dataSize << " exceeds available " << available << std::endl;
+        sc_logger::Warn("X11 dataSize {} exceeds available {}", dataSize, available);
         return std::nullopt;
     }
 
-    std::cerr << "[X11] frame: fd=" << handle.handle << " width=" << handle.width << " height=" << handle.height
-        << " stride=" << handle.stride << " offset=" << handle.offset << " planeSize=" << handle.planeSize
-        << " dataSize=" << dataSize << " mapSize=" << mapSize << " available=" << available << std::endl;
+    sc_logger::Debug("X11 frame: fd={} width={} height={} stride={} offset={} planeSize={} dataSize={} mapSize={} available={}",
+        handle.handle,
+        handle.width,
+        handle.height,
+        handle.stride,
+        handle.offset,
+        handle.planeSize,
+        dataSize,
+        mapSize,
+        available);
 
     MmapPtr localMapping;
     const uint8_t* mappedData = nullptr;
@@ -1632,8 +1656,7 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
             m_cachedMapping.reset();
             int actualFd = *frame->fd;
             if (static_cast<uint64_t>(actualFd) != handle.handle) {
-                std::cerr << "[X11] Warning: frame FD mismatch handle.handle=" << handle.handle
-                    << " actualFd=" << actualFd << std::endl;
+                sc_logger::Warn("X11 frame FD mismatch handle.handle={} actualFd={}", handle.handle, actualFd);
             }
             void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
             if (ptr == MAP_FAILED) {
@@ -1652,12 +1675,11 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(const std::
     }
 
     std::optional<std::vector<uint8_t>> result = ReadPixelDataFromRawPointer(
-        mappedData + static_cast<size_t>(handle.offset),
+        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), available),
         handle.width,
         handle.height,
         handle.stride,
         dataSize,
-        available,
         handle.pixelFormat,
         desiredFormat);
 
@@ -1680,10 +1702,10 @@ bool IsWayland() {
 
 std::unique_ptr<IPlatformCapture> CreatePlatformCapture() {
     if (IsWayland()) {
-        std::cout << "[Capture] Wykryto środowisko Wayland." << std::endl;
+        sc_logger::Info("Detected Wayland environment");
         return std::make_unique<WaylandPlatformCapture>();
     } else {
-        std::cout << "[Capture] Wykryto środowisko X11." << std::endl;
+        sc_logger::Info("Detected X11 environment");
         return std::make_unique<X11PlatformCapture>();
     }
 }

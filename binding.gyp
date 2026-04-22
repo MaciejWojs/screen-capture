@@ -7,7 +7,8 @@
       },
       "sources": [
         "src/addon.cpp",
-        "src/serialize.cpp"
+        "src/serialize.cpp",
+        "src/logger.cpp"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"

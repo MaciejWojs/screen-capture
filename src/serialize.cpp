@@ -1,6 +1,8 @@
+#include <bit>
 #include <string>
-#include <iostream>
 #include <vector>
+
+#include "logger.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -17,47 +19,47 @@ static std::string PixelFormatToString(uint32_t pixelFormat) {
 #ifdef __linux__
     switch (pixelFormat) {
     case SPA_VIDEO_FORMAT_BGRA:
-        std::cerr << "Pixel format: BGRA" << std::endl;
+        sc_logger::Debug("Pixel format: BGRA");
         return "bgra";
     case SPA_VIDEO_FORMAT_RGBA:
-        std::cerr << "Pixel format: RGBA" << std::endl;
+        sc_logger::Debug("Pixel format: RGBA");
         return "rgba";
     case SPA_VIDEO_FORMAT_BGRx:
-        std::cerr << "Pixel format: BGRx" << std::endl;
+        sc_logger::Debug("Pixel format: BGRx");
         return "bgrx";
     case SPA_VIDEO_FORMAT_RGBx:
-        std::cerr << "Pixel format: RGBx" << std::endl;
+        sc_logger::Debug("Pixel format: RGBx");
         return "rgbx";
     case SPA_VIDEO_FORMAT_xBGR:
-        std::cerr << "Pixel format: xBGR" << std::endl;
+        sc_logger::Debug("Pixel format: xBGR");
         return "xbgr";
     case SPA_VIDEO_FORMAT_xRGB:
-        std::cerr << "Pixel format: xRGB" << std::endl;
+        sc_logger::Debug("Pixel format: xRGB");
         return "xrgb";
     case SPA_VIDEO_FORMAT_NV12:
-        std::cerr << "Pixel format: NV12" << std::endl;
+        sc_logger::Debug("Pixel format: NV12");
         return "nv12";
     case SPA_VIDEO_FORMAT_I420:
-        std::cerr << "Pixel format: I420" << std::endl;
+        sc_logger::Debug("Pixel format: I420");
         return "i420";
     case SPA_VIDEO_FORMAT_YUY2:
-        std::cerr << "Pixel format: YUY2" << std::endl;
+        sc_logger::Debug("Pixel format: YUY2");
         return "yuy2";
     case SPA_VIDEO_FORMAT_AYUV:
-        std::cerr << "Pixel format: AYUV" << std::endl;
+        sc_logger::Debug("Pixel format: AYUV");
         return "ayuv";
     case SPA_VIDEO_FORMAT_UYVY:
-        std::cerr << "Pixel format: UYVY" << std::endl;
+        sc_logger::Debug("Pixel format: UYVY");
         return "uyvy";
     default:
-        std::cerr << "Unknown pixel format: " << pixelFormat << " Falling back to BGRA" << std::endl;
+        sc_logger::Warn("Unknown pixel format: {} Falling back to BGRA", pixelFormat);
         return "bgra";
     }
 #else
-    std::cerr << "Windows platform, defaulting to BGRA pixel format" << std::endl;
+    sc_logger::Info("Windows platform, defaulting to BGRA pixel format");
     return "bgra";
 #endif
-}
+    }
 
 Napi::Value SerializeSharedHandleLegacy(Napi::Env env, const std::optional<SharedHandleInfo>& shared) {
     if (!shared.has_value()) return env.Null();
@@ -82,7 +84,7 @@ Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<Shared
 #ifdef __linux__
     if (shared->bufferType != SPA_DATA_DmaBuf) {
         if (shared->bufferType == SPA_DATA_MemFd) {
-            std::cerr << "You should use getPixelData for SPA_DATA_MemFd buffer type, as it is not supported in Electron shared textures." << std::endl;
+            sc_logger::Warn("You should use getPixelData for SPA_DATA_MemFd buffer type, as it is not supported in Electron shared textures.");
         }
         return env.Null();
     }
@@ -103,7 +105,7 @@ Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<Shared
 
 #ifdef _WIN32
     // Windows expects ntHandle as a Buffer
-    HANDLE rawHandle = reinterpret_cast<HANDLE>(shared->handle);
+    HANDLE rawHandle = std::bit_cast<HANDLE>(static_cast<std::uintptr_t>(shared->handle));
     Napi::Buffer<uint8_t> buffer = Napi::Buffer<uint8_t>::Copy(env, reinterpret_cast<uint8_t*>(&rawHandle), sizeof(HANDLE));
     handle.Set("ntHandle", buffer);
 #elif defined(__linux__)
@@ -123,7 +125,7 @@ Napi::Value SerializeSharedTextureInfo(Napi::Env env, const std::optional<Shared
 
     obj.Set("handle", handle);
     return obj;
-}
+        }
 
 Napi::Value SerializePixelData(Napi::Env env, const std::optional<std::vector<uint8_t>>& pixels) {
     if (!pixels.has_value()) {
