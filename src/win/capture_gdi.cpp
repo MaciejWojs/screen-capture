@@ -4,11 +4,12 @@
 
 #include <atomic>
 #include <bit>
+#include <condition_variable>
+#include <mutex>
+#include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <vector>
 #include <windows.h>
 #include <d3d11.h>
@@ -18,32 +19,31 @@
 class LegacyWinPlatformCapture final : public IPlatformCapture {
     public:
     LegacyWinPlatformCapture() = default;
-    ~LegacyWinPlatformCapture() override {
-        Stop();
-    }
+    ~LegacyWinPlatformCapture() override { Stop(); }
 
     static void CleanupHook(void* arg) {
-        if (arg) {
-            static_cast<LegacyWinPlatformCapture*>(arg)->Stop();
-        }
+        if (arg) static_cast<LegacyWinPlatformCapture*>(arg)->Stop();
     }
 
     void Start(Napi::Env env) override {
-        if (m_isRunning) return;
+        if (m_thread.joinable()) return;   // już działa
 
         m_env = env;
-
-        sc_logger::Info("Screen capture started via GDI BitBlt fallback");
+        sc_logger::Info("Screen capture started via GDI BitBlt fallback (C++20 jthread)");
 
         napi_add_env_cleanup_hook(m_env, CleanupHook, this);
 
-        m_isRunning = true;
-        m_captureThread = std::thread([this]() {
+        // Uruchom wątek z obsługą stop_token
+        m_thread = std::jthread([this](std::stop_token stopToken) {
             InitializeDirect3D();
 
-            while (m_isRunning) {
+            std::unique_lock lock(m_cvMutex);
+            while (!stopToken.stop_requested()) {
                 CaptureScreenGDI();
-                std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS
+
+                // Czekaj max 16 ms lub do sygnału stop
+                m_cv.wait_for(lock, std::chrono::milliseconds(16),
+                    [&stopToken] { return stopToken.stop_requested(); });
             }
 
             CleanupDirect3D();
@@ -56,10 +56,10 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             m_env = nullptr;
         }
 
-        if (!m_isRunning.exchange(false)) return;
-
-        if (m_captureThread.joinable()) {
-            m_captureThread.join();
+        if (m_thread.joinable()) {
+            m_thread.request_stop();      // wysyła sygnał zatrzymania
+            m_cv.notify_all();            // budzi wątek, jeśli czeka
+            m_thread.join();              // czeka na zakończenie
         }
     }
 
@@ -74,30 +74,18 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         return info;
     }
 
-    int GetWidth() const override {
-        return static_cast<int>(m_width);
-    }
-
-    int GetHeight() const override {
-        return static_cast<int>(m_height);
-    }
-
-    int GetStride() const override {
-        return static_cast<int>(m_width * 4);
-    }
-
-    uint32_t GetPixelFormat() const override {
-        return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
-    }
-
-    std::string GetBackendName() const override {
-        return "gdi";
-    }
+    int GetWidth() const override { return static_cast<int>(m_width); }
+    int GetHeight() const override { return static_cast<int>(m_height); }
+    int GetStride() const override { return static_cast<int>(m_width * 4); }
+    uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
+    std::string GetBackendName() const override { return "gdi"; }
+    int GetFps() const override { return m_lastFps.load(); }
 
     private:
     napi_env m_env{ nullptr };
-    std::thread m_captureThread;
-    std::atomic<bool> m_isRunning{ false };
+    std::jthread m_thread;                       // automatyczne zarządzanie wątkiem
+    mutable std::mutex m_cvMutex;                // dla condition_variable
+    std::condition_variable_any m_cv;            // może czekać na stop_token
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
@@ -109,7 +97,6 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     uint32_t m_height = 0;
     std::vector<uint8_t> m_pixels;
 
-    // FPS counter
     std::atomic<uint64_t> m_frameCount{ 0 };
     std::atomic<int> m_lastFps{ 0 };
     std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
@@ -135,13 +122,13 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         desc.SampleDesc.Count = 1;
 
-        // Standard CPU-write supported texture to which we will transfer from RAM
+        // staging texture (CPU write)
         desc.Usage = D3D11_USAGE_DYNAMIC;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         m_device->CreateTexture2D(&desc, nullptr, &m_stagingTex);
 
-        // Shared texture
+        // shared texture (GPU default)
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         desc.CPUAccessFlags = 0;
@@ -159,7 +146,8 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     }
 
     void CleanupDirect3D() {
-        m_sharedHandle.store(nullptr);
+        HANDLE handle = m_sharedHandle.exchange(nullptr);
+        if (handle) CloseHandle(handle);
         m_sharedTex = nullptr;
         m_stagingTex = nullptr;
         m_context = nullptr;
@@ -175,22 +163,21 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, m_width, m_height);
         HGDIOBJ hOldBitmap = SelectObject(hMemoryDC, hBitmap);
 
-        // Screen copy
         BitBlt(hMemoryDC, 0, 0, m_width, m_height, hScreenDC, 0, 0, SRCCOPY | CAPTUREBLT);
 
         BITMAPINFOHEADER bi = {};
         bi.biSize = sizeof(BITMAPINFOHEADER);
         bi.biWidth = m_width;
-        bi.biHeight = -static_cast<LONG>(m_height); // bottom-up to top-down
+        bi.biHeight = -static_cast<LONG>(m_height);  // top-down
         bi.biPlanes = 1;
         bi.biBitCount = 32;
         bi.biCompression = BI_RGB;
 
-        // Get pixels
         m_pixels.resize(m_width * m_height * 4);
-        GetDIBits(hMemoryDC, hBitmap, 0, m_height, m_pixels.data(), reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
+        GetDIBits(hMemoryDC, hBitmap, 0, m_height, m_pixels.data(),
+            reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
 
-        // Replace with buffer in D3D11
+        // kopiuj do staging texture
         D3D11_MAPPED_SUBRESOURCE mapped;
         if (SUCCEEDED(m_context->Map(m_stagingTex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
             for (uint32_t y = 0; y < m_height; ++y) {
@@ -199,18 +186,17 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
                     m_width * 4);
             }
             m_context->Unmap(m_stagingTex.Get(), 0);
-
-            // Copy finished texture to the shared one using GPU
             m_context->CopyResource(m_sharedTex.Get(), m_stagingTex.Get());
             m_context->Flush();
         }
 
+        // zwolnij GDI
         SelectObject(hMemoryDC, hOldBitmap);
         DeleteObject(hBitmap);
         DeleteDC(hMemoryDC);
         ReleaseDC(nullptr, hScreenDC);
 
-        // FPS calculation
+        // FPS
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
         if (elapsed >= 1) {
@@ -219,15 +205,10 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             m_lastFpsTime = now;
         }
     }
-
-    public:
-    int GetFps() const override {
-        return m_lastFps.load();
-    }
 };
 
 std::unique_ptr<IPlatformCapture> CreateGDICapture() {
     return std::make_unique<LegacyWinPlatformCapture>();
 }
 
-#endif
+#endif // _WIN32
