@@ -6,11 +6,12 @@
 
 #include <atomic>
 #include <bit>
+#include <condition_variable>
+#include <mutex>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -50,23 +51,24 @@ class WinPlatformCapture final : public IPlatformCapture {
 
     static void CleanupHook(void* arg) {
         if (arg) {
-            static_cast<WinPlatformCapture*>(arg)->StopInternal();
+            static_cast<WinPlatformCapture*>(arg)->Stop();
         }
     }
 
     void Start(Napi::Env env) override {
-        if (m_isRunning) return;
+        if (m_jthread.joinable()) return;
 
         m_env = env;
-
-        sc_logger::Info("Screen capture started via WinRT Graphics Capture");
+        sc_logger::Info("Screen capture started via WinRT Graphics Capture (jthread)");
 
         napi_add_env_cleanup_hook(m_env, CleanupHook, this);
 
-        m_isRunning = true;
-        m_captureThread = std::thread([this]() {
+        m_jthread = std::jthread([this](std::stop_token stopToken) {
             try {
                 init_apartment(apartment_type::multi_threaded);
+
+                if (stopToken.stop_requested()) return;
+
                 InitializeD3D();
 
                 HMONITOR monitor = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
@@ -90,21 +92,22 @@ class WinPlatformCapture final : public IPlatformCapture {
 
                 CreateFramePoolAndSession();
 
-                // Wait until StopInternal() is called
-                std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait_for(lock, std::chrono::milliseconds(100), [this]() { return !m_isRunning.load(); });
-                while (m_isRunning.load()) {
-                    m_cv.wait_for(lock, std::chrono::milliseconds(100), [this]() { return !m_isRunning.load(); });
-                }
+                // Wait until stop is requested
+                std::unique_lock lock(m_waitMutex);
+                m_waitCv.wait(lock, [&] {
+                    return stopToken.stop_requested();
+                    });
 
                 CleanupCapture();
-
             } catch (const hresult_error& e) {
                 sc_logger::Error("WinRT capture thread error: {}", winrt::to_string(e.message()));
+                CleanupCapture();
             } catch (const std::exception& e) {
                 sc_logger::Error("WinRT capture thread error: {}", e.what());
+                CleanupCapture();
             } catch (...) {
                 sc_logger::Error("Capture thread error");
+                CleanupCapture();
             }
             });
     }
@@ -124,38 +127,22 @@ class WinPlatformCapture final : public IPlatformCapture {
         return info;
     }
 
-    int GetWidth() const override {
-        return static_cast<int>(m_width);
-    }
-
-    int GetHeight() const override {
-        return static_cast<int>(m_height);
-    }
-
-    int GetStride() const override {
-        return static_cast<int>(m_width * 4);
-    }
-
-    uint32_t GetPixelFormat() const override {
-        return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
-    }
-
-    std::string GetBackendName() const override {
-        return "winrt";
-    }
+    int GetWidth() const override { return static_cast<int>(m_width); }
+    int GetHeight() const override { return static_cast<int>(m_height); }
+    int GetStride() const override { return static_cast<int>(m_width * 4); }
+    uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
+    std::string GetBackendName() const override { return "winrt"; }
+    int GetFps() const override { return m_lastFps.load(); }
 
     private:
     napi_env m_env{ nullptr };
-    std::thread m_captureThread;
-    std::atomic<bool> m_isRunning{ false };
-    std::mutex m_mutex;
-    std::condition_variable m_cv;
+    std::jthread m_jthread;
+    std::mutex m_waitMutex;
+    std::condition_variable_any m_waitCv;
 
     com_ptr<ID3D11Device> m_device;
     com_ptr<ID3D11DeviceContext> m_context;
-
     IDirect3DDevice m_winrtDevice{ nullptr };
-
     com_ptr<ID3D11Texture2D> m_sharedTex;
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
 
@@ -167,7 +154,6 @@ class WinPlatformCapture final : public IPlatformCapture {
     uint32_t m_width = 0;
     uint32_t m_height = 0;
 
-    // FPS counter
     std::atomic<uint64_t> m_frameCount{ 0 };
     std::atomic<int> m_lastFps{ 0 };
     std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
@@ -194,11 +180,10 @@ class WinPlatformCapture final : public IPlatformCapture {
             m_env = nullptr;
         }
 
-        if (!m_isRunning.exchange(false)) return;
-        m_cv.notify_all();
-
-        if (m_captureThread.joinable()) {
-            m_captureThread.join();
+        if (m_jthread.joinable()) {
+            m_jthread.request_stop();
+            m_waitCv.notify_all();
+            m_jthread.join();
         }
     }
 
@@ -265,7 +250,6 @@ class WinPlatformCapture final : public IPlatformCapture {
             if (!frame) return;
 
             auto size = frame.ContentSize();
-
             if (size.Width == 0 || size.Height == 0) return;
 
             if (size.Width != m_width || size.Height != m_height) {
@@ -307,17 +291,11 @@ class WinPlatformCapture final : public IPlatformCapture {
                 m_lastFps = static_cast<int>(frames / elapsed);
                 m_lastFpsTime = now;
             }
-
         } catch (const std::exception& e) {
             sc_logger::Error("Unknown error in OnFrame: {}", e.what());
         } catch (...) {
             sc_logger::Error("Unknown error in OnFrame");
         }
-    }
-
-    public:
-    int GetFps() const override {
-        return m_lastFps.load();
     }
 };
 
@@ -325,7 +303,7 @@ std::unique_ptr<IPlatformCapture> CreateWinRTCapture() {
     return std::make_unique<WinPlatformCapture>();
 }
 
-#else
+#else // !HAS_WINRT_CAPTURE
 
 std::unique_ptr<IPlatformCapture> CreateWinRTCapture() {
     return nullptr;
