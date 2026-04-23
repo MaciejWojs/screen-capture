@@ -4,6 +4,9 @@
 
 #include <atomic>
 #include <bit>
+#include <condition_variable>
+#include <mutex>
+#include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -16,43 +19,43 @@
 class DXGIPlatformCapture final : public IPlatformCapture {
     public:
     DXGIPlatformCapture() = default;
-    ~DXGIPlatformCapture() override {
-        Stop();
-    }
+    ~DXGIPlatformCapture() override { Stop(); }
 
     static void CleanupHook(void* arg) {
-        if (arg) {
-            static_cast<DXGIPlatformCapture*>(arg)->Stop();
-        }
+        if (arg) static_cast<DXGIPlatformCapture*>(arg)->Stop();
     }
 
     void Start(Napi::Env env) override {
-        if (m_isRunning) return;
-
+        if (m_thread.joinable()) return;
         m_env = env;
-
-        sc_logger::Info("Screen capture started via DXGI Desktop Duplication API");
+        sc_logger::Info("Screen capture started via DXGI Desktop Duplication API with jthread");
 
         napi_add_env_cleanup_hook(m_env, CleanupHook, this);
 
-        m_isRunning = true;
-        m_captureThread = std::thread([this]() {
+        m_thread = std::jthread([this](std::stop_token stopToken) {
             if (!InitializeDirect3D()) {
-                m_isRunning = false;
+                sc_logger::Error("DXGI: Initialization failed");
                 return;
             }
 
-            while (m_isRunning) {
-                if (!CaptureFrame()) {
-                    // After session loss (e.g. screen resolution change / disconnect) - we refresh
+            // Main capture loop
+            while (!stopToken.stop_requested()) {
+                if (!CaptureFrame(stopToken)) {
+                    sc_logger::Info("DXGI: Session lost, reinitializing...");
                     CleanupDirect3D();
-                    if (!InitializeDirect3D()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Waiting for screen to return
+
+                    while (!stopToken.stop_requested()) {
+                        if (InitializeDirect3D())
+                            break;
+                        std::unique_lock lock(m_reinitMutex);
+                        m_reinitCv.wait_for(lock, std::chrono::milliseconds(100),
+                            [&stopToken] { return stopToken.stop_requested(); });
                     }
                 }
             }
 
             CleanupDirect3D();
+            sc_logger::Info("DXGI capture thread stopped");
             });
     }
 
@@ -62,10 +65,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             m_env = nullptr;
         }
 
-        if (!m_isRunning.exchange(false)) return;
-
-        if (m_captureThread.joinable()) {
-            m_captureThread.join();
+        if (m_thread.joinable()) {
+            m_thread.request_stop();
+            m_reinitCv.notify_all();
+            m_thread.join();
         }
     }
 
@@ -80,30 +83,18 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         return info;
     }
 
-    int GetWidth() const override {
-        return static_cast<int>(m_width);
-    }
-
-    int GetHeight() const override {
-        return static_cast<int>(m_height);
-    }
-
-    int GetStride() const override {
-        return static_cast<int>(m_width * 4);
-    }
-
-    uint32_t GetPixelFormat() const override {
-        return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
-    }
-
-    std::string GetBackendName() const override {
-        return "dxgi";
-    }
+    int GetWidth() const override { return static_cast<int>(m_width); }
+    int GetHeight() const override { return static_cast<int>(m_height); }
+    int GetStride() const override { return static_cast<int>(m_width * 4); }
+    uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
+    std::string GetBackendName() const override { return "dxgi"; }
+    int GetFps() const override { return m_lastFps.load(); }
 
     private:
     napi_env m_env{ nullptr };
-    std::thread m_captureThread;
-    std::atomic<bool> m_isRunning{ false };
+    std::jthread m_thread;                      // automatyczne zarządzanie wątkiem
+    mutable std::mutex m_reinitMutex;           // dla condition_variable przy ponownej inicjalizacji
+    std::condition_variable_any m_reinitCv;     // może czekać na stop_token
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
@@ -114,7 +105,6 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     uint32_t m_width = 0;
     uint32_t m_height = 0;
 
-    // FPS counter
     std::atomic<uint64_t> m_frameCount{ 0 };
     std::atomic<int> m_lastFps{ 0 };
     std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
@@ -139,32 +129,29 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         if (FAILED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) return false;
 
         Microsoft::WRL::ComPtr<IDXGIOutput1> dxgiOutput1;
-        if (FAILED(dxgiOutput.As(&dxgiOutput1))) return false; // This will throw error e.g. on Win7 without Platform Update
+        if (FAILED(dxgiOutput.As(&dxgiOutput1))) return false; // wymaga DXGI 1.2 (Win8+)
 
         hr = dxgiOutput1->DuplicateOutput(m_device.Get(), &m_duplication);
-        if (FAILED(hr)) return false; // E_ACCESSDENIED in Win8 full-screen apps, etc.
+        if (FAILED(hr)) return false; // np. E_ACCESSDENIED
 
         DXGI_OUTDUPL_DESC desc;
         m_duplication->GetDesc(&desc);
-        if (desc.DesktopImageInSystemMemory) return false; // We don't want to copy this way
+        if (desc.DesktopImageInSystemMemory) return false; // nie chcemy tej ścieżki
 
         m_width = desc.ModeDesc.Width;
         m_height = desc.ModeDesc.Height;
 
-        // Creating "Shared Texture"
         D3D11_TEXTURE2D_DESC texDesc = {};
         texDesc.Width = m_width;
         texDesc.Height = m_height;
         texDesc.MipLevels = 1;
         texDesc.ArraySize = 1;
-        // DXGI DDA returns B8G8R8A8_UNORM per specification
         texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         texDesc.SampleDesc.Count = 1;
         texDesc.Usage = D3D11_USAGE_DEFAULT;
         texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         texDesc.CPUAccessFlags = 0;
         texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-
 
         hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex);
         if (FAILED(hr)) return false;
@@ -177,36 +164,40 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                 return true;
             }
         }
-
         return false;
     }
 
     void CleanupDirect3D() {
-        m_sharedHandle.store(nullptr);
+        HANDLE handle = m_sharedHandle.exchange(nullptr);
+        if (handle) CloseHandle(handle);
         m_sharedTex = nullptr;
         m_duplication = nullptr;
         m_context = nullptr;
         m_device = nullptr;
     }
 
-    bool CaptureFrame() {
+    bool CaptureFrame(std::stop_token stopToken) {
         if (!m_duplication) return false;
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         Microsoft::WRL::ComPtr<IDXGIResource> desktopResource;
 
-        // Timeout e.g. 250ms, so thread doesn't block infinitely. Gives chance to respond to m_isRunning=false flag
-        HRESULT hr = m_duplication->AcquireNextFrame(250, &frameInfo, &desktopResource);
+        HRESULT hr = m_duplication->AcquireNextFrame(100, &frameInfo, &desktopResource);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            return true; // Nothing changed on screen, maintaining connection
+            return true;
         }
         if (FAILED(hr)) {
-            // This usually means ACCESS_LOST (lost full-screen or resolution change)
+            // DXGI_ERROR_ACCESS_LOST etc.
+            return false;
+        }
+
+        // check if stop was requested while waiting for the frame
+        if (stopToken.stop_requested()) {
+            m_duplication->ReleaseFrame();
             return false;
         }
 
         if (frameInfo.AccumulatedFrames == 0 || frameInfo.LastPresentTime.QuadPart == 0) {
-            // Frame not refreshed, just releasing
             m_duplication->ReleaseFrame();
             return true;
         }
@@ -215,14 +206,13 @@ class DXGIPlatformCapture final : public IPlatformCapture {
 
         Microsoft::WRL::ComPtr<ID3D11Texture2D> desktopTexture;
         if (SUCCEEDED(desktopResource.As(&desktopTexture))) {
-            // We copy texture obtained from Desktop Duplication directly to our SharedTexture on hardware side
             m_context->CopyResource(m_sharedTex.Get(), desktopTexture.Get());
             m_context->Flush();
         }
 
         m_duplication->ReleaseFrame();
 
-        // FPS calculation
+        // FPS
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
         if (elapsed >= 1) {
@@ -233,19 +223,14 @@ class DXGIPlatformCapture final : public IPlatformCapture {
 
         return true;
     }
-
-    public:
-    int GetFps() const override {
-        return m_lastFps.load();
-    }
 };
 
 // Check if OS is available to initialize DXGI DDA (Windows 8+)
 bool IsWin8OrGreaterForDXGI() {
     HMODULE hMod = ::GetModuleHandleW(L"ntdll.dll");
     if (hMod) {
-        typedef NTSTATUS(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
-        RtlGetVersionPtr fxPtr = (RtlGetVersionPtr)::GetProcAddress(hMod, "RtlGetVersion");
+        using RtlGetVersionPtr = NTSTATUS(WINAPI*)(PRTL_OSVERSIONINFOW);
+        auto fxPtr = reinterpret_cast<RtlGetVersionPtr>(::GetProcAddress(hMod, "RtlGetVersion"));
         if (fxPtr) {
             RTL_OSVERSIONINFOW rovi = { 0 };
             rovi.dwOSVersionInfoSize = sizeof(rovi);
@@ -260,11 +245,10 @@ bool IsWin8OrGreaterForDXGI() {
 }
 
 std::unique_ptr<IPlatformCapture> CreateDXGICapture() {
-    // Windows 8 (DXGI 1.2) API
     if (IsWin8OrGreaterForDXGI()) {
         return std::make_unique<DXGIPlatformCapture>();
     }
     return nullptr;
 }
 
-#endif
+#endif // _WIN32
