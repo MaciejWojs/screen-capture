@@ -163,7 +163,8 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         texDesc.Usage = D3D11_USAGE_DEFAULT;
         texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         texDesc.CPUAccessFlags = 0;
-        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
 
         hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex);
         if (FAILED(hr)) return false;
