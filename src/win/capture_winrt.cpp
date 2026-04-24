@@ -58,6 +58,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     void Start(Napi::Env env) override {
         if (m_jthread.joinable()) return;
 
+        m_cleaned.store(false, std::memory_order_relaxed);
         m_env = env;
         sc_logger::Info("Screen capture started via WinRT Graphics Capture (jthread)");
 
@@ -93,8 +94,9 @@ class WinPlatformCapture final : public IPlatformCapture {
                     m_height = m_item.Size().Height;
                 }
 
-                CreateFramePoolAndSession();
+                CreateFramePoolAndSession(m_winrtDevice, m_item);
 
+                m_lastFpsTimeNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
                 m_running.store(true, std::memory_order_release);
 
                 // Wait until stop is requested or pool recreation is requested
@@ -109,13 +111,15 @@ class WinPlatformCapture final : public IPlatformCapture {
                     }
 
                     if (m_poolRecreationRequested.exchange(false)) {
-                        bool shouldRecreate = false;
+                        auto item = m_item;
+                        auto device = m_winrtDevice;
                         {
                             std::lock_guard<std::mutex> stateLock(m_stateMutex);
-                            shouldRecreate = (m_winrtDevice && m_item);
+                            item = m_item;
+                            device = m_winrtDevice;
                         }
-                        if (shouldRecreate) {
-                            CreateFramePoolAndSession();
+                        if (item && device) {
+                            CreateFramePoolAndSession(device, item);
                         }
                     }
                 }
@@ -183,6 +187,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     mutable std::mutex m_stateMutex;
     std::atomic<bool> m_running{ false };
     std::atomic<bool> m_poolRecreationRequested{ false };
+    std::atomic<bool> m_cleaned{ false };
 
     com_ptr<ID3D11Device> m_device;
     com_ptr<ID3D11DeviceContext> m_context;
@@ -204,7 +209,7 @@ class WinPlatformCapture final : public IPlatformCapture {
 
     void InitializeD3D() {
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
-        check_hresult(D3D11CreateDevice(
+        HRESULT hr = D3D11CreateDevice(
             nullptr,
             D3D_DRIVER_TYPE_HARDWARE,
             nullptr,
@@ -215,7 +220,25 @@ class WinPlatformCapture final : public IPlatformCapture {
             m_device.put(),
             nullptr,
             m_context.put()
-        ));
+        );
+
+        if (FAILED(hr)) {
+            sc_logger::Warn("D3D11CreateDevice(HARDWARE) failed, falling back to WARP");
+            hr = D3D11CreateDevice(
+                nullptr,
+                D3D_DRIVER_TYPE_WARP,
+                nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                levels,
+                ARRAYSIZE(levels),
+                D3D11_SDK_VERSION,
+                m_device.put(),
+                nullptr,
+                m_context.put()
+            );
+        }
+
+        check_hresult(hr);
     }
 
     void StopInternal() {
@@ -234,6 +257,18 @@ class WinPlatformCapture final : public IPlatformCapture {
     }
 
     void CleanupCapture() {
+        if (m_cleaned.exchange(true)) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            if (m_session) {
+                m_session.Close();
+                m_session = nullptr;
+            }
+        }
+
         auto framePool = m_framePool;
         auto token = m_token;
 
@@ -251,11 +286,6 @@ class WinPlatformCapture final : public IPlatformCapture {
 
         std::lock_guard<std::mutex> lock(m_stateMutex);
 
-        if (m_session) {
-            m_session.Close();
-            m_session = nullptr;
-        }
-
         m_item = nullptr;
         m_winrtDevice = nullptr;
         m_sharedTex = nullptr;
@@ -266,34 +296,41 @@ class WinPlatformCapture final : public IPlatformCapture {
         if (handle) CloseHandle(handle);
     }
 
-    void CreateFramePoolAndSession() {
-        if (m_framePool) {
-            if (m_token.value) {
-                m_framePool.FrameArrived(m_token);
-                m_token.value = 0;
-            }
-            m_framePool.Close();
-            m_framePool = nullptr;
+    void CreateFramePoolAndSession(IDirect3DDevice const& winrtDevice, GraphicsCaptureItem const& item) {
+        auto oldPool = m_framePool;
+        auto oldToken = m_token;
+
+        m_framePool = nullptr;
+        m_token = {};
+
+        if (oldPool && oldToken.value) {
+            oldPool.FrameArrived(oldToken);
         }
+
+        if (oldPool) {
+            oldPool.Close();
+            oldPool = nullptr;
+        }
+
         if (m_session) {
             m_session.Close();
             m_session = nullptr;
         }
 
-        if (!m_winrtDevice) return;
+        if (!winrtDevice) return;
 
         winrt::Windows::Graphics::SizeInt32 framePoolSize;
         framePoolSize.Width = static_cast<int32_t>(m_width);
         framePoolSize.Height = static_cast<int32_t>(m_height);
 
         m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            m_winrtDevice,
+            winrtDevice,
             winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,
             framePoolSize
         );
 
-        m_session = m_framePool.CreateCaptureSession(m_item);
+        m_session = m_framePool.CreateCaptureSession(item);
         m_session.IsCursorCaptureEnabled(false);
         m_session.IsBorderRequired(false);
         m_session.IncludeSecondaryWindows(true);
