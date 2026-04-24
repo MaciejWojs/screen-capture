@@ -177,6 +177,11 @@ class WinPlatformCapture final : public IPlatformCapture {
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
         sc_logger::Info("GetSharedHandle called");
+        if (!m_captureStarted.load(std::memory_order_acquire) || !m_textureReady.load(std::memory_order_acquire)) {
+            sc_logger::Warn("GetSharedHandle: capture not started or texture not ready");
+            return std::nullopt;
+        }
+
         std::lock_guard<std::mutex> lock(m_stateMutex);
         HANDLE handle = m_sharedHandle.load();
         if (!handle) {
@@ -227,6 +232,9 @@ class WinPlatformCapture final : public IPlatformCapture {
     std::atomic<bool> m_running{ false };
     std::atomic<bool> m_poolRecreationRequested{ false };
     std::atomic<bool> m_cleaned{ false };
+    std::atomic<bool> m_deviceReady{ false };
+    std::atomic<bool> m_textureReady{ false };
+    std::atomic<bool> m_captureStarted{ false };
 
     com_ptr<ID3D11Device> m_device;
     com_ptr<ID3D11DeviceContext> m_context;
@@ -280,6 +288,7 @@ class WinPlatformCapture final : public IPlatformCapture {
 
         check_hresult(hr);
         sc_logger::Info("D3D11 device created successfully");
+        m_deviceReady.store(true, std::memory_order_release);
     }
 
     void StopInternal() {
@@ -341,6 +350,9 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_sharedTex = nullptr;
         m_device = nullptr;
         m_context = nullptr;
+        m_deviceReady.store(false, std::memory_order_release);
+        m_textureReady.store(false, std::memory_order_release);
+        m_captureStarted.store(false, std::memory_order_release);
 
         HANDLE handle = m_sharedHandle.exchange(nullptr);
         if (handle) {
@@ -368,7 +380,23 @@ class WinPlatformCapture final : public IPlatformCapture {
             return;
         }
         if (size.Width == 0 || size.Height == 0) {
-            sc_logger::Warn("Invalid capture size 0x0, using fallback 1920x1080 until first frame");
+            sc_logger::Warn("CreateFramePoolAndSession: initial item size is zero, waiting for valid size");
+            for (int retry = 0; retry < 20; retry++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                size = item.Size();
+                if (size.Width != 0 && size.Height != 0) {
+                    sc_logger::Info("CreateFramePoolAndSession: item size became valid {}x{}", size.Width, size.Height);
+                    break;
+                }
+            }
+        }
+
+        if (size.Width < 0 || size.Height < 0) {
+            sc_logger::Warn("Invalid capture size {},{} - waiting for first frame", size.Width, size.Height);
+            return;
+        }
+        if (size.Width == 0 || size.Height == 0) {
+            sc_logger::Warn("Invalid capture size 0x0 after wait, using fallback 1920x1080");
             size.Width = 1920;
             size.Height = 1080;
         }
@@ -402,6 +430,9 @@ class WinPlatformCapture final : public IPlatformCapture {
             m_session = nullptr;
         }
 
+        m_textureReady.store(false, std::memory_order_release);
+        m_captureStarted.store(false, std::memory_order_release);
+
         winrt::Windows::Graphics::SizeInt32 framePoolSize;
         framePoolSize.Width = static_cast<int32_t>(size.Width);
         framePoolSize.Height = static_cast<int32_t>(size.Height);
@@ -409,6 +440,9 @@ class WinPlatformCapture final : public IPlatformCapture {
         sc_logger::Info("WINRT SIZE RAW: {}x{}", size.Width, size.Height);
         sc_logger::Info("WINRT DEVICE: {}", static_cast<void*>(winrt::get_abi(winrtDevice)));
         sc_logger::Info("WINRT ITEM VALID: {}", static_cast<bool>(item));
+
+        sc_logger::Info("Creating shared texture before frame pool {}x{}", size.Width, size.Height);
+        CreateOrRecreateSharedTexture();
 
         sc_logger::Info("Creating frame pool {}x{}", size.Width, size.Height);
         m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -426,12 +460,11 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_session.IncludeSecondaryWindows(true);
         sc_logger::Info("Capture session configured");
 
-        CreateOrRecreateSharedTexture();
-
         m_token = m_framePool.FrameArrived({ this, &WinPlatformCapture::OnFrame });
         sc_logger::Info("FrameArrived handler registered");
         sc_logger::Info("Starting capture...");
         m_session.StartCapture();
+        m_captureStarted.store(true, std::memory_order_release);
         sc_logger::Info("Capture started");
     }
 
@@ -480,18 +513,27 @@ class WinPlatformCapture final : public IPlatformCapture {
         }
 
         HANDLE handle = nullptr;
-        hr = res->CreateSharedHandle(
-            nullptr,
-            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-            nullptr,
-            &handle
-        );
-        if (FAILED(hr)) {
-            sc_logger::Error("CreateSharedHandle failed with error 0x{:08X}", hr);
+        HRESULT createHandleResult = E_FAIL;
+        for (int i = 0; i < 3; i++) {
+            createHandleResult = res->CreateSharedHandle(
+                nullptr,
+                DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                nullptr,
+                &handle
+            );
+            if (SUCCEEDED(createHandleResult)) {
+                break;
+            }
+            sc_logger::Warn("CreateSharedHandle failed retry {} with error 0x{:08X}", i, createHandleResult);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (FAILED(createHandleResult)) {
+            sc_logger::Error("CreateSharedHandle failed after retries with error 0x{:08X}", createHandleResult);
             throw std::runtime_error("Failed to create shared handle");
         }
 
         m_sharedHandle.store(handle);
+        m_textureReady.store(true, std::memory_order_release);
         sc_logger::Info("Shared texture and handle created successfully, handle = {}", reinterpret_cast<void*>(handle));
     }
 
