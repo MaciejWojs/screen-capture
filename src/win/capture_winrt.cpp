@@ -85,6 +85,9 @@ class WinPlatformCapture final : public IPlatformCapture {
 
                 com_ptr<IDXGIDevice> dxgiDevice;
                 m_device->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.put_void());
+                if (!dxgiDevice) {
+                    throw std::runtime_error("DXGI device is null");
+                }
 
                 m_winrtDevice = CreateDirect3DDevice(dxgiDevice.get());
 
@@ -93,6 +96,24 @@ class WinPlatformCapture final : public IPlatformCapture {
                     m_width = m_item.Size().Width;
                     m_height = m_item.Size().Height;
                 }
+
+                int retries = 0;
+                while ((m_width == 0 || m_height == 0) && retries < 10) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    auto size = m_item.Size();
+                    {
+                        std::lock_guard<std::mutex> lock(m_stateMutex);
+                        m_width = size.Width;
+                        m_height = size.Height;
+                    }
+                    retries++;
+                }
+
+                if (m_width == 0 || m_height == 0) {
+                    throw std::runtime_error("Capture size is zero");
+                }
+
+                sc_logger::Info("Capture size: {}x{}", m_width, m_height);
 
                 CreateFramePoolAndSession(m_winrtDevice, m_item);
 
@@ -297,6 +318,22 @@ class WinPlatformCapture final : public IPlatformCapture {
     }
 
     void CreateFramePoolAndSession(IDirect3DDevice const& winrtDevice, GraphicsCaptureItem const& item) {
+        if (!winrtDevice) {
+            throw std::runtime_error("WinRT device is null");
+        }
+
+        auto size = item.Size();
+        if (size.Width == 0 || size.Height == 0) {
+            sc_logger::Warn("Invalid capture size ({}x{}), skipping frame pool initialization", size.Width, size.Height);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            m_width = size.Width;
+            m_height = size.Height;
+        }
+
         auto oldPool = m_framePool;
         auto oldToken = m_token;
 
@@ -317,12 +354,11 @@ class WinPlatformCapture final : public IPlatformCapture {
             m_session = nullptr;
         }
 
-        if (!winrtDevice) return;
-
         winrt::Windows::Graphics::SizeInt32 framePoolSize;
-        framePoolSize.Width = static_cast<int32_t>(m_width);
-        framePoolSize.Height = static_cast<int32_t>(m_height);
+        framePoolSize.Width = static_cast<int32_t>(size.Width);
+        framePoolSize.Height = static_cast<int32_t>(size.Height);
 
+        sc_logger::Info("Creating frame pool {}x{}", size.Width, size.Height);
         m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             winrtDevice,
             winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -330,6 +366,7 @@ class WinPlatformCapture final : public IPlatformCapture {
             framePoolSize
         );
 
+        sc_logger::Info("Creating session...");
         m_session = m_framePool.CreateCaptureSession(item);
         m_session.IsCursorCaptureEnabled(false);
         m_session.IsBorderRequired(false);
@@ -338,10 +375,16 @@ class WinPlatformCapture final : public IPlatformCapture {
         CreateOrRecreateSharedTexture();
 
         m_token = m_framePool.FrameArrived({ this, &WinPlatformCapture::OnFrame });
+        sc_logger::Info("Starting capture...");
         m_session.StartCapture();
     }
 
     void CreateOrRecreateSharedTexture() {
+        if (!m_device) {
+            sc_logger::Error("Cannot create shared texture: D3D device is missing");
+            return;
+        }
+
         HANDLE oldHandle = m_sharedHandle.exchange(nullptr);
         if (oldHandle) {
             CloseHandle(oldHandle);
