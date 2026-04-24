@@ -91,22 +91,33 @@ class WinPlatformCapture final : public IPlatformCapture {
                     std::lock_guard<std::mutex> lock(m_stateMutex);
                     m_width = m_item.Size().Width;
                     m_height = m_item.Size().Height;
-                    CreateFramePoolAndSession();
                 }
+
+                CreateFramePoolAndSession();
+
+                m_running.store(true, std::memory_order_release);
 
                 // Wait until stop is requested or pool recreation is requested
                 std::unique_lock lock(m_waitMutex);
                 while (!stopToken.stop_requested()) {
+                    m_waitCv.wait(lock, [&] {
+                        return stopToken.stop_requested() || m_poolRecreationRequested.load();
+                        });
+
+                    if (stopToken.stop_requested()) {
+                        break;
+                    }
+
                     if (m_poolRecreationRequested.exchange(false)) {
-                        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-                        if (m_winrtDevice && m_item) {
+                        bool shouldRecreate = false;
+                        {
+                            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                            shouldRecreate = (m_winrtDevice && m_item);
+                        }
+                        if (shouldRecreate) {
                             CreateFramePoolAndSession();
                         }
                     }
-
-                    m_waitCv.wait_for(lock, std::chrono::milliseconds(100), [&] {
-                        return stopToken.stop_requested() || m_poolRecreationRequested.load();
-                        });
                 }
 
                 CleanupCapture();
@@ -161,8 +172,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
     std::string GetBackendName() const override { return "winrt"; }
     int GetFps() const override {
-        std::lock_guard<std::mutex> lock(m_stateMutex);
-        return m_lastFps.load();
+        return m_lastFps.load(std::memory_order_relaxed);
     }
 
     private:
@@ -171,6 +181,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     std::mutex m_waitMutex;
     std::condition_variable_any m_waitCv;
     mutable std::mutex m_stateMutex;
+    std::atomic<bool> m_running{ false };
     std::atomic<bool> m_poolRecreationRequested{ false };
 
     com_ptr<ID3D11Device> m_device;
@@ -189,7 +200,7 @@ class WinPlatformCapture final : public IPlatformCapture {
 
     std::atomic<uint64_t> m_frameCount{ 0 };
     std::atomic<int> m_lastFps{ 0 };
-    std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
+    std::atomic<int64_t> m_lastFpsTimeNs{ 0 };
 
     void InitializeD3D() {
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
@@ -208,6 +219,8 @@ class WinPlatformCapture final : public IPlatformCapture {
     }
 
     void StopInternal() {
+        m_running.store(false, std::memory_order_release);
+
         if (m_env) {
             napi_remove_env_cleanup_hook(m_env, CleanupHook, this);
             m_env = nullptr;
@@ -221,17 +234,22 @@ class WinPlatformCapture final : public IPlatformCapture {
     }
 
     void CleanupCapture() {
-        if (m_framePool && m_token.value) {
-            m_framePool.FrameArrived(m_token);
-            m_token.value = 0;
+        auto framePool = m_framePool;
+        auto token = m_token;
+
+        m_framePool = nullptr;
+        m_token = {};
+
+        if (framePool && token.value) {
+            framePool.FrameArrived(token);
+        }
+
+        if (framePool) {
+            framePool.Close();
+            framePool = nullptr;
         }
 
         std::lock_guard<std::mutex> lock(m_stateMutex);
-
-        if (m_framePool) {
-            m_framePool.Close();
-            m_framePool = nullptr;
-        }
 
         if (m_session) {
             m_session.Close();
@@ -327,6 +345,10 @@ class WinPlatformCapture final : public IPlatformCapture {
 
     void OnFrame(Direct3D11CaptureFramePool const& sender,
         winrt::Windows::Foundation::IInspectable const&) {
+        if (!m_running.load(std::memory_order_acquire)) {
+            return;
+        }
+
         while (true) {
             auto frame = sender.TryGetNextFrame();
             if (!frame) return;
@@ -364,6 +386,10 @@ class WinPlatformCapture final : public IPlatformCapture {
                 localContext = m_context;
             }
 
+            if (!localContext || !localSharedTex) {
+                return;
+            }
+
             m_frameCount.fetch_add(1, std::memory_order_relaxed);
 
             try {
@@ -376,12 +402,14 @@ class WinPlatformCapture final : public IPlatformCapture {
                 localContext->CopyResource(localSharedTex.get(), srcTex.get());
 
                 auto now = std::chrono::steady_clock::now();
-                std::lock_guard<std::mutex> fpsLock(m_stateMutex);
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
-                if (elapsed >= 1) {
+                int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+                int64_t lastNs = m_lastFpsTimeNs.load(std::memory_order_relaxed);
+                if (lastNs == 0) {
+                    m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
+                } else if (nowNs - lastNs >= 1000000000LL) {
                     uint64_t frames = m_frameCount.exchange(0, std::memory_order_relaxed);
-                    m_lastFps = static_cast<int>(frames / elapsed);
-                    m_lastFpsTime = now;
+                    m_lastFps.store(static_cast<int>(frames), std::memory_order_relaxed);
+                    m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
                 }
             } catch (const std::exception& e) {
                 sc_logger::Error("Unknown error in OnFrame: {}", e.what());
