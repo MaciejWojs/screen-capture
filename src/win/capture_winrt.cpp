@@ -94,11 +94,20 @@ class WinPlatformCapture final : public IPlatformCapture {
                     CreateFramePoolAndSession();
                 }
 
-                // Wait until stop is requested
+                // Wait until stop is requested or pool recreation is requested
                 std::unique_lock lock(m_waitMutex);
-                m_waitCv.wait(lock, [&] {
-                    return stopToken.stop_requested();
-                    });
+                while (!stopToken.stop_requested()) {
+                    if (m_poolRecreationRequested.exchange(false)) {
+                        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                        if (m_winrtDevice && m_item) {
+                            CreateFramePoolAndSession();
+                        }
+                    }
+
+                    m_waitCv.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                        return stopToken.stop_requested() || m_poolRecreationRequested.load();
+                        });
+                }
 
                 CleanupCapture();
             } catch (const hresult_error& e) {
@@ -162,6 +171,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     std::mutex m_waitMutex;
     std::condition_variable_any m_waitCv;
     mutable std::mutex m_stateMutex;
+    std::atomic<bool> m_poolRecreationRequested{ false };
 
     com_ptr<ID3D11Device> m_device;
     com_ptr<ID3D11DeviceContext> m_context;
@@ -254,11 +264,15 @@ class WinPlatformCapture final : public IPlatformCapture {
 
         if (!m_winrtDevice) return;
 
+        winrt::Windows::Graphics::SizeInt32 framePoolSize;
+        framePoolSize.Width = static_cast<int32_t>(m_width);
+        framePoolSize.Height = static_cast<int32_t>(m_height);
+
         m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             m_winrtDevice,
             winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,
-            m_item.Size()
+            framePoolSize
         );
 
         m_session = m_framePool.CreateCaptureSession(m_item);
@@ -313,44 +327,69 @@ class WinPlatformCapture final : public IPlatformCapture {
 
     void OnFrame(Direct3D11CaptureFramePool const& sender,
         winrt::Windows::Foundation::IInspectable const&) {
-        std::lock_guard<std::mutex> lock(m_stateMutex);
-        m_frameCount.fetch_add(1, std::memory_order_relaxed);
-
-        try {
+        while (true) {
             auto frame = sender.TryGetNextFrame();
             if (!frame) return;
 
             auto size = frame.ContentSize();
-            if (size.Width == 0 || size.Height == 0) return;
+            if (size.Width == 0 || size.Height == 0) {
+                continue;
+            }
 
-            if (size.Width != m_width || size.Height != m_height) {
-                m_width = size.Width;
-                m_height = size.Height;
-                CreateFramePoolAndSession();
+            uint32_t currentWidth;
+            uint32_t currentHeight;
+            {
+                std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                currentWidth = m_width;
+                currentHeight = m_height;
+            }
+
+            if (size.Width != currentWidth || size.Height != currentHeight) {
+                {
+                    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                    m_width = size.Width;
+                    m_height = size.Height;
+                    m_poolRecreationRequested.store(true);
+                }
+                m_waitCv.notify_all();
                 return;
             }
 
-            if (!m_sharedTex) return;
-
-            auto surface = frame.Surface().as<IDirect3DSurface>();
-            auto access = surface.as<IDirect3DDxgiInterfaceAccess>();
-
-            com_ptr<ID3D11Texture2D> srcTex;
-            access->GetInterface(__uuidof(ID3D11Texture2D), srcTex.put_void());
-
-            m_context->CopyResource(m_sharedTex.get(), srcTex.get());
-
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
-            if (elapsed >= 1) {
-                uint64_t frames = m_frameCount.exchange(0, std::memory_order_relaxed);
-                m_lastFps = static_cast<int>(frames / elapsed);
-                m_lastFpsTime = now;
+            com_ptr<ID3D11Texture2D> localSharedTex;
+            com_ptr<ID3D11DeviceContext> localContext;
+            {
+                std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                if (!m_sharedTex || !m_context) return;
+                localSharedTex = m_sharedTex;
+                localContext = m_context;
             }
-        } catch (const std::exception& e) {
-            sc_logger::Error("Unknown error in OnFrame: {}", e.what());
-        } catch (...) {
-            sc_logger::Error("Unknown error in OnFrame");
+
+            m_frameCount.fetch_add(1, std::memory_order_relaxed);
+
+            try {
+                auto surface = frame.Surface().as<IDirect3DSurface>();
+                auto access = surface.as<IDirect3DDxgiInterfaceAccess>();
+
+                com_ptr<ID3D11Texture2D> srcTex;
+                access->GetInterface(__uuidof(ID3D11Texture2D), srcTex.put_void());
+
+                localContext->CopyResource(localSharedTex.get(), srcTex.get());
+
+                auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> fpsLock(m_stateMutex);
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
+                if (elapsed >= 1) {
+                    uint64_t frames = m_frameCount.exchange(0, std::memory_order_relaxed);
+                    m_lastFps = static_cast<int>(frames / elapsed);
+                    m_lastFpsTime = now;
+                }
+            } catch (const std::exception& e) {
+                sc_logger::Error("Unknown error in OnFrame: {}", e.what());
+                return;
+            } catch (...) {
+                sc_logger::Error("Unknown error in OnFrame");
+                return;
+            }
         }
     }
 };
