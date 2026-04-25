@@ -18,6 +18,16 @@ import { ScreenCapture } from '@maciejwojs/screen-capture';
 const capture = new ScreenCapture();
 capture.start();
 
+// Push-based frame delivery for Node/Electron:
+capture.onFrame((frame) => {
+    console.log('Frame available', frame.backend, frame.width, frame.height);
+    if (frame.sharedTextureInfo) {
+        // Use Electron shared texture import path.
+    } else if (frame.pixelData) {
+        // Use raw pixel buffer fallback.
+    }
+});
+
 // Get texture structure formatted for Electron's shared-texture API:
 const textureInfo = capture.getSharedTextureInfo();
 // On Wayland with NVIDIA MemFd CPU fallback, shared texture info may be unavailable.

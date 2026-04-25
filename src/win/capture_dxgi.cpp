@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <stop_token>
 #include <stdexcept>
@@ -90,6 +91,22 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     std::string GetBackendName() const override { return "dxgi"; }
     int GetFps() const override { return m_lastFps.load(); }
 
+    void SetFrameAvailableCallback(std::function<void()> callback) override {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        m_frameAvailableCallback = std::move(callback);
+    }
+
+    void InvokeFrameAvailableCallback() {
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+            callback = m_frameAvailableCallback;
+        }
+        if (callback) {
+            callback();
+        }
+    }
+
     private:
     napi_env m_env{ nullptr };
     std::jthread m_thread;                      // automatyczne zarządzanie wątkiem
@@ -101,6 +118,9 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> m_duplication;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex;
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
+
+    std::function<void()> m_frameAvailableCallback;
+    std::mutex m_frameCallbackMutex;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -208,6 +228,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         if (SUCCEEDED(desktopResource.As(&desktopTexture))) {
             m_context->CopyResource(m_sharedTex.Get(), desktopTexture.Get());
             m_context->Flush();
+            InvokeFrameAvailableCallback();
         }
 
         m_duplication->ReleaseFrame();

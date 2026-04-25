@@ -63,11 +63,40 @@ export interface ScreenCaptureOptions {
     logLevel?: "none" | "error" | "warn" | "info" | "debug";
 }
 
+export interface FrameUpdate {
+    /** Backend name, e.g. 'winrt', 'dxgi', 'gdi', 'wayland', 'x11'. */
+    backend: Backend;
+    /** Frame width in pixels. */
+    width: number;
+    /** Frame height in pixels. */
+    height: number;
+    /** Frame pitch/stride in bytes. */
+    stride: number;
+    /** Pixel format code for the captured frame. */
+    pixelFormat: number;
+    /** Shared texture information for Electron import, when available. */
+    sharedTextureInfo: SharedTextureImportTextureInfo | null;
+    /** Legacy shared handle information for the current frame. */
+    sharedHandle: SharedHandleInfo | null;
+    /** Raw pixel buffer for the current frame if shared texture export is unavailable. */
+    pixelData: Buffer | null;
+}
+
 export interface IScreenCapture {
     /** Starts the screen capture process. */
     start(): void;
     /** Stops the screen capture process. */
     stop(): void;
+    /**
+     * Registers a callback that receives frame data whenever a new frame is available.
+     * This is the preferred push-based API for Node/Electron integration.
+     * @param callback Function called with frame metadata and optional pixel data.
+     */
+    onFrame(callback: (frame: FrameUpdate) => void): void;
+    /**
+     * Unregisters the frame callback previously passed to `onFrame()`.
+     */
+    offFrame(): void;
     /**
      * Retrieves the legacy shared handle information for the latest captured frame.
      * @returns The shared handle info if available, otherwise null.

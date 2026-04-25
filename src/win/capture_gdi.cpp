@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <stop_token>
 #include <stdexcept>
@@ -81,6 +82,22 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     std::string GetBackendName() const override { return "gdi"; }
     int GetFps() const override { return m_lastFps.load(); }
 
+    void SetFrameAvailableCallback(std::function<void()> callback) override {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        m_frameAvailableCallback = std::move(callback);
+    }
+
+    void InvokeFrameAvailableCallback() {
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+            callback = m_frameAvailableCallback;
+        }
+        if (callback) {
+            callback();
+        }
+    }
+
     private:
     napi_env m_env{ nullptr };
     std::jthread m_thread;                       // automatyczne zarządzanie wątkiem
@@ -92,6 +109,9 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingTex;
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
+
+    std::function<void()> m_frameAvailableCallback;
+    std::mutex m_frameCallbackMutex;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -188,6 +208,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             m_context->Unmap(m_stagingTex.Get(), 0);
             m_context->CopyResource(m_sharedTex.Get(), m_stagingTex.Get());
             m_context->Flush();
+            InvokeFrameAvailableCallback();
         }
 
         // zwolnij GDI

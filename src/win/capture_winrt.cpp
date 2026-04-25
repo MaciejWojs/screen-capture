@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <stop_token>
@@ -223,6 +224,22 @@ class WinPlatformCapture final : public IPlatformCapture {
         return m_lastFps.load(std::memory_order_relaxed);
     }
 
+    void SetFrameAvailableCallback(std::function<void()> callback) override {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        m_frameAvailableCallback = std::move(callback);
+    }
+
+    void InvokeFrameAvailableCallback() {
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+            callback = m_frameAvailableCallback;
+        }
+        if (callback) {
+            callback();
+        }
+    }
+
     private:
     napi_env m_env{ nullptr };
     std::jthread m_jthread;
@@ -241,6 +258,9 @@ class WinPlatformCapture final : public IPlatformCapture {
     IDirect3DDevice m_winrtDevice{ nullptr };
     com_ptr<ID3D11Texture2D> m_sharedTex;
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
+
+    std::function<void()> m_frameAvailableCallback;
+    std::mutex m_frameCallbackMutex;
 
     GraphicsCaptureItem m_item{ nullptr };
     Direct3D11CaptureFramePool m_framePool{ nullptr };
@@ -611,6 +631,9 @@ class WinPlatformCapture final : public IPlatformCapture {
                 }
 
                 localContext->CopyResource(localSharedTex.get(), srcTex.get());
+                if (m_frameAvailableCallback) {
+                    InvokeFrameAvailableCallback();
+                }
                 // Log co 1000 klatek, aby nie spamować
                 if (m_frameCount.load() % 1000 == 0) {
                     sc_logger::Info("OnFrame: copied frame #{}", m_frameCount.load());

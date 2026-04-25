@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cctype>
 #include <exception>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "logger.hpp"
@@ -20,6 +22,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             InstanceMethod("getSharedHandle", &ScreenCapture::GetSharedHandleLegacy),
             InstanceMethod("getSharedTextureInfo", &ScreenCapture::GetSharedTextureInfo),
             InstanceMethod("getPixelData", &ScreenCapture::GetPixelData),
+            InstanceMethod("onFrame", &ScreenCapture::OnFrame),
+            InstanceMethod("offFrame", &ScreenCapture::OffFrame),
             InstanceMethod("forceBackend", &ScreenCapture::ForceBackend),
             InstanceMethod("getBackend", &ScreenCapture::GetBackend),
             InstanceMethod("getWidth", &ScreenCapture::GetWidth),
@@ -56,8 +60,113 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         }
     }
 
+    ~ScreenCapture() override {
+        ResetFrameCallback();
+    }
+
     private:
     std::unique_ptr<IPlatformCapture> m_backend;
+    std::mutex m_frameCallbackMutex;
+    Napi::ThreadSafeFunction m_frameCallback;
+    bool m_frameCallbackActive = false;
+
+    void AttachFrameCallbackToBackend() {
+        if (!m_backend) {
+            return;
+        }
+
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+            if (!m_frameCallbackActive) {
+                callback = nullptr;
+            } else {
+                callback = [this]() { NotifyFrameAvailable(); };
+            }
+        }
+
+        m_backend->SetFrameAvailableCallback(std::move(callback));
+    }
+
+    void NotifyFrameAvailable() {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        if (!m_frameCallbackActive) {
+            return;
+        }
+
+        auto status = m_frameCallback.BlockingCall(this, [](Napi::Env env, Napi::Function jsCallback, ScreenCapture* self) {
+            self->InvokeFrameCallback(env, jsCallback);
+            });
+        if (status != napi_ok) {
+            sc_logger::Warn("Failed to queue frame callback to JS");
+        }
+    }
+
+    void InvokeFrameCallback(Napi::Env env, Napi::Function jsCallback) {
+        if (!m_backend) {
+            return;
+        }
+
+        auto shared = m_backend->GetSharedHandle();
+        auto pixels = m_backend->GetPixelData("rgba");
+
+        Napi::Object frame = Napi::Object::New(env);
+        frame.Set("backend", Napi::String::New(env, m_backend->GetBackendName()));
+        frame.Set("width", m_backend->GetWidth());
+        frame.Set("height", m_backend->GetHeight());
+        frame.Set("stride", m_backend->GetStride());
+        frame.Set("pixelFormat", m_backend->GetPixelFormat());
+        frame.Set("sharedTextureInfo", SerializeSharedTextureInfo(env, shared));
+        frame.Set("sharedHandle", SerializeSharedHandleLegacy(env, shared));
+        frame.Set("pixelData", SerializePixelData(env, pixels));
+
+        jsCallback.Call({ frame });
+    }
+
+    void ResetFrameCallback() {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        if (m_frameCallbackActive) {
+            m_frameCallback.Abort();
+            m_frameCallback = {};
+        }
+        m_frameCallbackActive = false;
+    }
+
+    Napi::Value OnFrame(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (info.Length() == 0 || info[0].IsNull() || info[0].IsUndefined()) {
+            return OffFrame(info);
+        }
+        if (!info[0].IsFunction()) {
+            Napi::TypeError::New(env, "onFrame requires a function callback").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        if (m_frameCallbackActive) {
+            m_frameCallback.Abort();
+            m_frameCallback = {};
+        }
+
+        auto callback = info[0].As<Napi::Function>();
+        m_frameCallback = Napi::ThreadSafeFunction::New(env, callback, "ScreenCaptureFrameCallback", 0, 1);
+        m_frameCallbackActive = true;
+        AttachFrameCallbackToBackend();
+        return env.Undefined();
+    }
+
+    Napi::Value OffFrame(const Napi::CallbackInfo& info) {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        if (m_frameCallbackActive) {
+            m_frameCallback.Abort();
+            m_frameCallback = {};
+        }
+        m_frameCallbackActive = false;
+        if (m_backend) {
+            m_backend->SetFrameAvailableCallback(nullptr);
+        }
+        return info.Env().Undefined();
+    }
 
     Napi::Value GetFps(const Napi::CallbackInfo& info) {
         int fps = -1;
@@ -120,6 +229,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         }
 
         m_backend = std::move(nextBackend);
+        AttachFrameCallbackToBackend();
         return env.Undefined();
     }
 

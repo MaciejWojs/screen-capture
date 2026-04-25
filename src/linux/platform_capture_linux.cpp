@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -416,6 +417,9 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
     UniqueFd m_sharedFd;
     mutable std::atomic<bool> m_frameConsumed{ false };
 
+    std::function<void()> m_frameAvailableCallback;
+    std::mutex m_frameCallbackMutex;
+
     std::mutex m_fpsMutex;
     std::atomic<int64_t> m_frameCount{ 0 };
     std::atomic<int> m_lastFps{ 0 };
@@ -445,6 +449,22 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
         return m_lastFps.load();
     }
 
+    void SetFrameAvailableCallback(std::function<void()> callback) override {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        m_frameAvailableCallback = std::move(callback);
+    }
+
+    void InvokeFrameAvailableCallback() {
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+            callback = m_frameAvailableCallback;
+        }
+        if (callback) {
+            callback();
+        }
+    }
+
     void RecordFrame() {
         auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(m_fpsMutex);
@@ -455,6 +475,7 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
             m_frameCount.store(0, std::memory_order_relaxed);
             m_lastFpsTime = now;
         }
+        InvokeFrameAvailableCallback();
     }
 };
 
