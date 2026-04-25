@@ -1,5 +1,8 @@
 ---
-description: "Workspace instructions for @maciejwojs/screen-capture: native addon build, platform backend conventions, and packaging workflows."
+name: "Workspace instructions for screen-capture"
+description: "Workspace instructions for @maciejwojs/screen-capture: native addon build, platform backend conventions, packaging workflows, and C++20 compliance."
+applyTo:
+  "**/*.ts,**/*.js,**/*.cpp,**/*.hpp,**/*.h"
 ---
 
 # Workspace instructions
@@ -10,6 +13,7 @@ description: "Workspace instructions for @maciejwojs/screen-capture: native addo
 - Updating build, packaging, or prebuild workflows.
 - Improving runtime loading, ABI stability, or TypeScript integration.
 - Debugging crashes, frame drops, memory issues, or capture pipeline bugs.
+- Modifying any C++ code in `src/`.
 
 ---
 
@@ -40,6 +44,23 @@ Always reason in this order:
 5. JS API surface (`lib/index.ts`)
 
 If a bug involves capture data, trace it through these layers before changing any API.
+
+---
+
+## C++ Language Standard (MANDATORY)
+
+The entire native codebase is written in **C++20** (`-std=c++20` / `-std=gnu++20`).
+
+- All `.cpp` and `.hpp` files in `src/` and its subdirectories must be valid C++20.
+- Prefer C++20 features that improve clarity, safety, or maintainability, as long as they do not violate performance constraints:
+  - `std::span` for buffer views instead of raw pointer + length pairs (e.g., frame data)
+  - `std::format` / `std::print` where logging is needed, but **only outside hot paths** (never in the capture loop)
+  - `concepts` to constrain template interfaces if templates are used
+  - `constexpr` / `consteval` for compile-time computations
+  - structured bindings, designated initializers, etc.
+- Do NOT use features not yet widely supported by compilers targeting Windows (MSVC 2022) and Linux (GCC 12+, Clang 16+). Stick to C++20 features available in the default toolchains.
+- Ensure the build configuration (`binding.gyp`) sets the required C++ standard flag. If missing, add it as part of the build work, not as a separate refactor.
+- Node-API headers (`napi.h`) must compile cleanly with C++20. Avoid constructs that conflict with N-API internals; prefer modern alternatives only where safe.
 
 ---
 
@@ -100,11 +121,12 @@ If any answer is unknown, ask for more data.
 
 - Keep a single JS-facing API: `ScreenCapture`.
 - Do NOT break public API without explicit request.
-- Do NOT ship public Node/package API changes without adding `ts-doc` / JSDoc comments.
+- Do NOT ship public Node/package API changes without adding TSDoc / JSDoc comments.
 - Keep platform-specific behavior inside the backend layer.
 - Add OS support by extending the backend interface, not rewriting core logic.
 - Prefer `README.md` over duplicating documentation.
 - Write code comments only in English.
+- **All new native code must comply with C++20.** Legacy C-style code may be gradually modernized only with explicit approval.
 
 ---
 
@@ -115,6 +137,7 @@ If any answer is unknown, ask for more data.
 - Do NOT introduce new tooling unless requested.
 - Do NOT refactor native core only for style.
 - Do NOT guess OS-specific behavior without verifying the backend.
+- Do NOT downgrade the C++ standard or introduce code that requires C++17 (or earlier) unless you can prove that C++20 is insufficient for the specific low-level system API. In that case, request explicit permission.
 
 ---
 
@@ -124,6 +147,7 @@ If any answer is unknown, ask for more data.
 - Base conclusions only on code, logs, or reproducible behavior.
 - If unsure, ask for reproduction steps or runtime output.
 - Treat this repo as performance-critical native runtime code.
+- When proposing code changes, always ensure they are valid C++20 and match the toolchain requirements (MSVC 2022, GCC 12+, Clang 16+).
 
 ---
 
