@@ -363,9 +363,11 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_framePool = nullptr;
         m_token = {};
 
-        if (framePool && token.value) {
+        if (framePool && token.value != 0) {
             sc_logger::Info("Removing FrameArrived handler");
-            framePool.FrameArrived(token);
+            try { framePool.FrameArrived(token); } catch (const std::exception& e) {
+                sc_logger::Error("Error occurred while removing FrameArrived handler: {}", e.what());
+            }
         }
 
         if (framePool) {
@@ -506,13 +508,15 @@ class WinPlatformCapture final : public IPlatformCapture {
             return;
         }
 
-        HANDLE oldHandle = m_sharedHandle.exchange(nullptr);
-        if (oldHandle) {
-            sc_logger::Info("Closing old shared handle");
-            CloseHandle(oldHandle);
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            HANDLE oldHandle = m_sharedHandle.exchange(nullptr);
+            if (oldHandle) {
+                sc_logger::Info("Closing old shared handle");
+                CloseHandle(oldHandle);
+            }
+            m_sharedTex = nullptr;
         }
-
-        m_sharedTex = nullptr;
 
         if (m_width == 0 || m_height == 0) {
             sc_logger::Warn("Cannot create shared texture: zero dimensions");
@@ -641,11 +645,13 @@ class WinPlatformCapture final : public IPlatformCapture {
             }
 
             localContext->CopyResource(localSharedTex.get(), srcTex.get());
-            if (m_frameAvailableCallback) {
-                InvokeFrameAvailableCallback();
-            }
-            // Log co 1000 klatek, aby nie spamować
-            if (m_frameCount.load() % 1000 == 0) {
+            localContext->Flush();
+
+            InvokeFrameAvailableCallback();
+
+            // Log every 1000 frames, but also the first one to confirm it works
+            uint64_t count = m_frameCount.load();
+            if (count == 1 || count % 1000 == 0) {
                 sc_logger::Info("OnFrame: copied frame #{}", m_frameCount.load());
             }
 
@@ -660,6 +666,8 @@ class WinPlatformCapture final : public IPlatformCapture {
                 m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
                 sc_logger::Info("OnFrame: FPS updated to {}", frames);
             }
+        } catch (const winrt::hresult_error& e) {
+            sc_logger::Error("WinRT error in OnFrame: {}", winrt::to_string(e.message()));
         } catch (const std::exception& e) {
             sc_logger::Error("Unknown error in OnFrame: {}", e.what());
             return;

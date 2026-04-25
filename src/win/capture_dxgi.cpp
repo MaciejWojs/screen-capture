@@ -77,13 +77,25 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        HANDLE handle = m_sharedHandle.load();
+        // HANDLE handle = m_sharedHandle.load();
+        HANDLE handle = m_sharedHandle.load(std::memory_order_acquire);
         if (!handle) return std::nullopt;
 
+        HANDLE duplicate = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            sc_logger::Error("DXGI GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
+            return std::nullopt;
+        }
+
         SharedHandleInfo info;
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        // info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
         info.width = m_width;
         info.height = m_height;
+        info.stride = m_width * 4;
+        info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+
+        sc_logger::Debug("DXGI GetSharedHandle: duplicated handle={}", reinterpret_cast<void*>(duplicate));
         return info;
     }
 
@@ -199,6 +211,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         texDesc.CPUAccessFlags = 0;
         texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
         hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex);
         if (FAILED(hr)) {

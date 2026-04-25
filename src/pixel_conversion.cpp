@@ -1,11 +1,11 @@
 #ifdef __linux__
 #include <spa/param/video/format-utils.h>
-#include "logger.hpp"
 #endif
 
 #include <span>
 #include <string_view>
 #include "pixel_conversion.hpp"
+#include "logger.hpp"
 
 #include <algorithm>
 #include <atomic>

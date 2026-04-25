@@ -65,13 +65,25 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        HANDLE handle = m_sharedHandle.load();
+        // HANDLE handle = m_sharedHandle.load();
+        HANDLE handle = m_sharedHandle.load(std::memory_order_acquire);
         if (!handle) return std::nullopt;
 
+        HANDLE duplicate = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            sc_logger::Error("GDI GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
+            return std::nullopt;
+        }
+
         SharedHandleInfo info;
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        // info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
         info.width = m_width;
         info.height = m_height;
+        info.stride = m_width * 4;
+        info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+
+        sc_logger::Debug("GDI GetSharedHandle: duplicated handle={}", reinterpret_cast<void*>(duplicate));
         return info;
     }
 

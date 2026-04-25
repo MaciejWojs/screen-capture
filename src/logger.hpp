@@ -29,15 +29,15 @@ namespace sc_logger {
 
     template <typename... Args>
     void LogMessage(LogLevel level, const char* prefix, std::string_view format, Args&&... args) {
-        static std::mutex mutex;
-        std::string fmt(format.data(), format.size());
-        auto message = std::vformat(fmt, std::make_format_args(args...));
-        std::string output = std::format("[ScreenCapture] {}: {}\n", prefix, message);
-        std::lock_guard lock(mutex);
-        LogToDebugOutput(output);
         if (!ShouldLog(level)) {
             return;
         }
+        static std::mutex mutex;
+        auto message = std::vformat(format, std::make_format_args(args...));
+        std::string output = std::format("[ScreenCapture] {}: {}\n", prefix, message);
+
+        std::lock_guard lock(mutex);
+        LogToDebugOutput(output);
         std::cerr << output;
     }
 
