@@ -126,7 +126,7 @@ namespace {
                 slot.ready = false;
             }
             m_writeIndex = 0;
-            m_readIndex = 0;
+            m_latestIndex = -1;
         }
 
         void PushFrame(SharedFd fd, std::optional<SharedHandleInfo> handle) {
@@ -136,29 +136,31 @@ namespace {
             slot.fd = std::move(fd);
             slot.handle = std::move(handle);
             slot.ready = true;
-            m_readIndex = writeIdx;
+            m_latestIndex = writeIdx;
             m_writeIndex = (writeIdx + 1) % m_slots.size();
         }
 
         std::optional<FrameBufferSlot> AcquireReadFrame() {
             std::lock_guard<std::mutex> lock(m_mutex);
-            size_t startIdx = m_readIndex;
-            for (size_t i = 0; i < m_slots.size(); ++i) {
-                size_t idx = (startIdx + i) % m_slots.size();
-                if (m_slots[idx].ready) {
-                    FrameBufferSlot result = m_slots[idx];
-                    m_slots[idx].ready = false;
-                    m_readIndex = (idx + 1) % m_slots.size();
-                    return result;
-                }
+            if (m_latestIndex == -1 || !m_slots[m_latestIndex].ready) {
+                return std::nullopt;
             }
-            return std::nullopt;
+
+            // Zawsze pobieraj najnowszą klatkę (LIFO / Zero Latency)
+            FrameBufferSlot result = m_slots[m_latestIndex];
+
+            // Oznacz wszystkie klatki jako zużyte - nie chcemy czytać starych danych
+            for (auto& slot : m_slots) {
+                slot.ready = false;
+            }
+            m_latestIndex = -1;
+            return result;
         }
 
         private:
-        std::array<FrameBufferSlot, 4> m_slots;
+        std::array<FrameBufferSlot, 3> m_slots;
         size_t m_writeIndex = 0;
-        size_t m_readIndex = 0;
+        int m_latestIndex = -1;
         std::mutex m_mutex;
     };
 
@@ -1537,9 +1539,10 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
             }
 
             auto end = std::chrono::steady_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-            if (duration.count() < 16) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(16) - duration);
+            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+            // Bardziej precyzyjne czekanie dla 60 FPS (16.6ms)
+            if (elapsed.count() < 16666) {
+                std::this_thread::sleep_for(std::chrono::microseconds(16666 - elapsed.count()));
             }
         }
         sc_logger::Info("Stopping X11 capture loop. Frames cloned: {}", frameCounter);
@@ -1592,14 +1595,13 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(std::st
 
     {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        if (!m_cachedMapping || m_cachedFd != frame->fd || m_cachedMapSize != mapSize) {
+        // Poprawka: porównujemy wartość deskryptora (*frame->fd), a nie wskaźnik shared_ptr
+        if (!m_cachedMapping || !m_cachedFd || *m_cachedFd != *frame->fd || m_cachedMapSize != mapSize) {
             m_cachedMapping.reset();
             int actualFd = *frame->fd;
-            if (static_cast<uint64_t>(actualFd) != handle.handle) {
-                sc_logger::Warn("Wayland frame FD mismatch handle.handle={} actualFd={}", handle.handle, actualFd);
-            }
             void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
             if (ptr == MAP_FAILED) {
+                sc_logger::Error("Wayland mmap failed: {}", strerror(errno));
                 return std::nullopt;
             }
             m_cachedMapping = MmapPtr(ptr, MmapDeleter{ mapSize });
@@ -1614,12 +1616,12 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(std::st
         return std::nullopt;
     }
 
-    std::optional<std::vector<uint8_t>> result = ReadPixelDataFromRawPointer(
-        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), available),
+    // Optymalizacja: Konwertujemy bezpośrednio z zmapowanej pamięci (usuwamy jedno zbędne kopiowanie memcpy)
+    std::optional<std::vector<uint8_t>> result = ConvertPixelBuffer(
+        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), dataSize),
         handle.width,
         handle.height,
         handle.stride,
-        dataSize,
         handle.pixelFormat,
         desiredFormat);
 
@@ -1673,7 +1675,8 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string
 
     {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        if (!m_cachedMapping || m_cachedFd != frame->fd || m_cachedMapSize != mapSize) {
+        // Poprawka: porównujemy wartości FD (*m_cachedFd), a nie wskaźniki shared_ptr
+        if (!m_cachedMapping || !m_cachedFd || *m_cachedFd != *frame->fd || m_cachedMapSize != mapSize) {
             m_cachedMapping.reset();
             int actualFd = *frame->fd;
             if (static_cast<uint64_t>(actualFd) != handle.handle) {
@@ -1695,12 +1698,12 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string
         return std::nullopt;
     }
 
-    std::optional<std::vector<uint8_t>> result = ReadPixelDataFromRawPointer(
-        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), available),
+    // Optymalizacja: Konwertujemy bezpośrednio z zmapowanej pamięci (omijamy 1 kopiowanie)
+    std::optional<std::vector<uint8_t>> result = ConvertPixelBuffer(
+        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), dataSize),
         handle.width,
         handle.height,
         handle.stride,
-        dataSize,
         handle.pixelFormat,
         desiredFormat);
 
@@ -1732,4 +1735,3 @@ std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& /*for
 }
 
 #endif
-
