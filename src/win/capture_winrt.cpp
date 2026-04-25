@@ -479,7 +479,7 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             winrtDevice,
             winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
+            4,
             framePoolSize
         );
         sc_logger::Info("Frame pool created");
