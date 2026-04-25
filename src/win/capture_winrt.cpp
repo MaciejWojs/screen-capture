@@ -15,6 +15,7 @@
 #include <thread>
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
@@ -307,6 +308,16 @@ class WinPlatformCapture final : public IPlatformCapture {
         }
 
         check_hresult(hr);
+
+        ID3D11Multithread* multithread = nullptr;
+        if (SUCCEEDED(m_context->QueryInterface(IID_PPV_ARGS(&multithread)))) {
+            multithread->SetMultithreadProtected(TRUE);
+            sc_logger::Info("D3D11 multithread protection enabled");
+            multithread->Release();
+        } else {
+            sc_logger::Warn("Could not enable D3D11 multithread protection");
+        }
+
         sc_logger::Info("D3D11 device created successfully");
         m_deviceReady.store(true, std::memory_order_release);
     }
@@ -565,98 +576,96 @@ class WinPlatformCapture final : public IPlatformCapture {
             return;
         }
 
-        while (true) {
-            auto frame = sender.TryGetNextFrame();
-            if (!frame) {
-                if (frameLogCounter++ % 300 == 0) {
-                    sc_logger::Info("OnFrame: no frame available (might be normal)");
-                }
-                return;
+        auto frame = sender.TryGetNextFrame();
+        if (!frame) {
+            if (frameLogCounter++ % 300 == 0) {
+                sc_logger::Info("OnFrame: no frame available");
             }
+            return;
+        }
 
-            auto size = frame.ContentSize();
-            if (size.Width == 0 || size.Height == 0) {
-                sc_logger::Warn("OnFrame: received frame with zero size, skipping");
-                continue;
-            }
+        auto size = frame.ContentSize();
+        if (size.Width == 0 || size.Height == 0) {
+            sc_logger::Warn("OnFrame: received frame with zero size, skipping");
+            return;
+        }
 
-            uint32_t currentWidth;
-            uint32_t currentHeight;
+        uint32_t currentWidth;
+        uint32_t currentHeight;
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            currentWidth = m_width;
+            currentHeight = m_height;
+        }
+
+        if (size.Width != currentWidth || size.Height != currentHeight) {
+            sc_logger::Info("OnFrame: size changed from {}x{} to {}x{}, requesting pool recreation", currentWidth, currentHeight, size.Width, size.Height);
             {
                 std::lock_guard<std::mutex> stateLock(m_stateMutex);
-                currentWidth = m_width;
-                currentHeight = m_height;
+                m_width = size.Width;
+                m_height = size.Height;
+                m_poolRecreationRequested.store(true);
             }
+            m_waitCv.notify_all();
+            return;
+        }
 
-            if (size.Width != currentWidth || size.Height != currentHeight) {
-                sc_logger::Info("OnFrame: size changed from {}x{} to {}x{}, requesting pool recreation", currentWidth, currentHeight, size.Width, size.Height);
-                {
-                    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-                    m_width = size.Width;
-                    m_height = size.Height;
-                    m_poolRecreationRequested.store(true);
-                }
-                m_waitCv.notify_all();
+        com_ptr<ID3D11Texture2D> localSharedTex;
+        com_ptr<ID3D11DeviceContext> localContext;
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            if (!m_sharedTex || !m_context) {
+                sc_logger::Warn("OnFrame: sharedTex or context is null");
+                return;
+            }
+            localSharedTex = m_sharedTex;
+            localContext = m_context;
+        }
+
+        if (!localContext || !localSharedTex) {
+            sc_logger::Warn("OnFrame: localSharedTex or localContext is null");
+            return;
+        }
+
+        m_frameCount.fetch_add(1, std::memory_order_relaxed);
+
+        try {
+            auto surface = frame.Surface().as<IDirect3DSurface>();
+            auto access = surface.as<IDirect3DDxgiInterfaceAccess>();
+
+            com_ptr<ID3D11Texture2D> srcTex;
+            HRESULT hr = access->GetInterface(__uuidof(ID3D11Texture2D), srcTex.put_void());
+            if (FAILED(hr)) {
+                sc_logger::Error("OnFrame: GetInterface failed with error 0x{:08X}", hr);
                 return;
             }
 
-            com_ptr<ID3D11Texture2D> localSharedTex;
-            com_ptr<ID3D11DeviceContext> localContext;
-            {
-                std::lock_guard<std::mutex> stateLock(m_stateMutex);
-                if (!m_sharedTex || !m_context) {
-                    sc_logger::Warn("OnFrame: sharedTex or context is null");
-                    return;
-                }
-                localSharedTex = m_sharedTex;
-                localContext = m_context;
+            localContext->CopyResource(localSharedTex.get(), srcTex.get());
+            if (m_frameAvailableCallback) {
+                InvokeFrameAvailableCallback();
+            }
+            // Log co 1000 klatek, aby nie spamować
+            if (m_frameCount.load() % 1000 == 0) {
+                sc_logger::Info("OnFrame: copied frame #{}", m_frameCount.load());
             }
 
-            if (!localContext || !localSharedTex) {
-                sc_logger::Warn("OnFrame: localSharedTex or localContext is null");
-                return;
+            auto now = std::chrono::steady_clock::now();
+            int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+            int64_t lastNs = m_lastFpsTimeNs.load(std::memory_order_relaxed);
+            if (lastNs == 0) {
+                m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
+            } else if (nowNs - lastNs >= 1000000000LL) {
+                uint64_t frames = m_frameCount.exchange(0, std::memory_order_relaxed);
+                m_lastFps.store(static_cast<int>(frames), std::memory_order_relaxed);
+                m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
+                sc_logger::Info("OnFrame: FPS updated to {}", frames);
             }
-
-            m_frameCount.fetch_add(1, std::memory_order_relaxed);
-
-            try {
-                auto surface = frame.Surface().as<IDirect3DSurface>();
-                auto access = surface.as<IDirect3DDxgiInterfaceAccess>();
-
-                com_ptr<ID3D11Texture2D> srcTex;
-                HRESULT hr = access->GetInterface(__uuidof(ID3D11Texture2D), srcTex.put_void());
-                if (FAILED(hr)) {
-                    sc_logger::Error("OnFrame: GetInterface failed with error 0x{:08X}", hr);
-                    return;
-                }
-
-                localContext->CopyResource(localSharedTex.get(), srcTex.get());
-                if (m_frameAvailableCallback) {
-                    InvokeFrameAvailableCallback();
-                }
-                // Log co 1000 klatek, aby nie spamować
-                if (m_frameCount.load() % 1000 == 0) {
-                    sc_logger::Info("OnFrame: copied frame #{}", m_frameCount.load());
-                }
-
-                auto now = std::chrono::steady_clock::now();
-                int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-                int64_t lastNs = m_lastFpsTimeNs.load(std::memory_order_relaxed);
-                if (lastNs == 0) {
-                    m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
-                } else if (nowNs - lastNs >= 1000000000LL) {
-                    uint64_t frames = m_frameCount.exchange(0, std::memory_order_relaxed);
-                    m_lastFps.store(static_cast<int>(frames), std::memory_order_relaxed);
-                    m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
-                    sc_logger::Info("OnFrame: FPS updated to {}", frames);
-                }
-            } catch (const std::exception& e) {
-                sc_logger::Error("Unknown error in OnFrame: {}", e.what());
-                return;
-            } catch (...) {
-                sc_logger::Error("Unknown error in OnFrame");
-                return;
-            }
+        } catch (const std::exception& e) {
+            sc_logger::Error("Unknown error in OnFrame: {}", e.what());
+            return;
+        } catch (...) {
+            sc_logger::Error("Unknown error in OnFrame");
+            return;
         }
     }
 };
