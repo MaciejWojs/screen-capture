@@ -34,6 +34,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         napi_add_env_cleanup_hook(m_env, CleanupHook, this);
 
         m_thread = std::jthread([this](std::stop_token stopToken) {
+            sc_logger::Info("DXGI capture thread started");
             if (!InitializeDirect3D()) {
                 sc_logger::Error("DXGI: Initialization failed");
                 return;
@@ -46,8 +47,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                     CleanupDirect3D();
 
                     while (!stopToken.stop_requested()) {
-                        if (InitializeDirect3D())
+                        if (InitializeDirect3D()) {
+                            sc_logger::Info("DXGI: Reinitialized successfully");
                             break;
+                        }
                         std::unique_lock lock(m_reinitMutex);
                         m_reinitCv.wait_for(lock, std::chrono::milliseconds(100),
                             [&stopToken] { return stopToken.stop_requested(); });
@@ -137,29 +140,53 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             levels, ARRAYSIZE(levels),
             D3D11_SDK_VERSION, &m_device, nullptr, &m_context
         );
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: D3D11CreateDevice failed with 0x{:08X}", hr);
+            return false;
+        }
+
+        sc_logger::Info("DXGI: D3D11 device created");
 
         Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
-        if (FAILED(m_device.As(&dxgiDevice))) return false;
+        if (FAILED(m_device.As(&dxgiDevice))) {
+            sc_logger::Error("DXGI: failed to query IDXGIDevice");
+            return false;
+        }
 
         Microsoft::WRL::ComPtr<IDXGIAdapter> dxgiAdapter;
-        if (FAILED(dxgiDevice->GetAdapter(&dxgiAdapter))) return false;
+        if (FAILED(dxgiDevice->GetAdapter(&dxgiAdapter))) {
+            sc_logger::Error("DXGI: failed to get DXGI adapter");
+            return false;
+        }
 
         Microsoft::WRL::ComPtr<IDXGIOutput> dxgiOutput;
-        if (FAILED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) return false;
+        if (FAILED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) {
+            sc_logger::Error("DXGI: failed to enumerate output");
+            return false;
+        }
 
         Microsoft::WRL::ComPtr<IDXGIOutput1> dxgiOutput1;
-        if (FAILED(dxgiOutput.As(&dxgiOutput1))) return false; // wymaga DXGI 1.2 (Win8+)
+        if (FAILED(dxgiOutput.As(&dxgiOutput1))) {
+            sc_logger::Error("DXGI: failed to cast output to IDXGIOutput1");
+            return false;
+        }
 
         hr = dxgiOutput1->DuplicateOutput(m_device.Get(), &m_duplication);
-        if (FAILED(hr)) return false; // np. E_ACCESSDENIED
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: DuplicateOutput failed with 0x{:08X}", hr);
+            return false;
+        }
 
         DXGI_OUTDUPL_DESC desc;
         m_duplication->GetDesc(&desc);
-        if (desc.DesktopImageInSystemMemory) return false; // nie chcemy tej ścieżki
+        if (desc.DesktopImageInSystemMemory) {
+            sc_logger::Error("DXGI: DesktopImageInSystemMemory path is not supported");
+            return false;
+        }
 
         m_width = desc.ModeDesc.Width;
         m_height = desc.ModeDesc.Height;
+        sc_logger::Info("DXGI: capture size {}x{}", m_width, m_height);
 
         D3D11_TEXTURE2D_DESC texDesc = {};
         texDesc.Width = m_width;
@@ -174,17 +201,26 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 
         hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: CreateTexture2D failed with 0x{:08X}", hr);
+            return false;
+        }
 
         Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
-        if (SUCCEEDED(m_sharedTex.As(&dxgiRes))) {
-            HANDLE sharedHandle = nullptr;
-            if (SUCCEEDED(dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &sharedHandle))) {
-                m_sharedHandle.store(sharedHandle);
-                return true;
-            }
+        if (FAILED(m_sharedTex.As(&dxgiRes))) {
+            sc_logger::Error("DXGI: failed to query IDXGIResource1");
+            return false;
         }
-        return false;
+
+        HANDLE sharedHandle = nullptr;
+        if (FAILED(dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &sharedHandle))) {
+            sc_logger::Error("DXGI: CreateSharedHandle failed");
+            return false;
+        }
+
+        m_sharedHandle.store(sharedHandle);
+        sc_logger::Info("DXGI: shared handle created {}", reinterpret_cast<void*>(sharedHandle));
+        return true;
     }
 
     void CleanupDirect3D() {
@@ -197,7 +233,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     bool CaptureFrame(std::stop_token stopToken) {
-        if (!m_duplication) return false;
+        if (!m_duplication) {
+            sc_logger::Error("DXGI: CaptureFrame called with no duplication object");
+            return false;
+        }
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         Microsoft::WRL::ComPtr<IDXGIResource> desktopResource;
@@ -207,11 +246,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return true;
         }
         if (FAILED(hr)) {
-            // DXGI_ERROR_ACCESS_LOST etc.
+            sc_logger::Warn("DXGI: AcquireNextFrame failed with 0x{:08X}", hr);
             return false;
         }
 
-        // check if stop was requested while waiting for the frame
         if (stopToken.stop_requested()) {
             m_duplication->ReleaseFrame();
             return false;
@@ -233,7 +271,6 @@ class DXGIPlatformCapture final : public IPlatformCapture {
 
         m_duplication->ReleaseFrame();
 
-        // FPS
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
         if (elapsed >= 1) {
