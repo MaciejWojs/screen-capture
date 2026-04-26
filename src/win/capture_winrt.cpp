@@ -664,7 +664,7 @@ class WinPlatformCapture final : public IPlatformCapture {
                 uint64_t frames = m_frameCount.exchange(0, std::memory_order_relaxed);
                 m_lastFps.store(static_cast<int>(frames), std::memory_order_relaxed);
                 m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
-                sc_logger::Info("OnFrame: FPS updated to {}", frames);
+                sc_logger::Debug("OnFrame: FPS updated to {}", frames);
             }
         } catch (const winrt::hresult_error& e) {
             sc_logger::Error("WinRT error in OnFrame: {}", winrt::to_string(e.message()));
