@@ -12,6 +12,7 @@
 #include <spa/param/buffers.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/pod/builder.h>
+#include <unordered_map>
 #include <spa/utils/result.h>
 
 #include <algorithm>
@@ -112,6 +113,7 @@ namespace {
 
     struct FrameBufferSlot {
         SharedFd fd;
+        MmapPtr mapping;
         std::optional<SharedHandleInfo> handle;
         bool ready = false;
     };
@@ -129,11 +131,12 @@ namespace {
             m_latestIndex = -1;
         }
 
-        void PushFrame(SharedFd fd, std::optional<SharedHandleInfo> handle) {
+        void PushFrame(SharedFd fd, std::optional<SharedHandleInfo> handle, MmapPtr mapping = nullptr) {
             std::lock_guard<std::mutex> lock(m_mutex);
             size_t writeIdx = m_writeIndex;
             FrameBufferSlot& slot = m_slots[writeIdx];
             slot.fd = std::move(fd);
+            slot.mapping = std::move(mapping);
             slot.handle = std::move(handle);
             slot.ready = true;
             m_latestIndex = writeIdx;
@@ -416,7 +419,7 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
     std::condition_variable m_captureCv;
 
     std::optional<SharedHandleInfo> m_sharedHandle;
-    UniqueFd m_sharedFd;
+    SharedFd m_sharedFd;
     mutable std::atomic<bool> m_frameConsumed{ false };
 
     std::function<void()> m_frameAvailableCallback;
@@ -591,9 +594,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
     std::atomic<int> m_pendingPipewireFd{ -1 };
     mutable FrameBufferPool m_frameBuffers;
-    mutable MmapPtr m_cachedMapping;
-    mutable SharedFd m_cachedFd;
-    mutable size_t m_cachedMapSize = 0;
+    mutable std::unordered_map<int, MmapPtr> m_mappingCache;
+    std::unordered_map<int, SharedFd> m_fdCache;
 
     void RunCaptureFlow(std::stop_token stopToken) {
         int pipewireFd = -1;
@@ -879,6 +881,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 &builder,
                 SPA_TYPE_OBJECT_ParamBuffers,
                 SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
                 SPA_PARAM_BUFFERS_dataType,
                 SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd)));
         } else {
@@ -886,6 +889,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 &builder,
                 SPA_TYPE_OBJECT_ParamBuffers,
                 SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
                 SPA_PARAM_BUFFERS_dataType,
                 SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
         }
@@ -951,9 +955,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_bufferType = 0;
         m_chunkSize = 0;
         m_frameBuffers.Reset();
-        m_cachedMapping.reset();
-        m_cachedFd.reset();
-        m_cachedMapSize = 0;
+        m_mappingCache.clear();
+        m_fdCache.clear();
         m_loggedNonDmabuf = false;
         m_frameConsumed = false;
     }
@@ -978,18 +981,32 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     void UpdateSharedHandleFromFd(int fd) {
-        int bufferFd = dup(fd);
-        if (bufferFd < 0) {
-            return;
+        SharedFd sfd;
+        {
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+            auto it = m_fdCache.find(fd);
+            if (it != m_fdCache.end()) {
+                sfd = it->second;
+            } else {
+                int ownedFd = dup(fd);
+                if (ownedFd >= 0) {
+                    sfd = SharedFd(new int(ownedFd), FdDeleter());
+                    m_fdCache[fd] = sfd;
+                }
+            }
         }
 
-        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        std::optional<SharedHandleInfo> handle;
+        if (!sfd) return;
 
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        m_sharedFd = sfd;
+        m_frameConsumed = false;
+
+        std::optional<SharedHandleInfo> handle;
         if (m_streamConfig) {
             uint32_t stride = m_stride ? m_stride : static_cast<uint32_t>(m_streamConfig->width) * 4;
             handle = SharedHandleInfo{
-                static_cast<uint64_t>(bufferFd),
+                static_cast<uint64_t>(*sfd),
                 m_streamConfig->width,
                 m_streamConfig->height,
                 stride,
@@ -1000,18 +1017,11 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 m_bufferType,
                 m_chunkSize,
             };
+            m_sharedHandle = handle;
         }
 
-        // Reuse the duplicated FD for both the pool and the current shared reference
-        SharedFd sfd = std::make_shared<int>(bufferFd);
+        // Push the same shared pointer to the pool - no extra dups needed
         m_frameBuffers.PushFrame(sfd, handle);
-
-        m_cachedMapping.reset();
-        m_cachedFd.reset();
-        m_cachedMapSize = 0;
-
-        m_sharedFd.reset(new int(dup(bufferFd)));
-        m_frameConsumed = false;
         PublishSharedHandleLocked();
     }
 
@@ -1098,6 +1108,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 &builder,
                 SPA_TYPE_OBJECT_ParamBuffers,
                 SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
                 SPA_PARAM_BUFFERS_dataType,
                 SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd)));
         } else {
@@ -1105,6 +1116,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 &builder,
                 SPA_TYPE_OBJECT_ParamBuffers,
                 SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
                 SPA_PARAM_BUFFERS_dataType,
                 SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
         }
@@ -1332,9 +1344,6 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         }
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-            m_cachedMapping.reset();
-            m_cachedFd.reset();
-            m_cachedMapSize = 0;
             m_frameBuffers.Reset();
             for (auto& mapping : m_captureMappings) {
                 mapping.reset();
@@ -1374,9 +1383,6 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     private:
-    mutable MmapPtr m_cachedMapping;
-    mutable SharedFd m_cachedFd;
-    mutable size_t m_cachedMapSize = 0;
     mutable FrameBufferPool m_frameBuffers;
     std::array<UniqueFd, 2> m_captureFds;
     std::array<MmapPtr, 2> m_captureMappings;
@@ -1467,9 +1473,6 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
 
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-            m_cachedMapping.reset();
-            m_cachedFd.reset();
-            m_cachedMapSize = 0;
             if (m_captureFds[0] && *m_captureFds[0] >= 0) {
                 m_sharedFd.reset(new int(dup(*m_captureFds[0])));
             } else {
@@ -1496,21 +1499,17 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
         }
 
         uint64_t frameCounter = 0;
-        // Pętla przechwytywania (ok. 60 FPS)
+        auto nextFrameTime = std::chrono::steady_clock::now();
         while (!stopToken.stop_requested()) {
-            auto start = std::chrono::steady_clock::now();
+            nextFrameTime += std::chrono::microseconds(16666); // Target ~60fps
 
             if (XShmGetImage(display.get(), root, image.get(), 0, 0, AllPlanes)) {
                 size_t writeIndex = m_captureWriteIndex;
                 std::memcpy(m_captureMappings[writeIndex].get(), image->data, size);
 
                 std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-                int duplicatedBufferFd = dup(*m_captureFds[writeIndex]);
-                if (duplicatedBufferFd < 0) {
-                    sc_logger::Error("X11 dup failed for capture buffer");
-                } else {
-                    SharedHandleInfo handle{
-                        static_cast<uint64_t>(duplicatedBufferFd),
+                SharedHandleInfo handle{
+                        0, // Will be filled below
                         static_cast<uint32_t>(width),
                         static_cast<uint32_t>(height),
                         static_cast<uint32_t>(image->bytes_per_line),
@@ -1520,10 +1519,14 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                         0,
                         1,
                         static_cast<uint32_t>(size),
-                    };
-                    m_frameBuffers.PushFrame(SharedFd(new int(duplicatedBufferFd), FdDeleter()), handle);
-                    m_sharedFd.reset(new int(dup(*m_captureFds[writeIndex])));
+                };
+
+                SharedFd sfd(new int(dup(*m_captureFds[writeIndex])), FdDeleter());
+                if (*sfd >= 0) {
+                    handle.handle = static_cast<uint64_t>(*sfd);
+                    m_sharedFd = sfd;
                     m_sharedHandle = handle;
+                    m_frameBuffers.PushFrame(sfd, handle, m_captureMappings[writeIndex]);
                     m_frameConsumed = false;
                 }
 
@@ -1537,12 +1540,8 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 sc_logger::Warn("X11 failed to grab XShmGetImage");
             }
 
-            auto end = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-            // Bardziej precyzyjne czekanie dla 60 FPS (16.6ms)
-            if (elapsed.count() < 16666) {
-                std::this_thread::sleep_for(std::chrono::microseconds(16666 - elapsed.count()));
-            }
+            // Adaptive sleep to maintain constant framerate
+            std::this_thread::sleep_until(nextFrameTime);
         }
         sc_logger::Info("Stopping X11 capture loop. Frames cloned: {}", frameCounter);
 
@@ -1594,20 +1593,20 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(std::st
 
     {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        // Poprawka: porównujemy wartość deskryptora (*frame->fd), a nie wskaźnik shared_ptr
-        if (!m_cachedMapping || !m_cachedFd || *m_cachedFd != *frame->fd || m_cachedMapSize != mapSize) {
-            m_cachedMapping.reset();
-            int actualFd = *frame->fd;
-            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
-            if (ptr == MAP_FAILED) {
+        int fdVal = *frame->fd;
+        auto it = m_mappingCache.find(fdVal);
+        if (it != m_mappingCache.end()) {
+            localMapping = it->second;
+        } else {
+            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fdVal, 0);
+            if (ptr != MAP_FAILED) {
+                localMapping = MmapPtr(ptr, MmapDeleter{ mapSize });
+                m_mappingCache[fdVal] = localMapping;
+            } else {
                 sc_logger::Error("Wayland mmap failed: {}", strerror(errno));
                 return std::nullopt;
             }
-            m_cachedMapping = MmapPtr(ptr, MmapDeleter{ mapSize });
-            m_cachedFd = frame->fd;
-            m_cachedMapSize = mapSize;
         }
-        localMapping = m_cachedMapping;
         mappedData = static_cast<const uint8_t*>(localMapping.get());
     }
 
@@ -1615,7 +1614,8 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(std::st
         return std::nullopt;
     }
 
-    // Optymalizacja: Konwertujemy bezpośrednio z zmapowanej pamięci (usuwamy jedno zbędne kopiowanie memcpy)
+    // Optimization: Perform conversion OUTSIDE of the mutex lock.
+    // This allows the capture thread to remain unblocked while we process pixels.
     std::optional<std::vector<uint8_t>> result = ConvertPixelBuffer(
         std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), dataSize),
         handle.width,
@@ -1674,22 +1674,12 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string
 
     {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        // Poprawka: porównujemy wartości FD (*m_cachedFd), a nie wskaźniki shared_ptr
-        if (!m_cachedMapping || !m_cachedFd || *m_cachedFd != *frame->fd || m_cachedMapSize != mapSize) {
-            m_cachedMapping.reset();
-            int actualFd = *frame->fd;
-            if (static_cast<uint64_t>(actualFd) != handle.handle) {
-                sc_logger::Warn("X11 frame FD mismatch handle.handle={} actualFd={}", handle.handle, actualFd);
-            }
-            void* ptr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, actualFd, 0);
-            if (ptr == MAP_FAILED) {
-                return std::nullopt;
-            }
-            m_cachedMapping = MmapPtr(ptr, MmapDeleter{ mapSize });
-            m_cachedFd = frame->fd;
-            m_cachedMapSize = mapSize;
+        if (frame->mapping) {
+            localMapping = frame->mapping;
+        } else {
+            sc_logger::Error("X11 frame mapping missing");
+            return std::nullopt;
         }
-        localMapping = m_cachedMapping;
         mappedData = static_cast<const uint8_t*>(localMapping.get());
     }
 
@@ -1706,8 +1696,9 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string
         handle.pixelFormat,
         desiredFormat);
 
-    if (result) {
+    if (result && m_sharedHandle) {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        // Oznaczamy klatkę jako skonsumowaną tylko jeśli faktycznie działamy na bieżącym uchwycie
         m_frameConsumed = true;
     }
     return result;
