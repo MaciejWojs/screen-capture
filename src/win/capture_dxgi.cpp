@@ -210,7 +210,6 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         texDesc.Usage = D3D11_USAGE_DEFAULT;
         texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         texDesc.CPUAccessFlags = 0;
-        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
         texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
         hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex);
@@ -268,7 +267,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        if (frameInfo.AccumulatedFrames == 0 || frameInfo.LastPresentTime.QuadPart == 0) {
+        // We only care about AccumulatedFrames. LastPresentTime can be 0 even for valid 
+        // frames on some systems/drivers, leading to rhythmic stuttering if discarded.
+        // Mouse-only updates (AccumulatedFrames == 0) are handled by ReleaseFrame without copy.
+        if (frameInfo.AccumulatedFrames == 0) {
             m_duplication->ReleaseFrame();
             return true;
         }
