@@ -1581,30 +1581,33 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 size_t writeIndex = m_captureWriteIndex;
                 std::memcpy(m_captureMappings[writeIndex].get(), image->data, size);
 
-                std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-                SharedHandleInfo handle{
-                        0, // Will be filled below
-                        static_cast<uint32_t>(width),
-                        static_cast<uint32_t>(height),
-                        static_cast<uint32_t>(image->bytes_per_line),
-                        0,
-                        static_cast<uint64_t>(size),
-                        detectedFormat,
-                        0,
-                        1,
-                        static_cast<uint32_t>(size),
-                };
+                {
+                    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                    SharedHandleInfo handle{
+                            0, // Will be filled below
+                            static_cast<uint32_t>(width),
+                            static_cast<uint32_t>(height),
+                            static_cast<uint32_t>(image->bytes_per_line),
+                            0,
+                            static_cast<uint64_t>(size),
+                            detectedFormat,
+                            0,
+                            1,
+                            static_cast<uint32_t>(size),
+                    };
 
-                SharedFd sfd(new int(dup(*m_captureFds[writeIndex])), FdDeleter());
-                if (*sfd >= 0) {
-                    handle.handle = static_cast<uint64_t>(*sfd);
-                    m_sharedFd = sfd;
-                    m_sharedHandle = handle;
-                    m_frameBuffers.PushFrame(sfd, handle, {}, true, m_captureMappings[writeIndex]);
-                    m_frameConsumed = false;
+                    SharedFd sfd(new int(dup(*m_captureFds[writeIndex])), FdDeleter());
+                    if (*sfd >= 0) {
+                        handle.handle = static_cast<uint64_t>(*sfd);
+                        m_sharedFd = sfd;
+                        m_sharedHandle = handle;
+                        m_frameBuffers.PushFrame(sfd, handle, {}, true, m_captureMappings[writeIndex]);
+                        m_frameConsumed = false;
+                    }
+
+                    m_captureWriteIndex = (writeIndex + 1) % m_captureFds.size();
                 }
 
-                m_captureWriteIndex = (writeIndex + 1) % m_captureFds.size();
                 frameCounter++;
                 if (frameCounter % 120 == 0) {
                     sc_logger::Info("Captured X11 frame number {}", frameCounter);
