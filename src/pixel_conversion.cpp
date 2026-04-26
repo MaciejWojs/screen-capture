@@ -1,5 +1,6 @@
 #ifdef __linux__
 #include <spa/param/video/format-utils.h>
+#include <spa/buffer/meta.h>
 #endif
 
 #include <span>
@@ -682,3 +683,30 @@ std::vector<uint8_t> ConvertPixelBuffer(
 
     return dst;
 };
+
+void ConvertPixelRegion(
+    const uint8_t* src,
+    uint8_t* dst,
+    uint32_t regionWidth,
+    uint32_t regionHeight,
+    uint32_t srcStride,
+    uint32_t dstStride,
+    uint32_t srcPixelFormat,
+    std::string_view desiredPixelFormat) {
+
+    PixelLayout dstLayout = ParsePixelLayout(desiredPixelFormat);
+    PixelLayout srcLayout = DecodePixelLayout(srcPixelFormat);
+
+    if (dstLayout == PixelLayout::UNKNOWN || srcLayout == PixelLayout::UNKNOWN) {
+        return;
+    }
+
+    RowConverterFunc converter = s_bestConverter;
+    LogConverterMethodOnce(s_detectedConverterName);
+
+    for (uint32_t row = 0; row < regionHeight; ++row) {
+        const uint8_t* srcRow = src + static_cast<size_t>(row) * srcStride;
+        uint8_t* dstRow = dst + static_cast<size_t>(row) * dstStride;
+        converter(srcRow, dstRow, regionWidth, srcLayout, dstLayout);
+    }
+}

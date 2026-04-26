@@ -10,6 +10,7 @@
 #include <pipewire/pipewire.h>
 #include <pipewire/stream.h>
 #include <spa/param/buffers.h>
+#include <spa/buffer/meta.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/pod/builder.h>
 #include <unordered_map>
@@ -111,11 +112,17 @@ namespace {
     using MmapPtr = std::shared_ptr<void>;
     using SharedFd = std::shared_ptr<int>;
 
+    struct IntRect {
+        uint32_t x, y, w, h;
+    };
+
     struct FrameBufferSlot {
         SharedFd fd;
         MmapPtr mapping;
         std::optional<SharedHandleInfo> handle;
+        std::vector<IntRect> damage;
         bool ready = false;
+        bool fullUpdate = true;
     };
 
     class FrameBufferPool {
@@ -131,14 +138,16 @@ namespace {
             m_latestIndex = -1;
         }
 
-        void PushFrame(SharedFd fd, std::optional<SharedHandleInfo> handle, MmapPtr mapping = nullptr) {
+        void PushFrame(SharedFd fd, std::optional<SharedHandleInfo> handle, std::vector<IntRect> damage, bool fullUpdate, MmapPtr mapping = nullptr) {
             std::lock_guard<std::mutex> lock(m_mutex);
             size_t writeIdx = m_writeIndex;
             FrameBufferSlot& slot = m_slots[writeIdx];
             slot.fd = std::move(fd);
             slot.mapping = std::move(mapping);
             slot.handle = std::move(handle);
+            slot.damage = std::move(damage);
             slot.ready = true;
+            slot.fullUpdate = fullUpdate;
             m_latestIndex = writeIdx;
             m_writeIndex = (writeIdx + 1) % m_slots.size();
         }
@@ -406,8 +415,8 @@ namespace Config {
     constexpr uint32_t DEFAULT_FPS_NUM = 60;
     constexpr uint32_t DEFAULT_FPS_DEN = 1;
     constexpr uint32_t MAX_FPS_NUM = 144;
-    constexpr size_t POD_BUFFER_SIZE_CONNECT = 2048;
-    constexpr size_t POD_BUFFER_SIZE_UPDATE = 1024;
+    constexpr size_t POD_BUFFER_SIZE_CONNECT = 8192;
+    constexpr size_t POD_BUFFER_SIZE_UPDATE = 4096;
 }
 
 class BaseLinuxPlatformCapture : public IPlatformCapture {
@@ -596,6 +605,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     mutable FrameBufferPool m_frameBuffers;
     mutable std::unordered_map<int, MmapPtr> m_mappingCache;
     std::unordered_map<int, SharedFd> m_fdCache;
+    mutable std::vector<uint8_t> m_pixelCache;
+    mutable std::string m_cacheFormat;
 
     void RunCaptureFlow(std::stop_token stopToken) {
         int pipewireFd = -1;
@@ -829,7 +840,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
         uint8_t buffer[Config::POD_BUFFER_SIZE_CONNECT];
         spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-        const spa_pod* params[2];
+        const spa_pod* params[3];
 
         const spa_rectangle minSize = SPA_RECTANGLE(1, 1);
         const spa_rectangle defaultSize = SPA_RECTANGLE(1920, 1080);
@@ -894,6 +905,20 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
         }
 
+        // Request VideoDamage metadata to enable dirty rectangles tracking
+        params[2] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+            &builder,
+            SPA_TYPE_OBJECT_ParamMeta,
+            SPA_PARAM_Meta,
+            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage),
+            SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_region))));
+
+        if (!params[0] || !params[1] || !params[2]) {
+            sc_logger::Error("Failed to build PW connection params (format={}, buffers={}, meta={})",
+                static_cast<const void*>(params[0]), static_cast<const void*>(params[1]), static_cast<const void*>(params[2]));
+            throw std::runtime_error("PipeWire POD buffer overflow during stream connection initialization");
+        }
+
         pw_stream_add_listener(
             m_streamState.stream.get(),
             &m_streamState.stream_listener,
@@ -908,7 +933,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             targetId,
             static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
             params,
-            2);
+            3);
 
         if (result < 0) {
             throw std::runtime_error(std::string("pw_stream_connect failed: ") + spa_strerror(result));
@@ -980,7 +1005,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         };
     }
 
-    void UpdateSharedHandleFromFd(int fd) {
+    void UpdateSharedHandleFromFd(int fd, std::vector<IntRect> damage, bool fullUpdate) {
         SharedFd sfd;
         {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
@@ -1021,7 +1046,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         }
 
         // Push the same shared pointer to the pool - no extra dups needed
-        m_frameBuffers.PushFrame(sfd, handle);
+        m_frameBuffers.PushFrame(sfd, handle, std::move(damage), fullUpdate);
         PublishSharedHandleLocked();
     }
 
@@ -1067,7 +1092,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
         uint8_t buffer[Config::POD_BUFFER_SIZE_UPDATE];
         spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-        const spa_pod* params[2];
+        const spa_pod* params[3];
 
         if (hasModifier && !forceMemFd) {
             params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
@@ -1121,7 +1146,21 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
         }
 
-        pw_stream_update_params(self->m_streamState.stream.get(), params, 2);
+        // Ensure metadata request is preserved during parameter updates
+        params[2] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+            &builder,
+            SPA_TYPE_OBJECT_ParamMeta,
+            SPA_PARAM_Meta,
+            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage),
+            SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_region))));
+
+        if (!params[2]) {
+            sc_logger::Warn("Failed to build meta update param (possible buffer overflow). Damage tracking disabled.");
+            // without meta - stream will continue but without dirty rects
+            pw_stream_update_params(self->m_streamState.stream.get(), params, 2);
+        } else {
+            pw_stream_update_params(self->m_streamState.stream.get(), params, 3);
+        }
     }
 
     static void OnStreamProcess(void* userdata) {
@@ -1138,6 +1177,37 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         spa_buffer* spaBuffer = buffer->buffer;
         if (spaBuffer && spaBuffer->n_datas > 0) {
             spa_data& data = spaBuffer->datas[0];
+
+            std::vector<IntRect> damageRects;
+            bool fullUpdate = true;
+
+            auto* meta = spa_buffer_find_meta(spaBuffer, SPA_META_VideoDamage);
+
+            if (meta) {
+                sc_logger::Debug("Wayland: Damage meta found");
+                const spa_meta_region* damage =
+                    (const spa_meta_region*)meta;
+                const spa_region& r = damage[0].region;
+
+                if (r.size.width == 0 || r.size.height == 0) {
+                    fullUpdate = true;
+                } else {
+                    fullUpdate = false;
+                    damageRects.push_back({
+                        (uint32_t)r.position.x,
+                        (uint32_t)r.position.y,
+                        (uint32_t)r.size.width,
+                        (uint32_t)r.size.height
+                        });
+                }
+            } else {
+                static std::once_flag noMetaWarning;
+                std::call_once(noMetaWarning, []() {
+                    sc_logger::Warn("Compositor does not provide VideoDamage meta – all frames will be full updates.");
+                    });
+                fullUpdate = true;
+            }
+
             const uint32_t chunkSize = data.chunk ? data.chunk->size : 0;
             if ((data.type == SPA_DATA_DmaBuf || data.type == SPA_DATA_MemFd) && data.fd >= 0) {
                 const auto now = std::chrono::steady_clock::now();
@@ -1175,7 +1245,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                     sc_logger::Info("Using MemFd CPU-copy buffer, common for NVIDIA Wayland");
                 }
 
-                self->UpdateSharedHandleFromFd(data.fd);
+                self->UpdateSharedHandleFromFd(data.fd, std::move(damageRects), fullUpdate);
                 self->m_loggedNonDmabuf = false;
             } else {
                 std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
@@ -1388,6 +1458,10 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     std::array<MmapPtr, 2> m_captureMappings;
     size_t m_captureWriteIndex = 0;
 
+    // Cache dla przeliczone klatki (identycznie jak w Wayland)
+    mutable std::vector<uint8_t> m_pixelCache;
+    mutable std::string m_cacheFormat;
+
     void CaptureLoop(std::stop_token stopToken) {
         sc_logger::Info("Starting X11 capture loop");
         DisplayPtr display(XOpenDisplay(nullptr));
@@ -1526,7 +1600,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                     handle.handle = static_cast<uint64_t>(*sfd);
                     m_sharedFd = sfd;
                     m_sharedHandle = handle;
-                    m_frameBuffers.PushFrame(sfd, handle, m_captureMappings[writeIndex]);
+                    m_frameBuffers.PushFrame(sfd, handle, {}, true, m_captureMappings[writeIndex]);
                     m_frameConsumed = false;
                 }
 
@@ -1614,21 +1688,51 @@ std::optional<std::vector<uint8_t>> WaylandPlatformCapture::GetPixelData(std::st
         return std::nullopt;
     }
 
-    // Optimization: Perform conversion OUTSIDE of the mutex lock.
-    // This allows the capture thread to remain unblocked while we process pixels.
-    std::optional<std::vector<uint8_t>> result = ConvertPixelBuffer(
-        std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), dataSize),
-        handle.width,
-        handle.height,
-        handle.stride,
-        handle.pixelFormat,
-        desiredFormat);
+    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
 
-    if (result) {
-        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        m_frameConsumed = true;
+    // Cache management: resize if dimensions or format changed
+    size_t targetSize = static_cast<size_t>(handle.width) * handle.height * 4;
+    if (m_pixelCache.size() != targetSize || m_cacheFormat != desiredFormat || frame->fullUpdate) {
+        m_pixelCache.resize(targetSize);
+        m_cacheFormat = std::string(desiredFormat);
+        sc_logger::Debug("Wayland: Full cache refresh (size: {})", targetSize);
+
+        m_pixelCache = ConvertPixelBuffer(
+            std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), dataSize),
+            handle.width,
+            handle.height,
+            handle.stride,
+            handle.pixelFormat,
+            desiredFormat);
+    } else {
+        // Partial update via dirty rectangles
+        sc_logger::Debug("Wayland: Partial update using {} dirty rects", frame->damage.size());
+        uint32_t dstStride = handle.width * 4;
+        for (const auto& rect : frame->damage) {
+            // Clamp rectangle to frame boundaries
+            uint32_t rx = std::min(rect.x, handle.width);
+            uint32_t ry = std::min(rect.y, handle.height);
+            uint32_t rw = std::min(rect.w, handle.width - rx);
+            uint32_t rh = std::min(rect.h, handle.height - ry);
+
+            if (rw == 0 || rh == 0) continue;
+
+            const uint8_t* srcPtr = mappedData + handle.offset + (ry * handle.stride) + (rx * 4);
+            uint8_t* dstPtr = m_pixelCache.data() + (ry * dstStride) + (rx * 4);
+
+            ConvertPixelRegion(
+                srcPtr,
+                dstPtr,
+                rw, rh,
+                handle.stride,
+                dstStride,
+                handle.pixelFormat,
+                desiredFormat);
+        }
     }
-    return result;
+
+    m_frameConsumed = true;
+    return m_pixelCache;
 }
 
 std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string_view desiredFormat) const {
@@ -1687,8 +1791,19 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string
         return std::nullopt;
     }
 
-    // Optymalizacja: Konwertujemy bezpośrednio z zmapowanej pamięci (omijamy 1 kopiowanie)
-    std::optional<std::vector<uint8_t>> result = ConvertPixelBuffer(
+    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+
+    // Optymalizacja cache dla X11: unikamy alokacji wektora przy każdej klatce
+    size_t targetSize = static_cast<size_t>(handle.width) * handle.height * 4;
+    if (m_pixelCache.size() != targetSize || m_cacheFormat != desiredFormat) {
+        m_pixelCache.resize(targetSize);
+        m_cacheFormat = std::string(desiredFormat);
+        sc_logger::Debug("X11: Initializing/Resizing pixel cache");
+    }
+
+    // Na X11 w tej wersji robimy pełną konwersję, ale do istniejącego już bufora m_pixelCache
+    // To eliminuje "stuttering" spowodowany GC i alokacjami pamięci w Node.js/V8
+    auto temp = ConvertPixelBuffer(
         std::span<const uint8_t>(mappedData + static_cast<size_t>(handle.offset), dataSize),
         handle.width,
         handle.height,
@@ -1696,12 +1811,10 @@ std::optional<std::vector<uint8_t>> X11PlatformCapture::GetPixelData(std::string
         handle.pixelFormat,
         desiredFormat);
 
-    if (result && m_sharedHandle) {
-        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        // Oznaczamy klatkę jako skonsumowaną tylko jeśli faktycznie działamy na bieżącym uchwycie
-        m_frameConsumed = true;
-    }
-    return result;
+    m_pixelCache = std::move(temp);
+
+    m_frameConsumed = true;
+    return m_pixelCache;
 }
 
 bool IsWayland() {
