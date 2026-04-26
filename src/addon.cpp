@@ -89,6 +89,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     std::mutex m_callbackMutex;
     Napi::ThreadSafeFunction m_frameCallback;
     bool m_frameCallbackActive = false;
+    std::atomic<int> m_framesInFlight{ 0 };
 
     void AttachFrameCallbackToBackend() {
         std::function<void()> callback;
@@ -107,8 +108,13 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     }
 
     void NotifyFrameAvailable() {
+        // Backpressure: Tylko 1 klatka w potoku IPC na raz. 
+        // Przy 8MB na klatkę, większa ilość zapycha proces główny Electrona.
+        if (m_framesInFlight.load(std::memory_order_relaxed) >= 1) {
+            return;
+        }
+
         Napi::ThreadSafeFunction tsfn;
-        auto payload = std::make_unique<FrameCallbackPayload>();
         IPlatformCapture* backend = nullptr;
 
         {
@@ -118,30 +124,37 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             }
             tsfn = m_frameCallback;
             backend = m_backend.get();
-
-            if (tsfn) {
-                // Wyciągamy wszystkie dane pod ochroną mutexa, aby uniknąć race condition
-                payload->backend = backend->GetBackendName();
-                payload->width = backend->GetWidth();
-                payload->height = backend->GetHeight();
-                payload->stride = backend->GetStride();
-                payload->pixelFormat = backend->GetPixelFormat();
-                payload->sharedHandle = backend->GetSharedHandle();
-                payload->pixelData = backend->GetPixelData("rgba");
-            }
         }
 
-        if (!tsfn) {
-            sc_logger::Warn("NotifyFrameAvailable called but TSFN is not available");
-            return;
+        if (!tsfn || !backend) return;
+
+        auto payload = std::make_unique<FrameCallbackPayload>();
+        // Pobieramy metadane (szybkie)
+        payload->backend = backend->GetBackendName();
+        payload->width = backend->GetWidth();
+        payload->height = backend->GetHeight();
+        payload->stride = backend->GetStride();
+        payload->pixelFormat = backend->GetPixelFormat();
+        payload->sharedHandle = backend->GetSharedHandle();
+
+        // Optimization: Only fetch slow pixel data if GPU shared handle is not available.
+        // This drastically reduces latency on the fast path (Wayland DMA-BUF / WinRT).
+        if (!payload->sharedHandle) {
+            payload->pixelData = backend->GetPixelData("rgba");
         }
+
+        if (!payload->sharedHandle && !payload->pixelData) return;
+
 
         sc_logger::Debug("NotifyFrameAvailable: Dispatching frame to JS (backend: {})", payload->backend);
+
+        m_framesInFlight.fetch_add(1, std::memory_order_relaxed);
 
         // Przekazujemy payload do TSFN. Od tego momentu TSFN odpowiada za pamięć.
         auto* rawPayload = payload.release();
 
-        auto status = tsfn.NonBlockingCall(rawPayload, [](Napi::Env env, Napi::Function jsCallback, FrameCallbackPayload* p) {
+        auto status = tsfn.NonBlockingCall(rawPayload, [this](Napi::Env env, Napi::Function jsCallback, FrameCallbackPayload* p) {
+            m_framesInFlight.fetch_sub(1, std::memory_order_relaxed);
             Napi::Object frame = Napi::Object::New(env);
             frame.Set("backend", Napi::String::New(env, p->backend));
             frame.Set("width", p->width);
@@ -164,6 +177,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
 
         if (status != napi_ok) {
             sc_logger::Warn("Failed to queue frame callback to JS");
+            m_framesInFlight.fetch_sub(1, std::memory_order_relaxed);
             delete rawPayload;
         }
     }

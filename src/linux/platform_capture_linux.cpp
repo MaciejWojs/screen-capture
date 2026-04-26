@@ -982,14 +982,10 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         if (bufferFd < 0) {
             return;
         }
-        int sharedFd = dup(fd);
-        if (sharedFd < 0) {
-            close(bufferFd);
-            return;
-        }
 
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         std::optional<SharedHandleInfo> handle;
+
         if (m_streamConfig) {
             uint32_t stride = m_stride ? m_stride : static_cast<uint32_t>(m_streamConfig->width) * 4;
             handle = SharedHandleInfo{
@@ -1005,13 +1001,16 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 m_chunkSize,
             };
         }
-        m_frameBuffers.PushFrame(SharedFd(new int(bufferFd), FdDeleter()), std::move(handle));
+
+        // Reuse the duplicated FD for both the pool and the current shared reference
+        SharedFd sfd = std::make_shared<int>(bufferFd);
+        m_frameBuffers.PushFrame(sfd, handle);
 
         m_cachedMapping.reset();
         m_cachedFd.reset();
         m_cachedMapSize = 0;
 
-        m_sharedFd.reset(new int(sharedFd));
+        m_sharedFd.reset(new int(dup(bufferFd)));
         m_frameConsumed = false;
         PublishSharedHandleLocked();
     }

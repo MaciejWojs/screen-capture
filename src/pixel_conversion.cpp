@@ -598,6 +598,37 @@ namespace {
 #endif
 }
 
+namespace {
+    static RowConverterFunc SelectBestConverter(const char*& name) {
+        RowConverterFunc converter = convertRow_scalar;
+        name = "scalar";
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        if (SupportsAVX512()) {
+            converter = convertRow_avx512;
+            name = "avx512";
+        } else if (SupportsAVX2()) {
+            converter = convertRow_avx2;
+            name = "avx2";
+        } else if (SupportsSSSE3()) {
+            converter = convertRow_ssse3;
+            name = "ssse3";
+        }
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        if (converter == convertRow_scalar && SupportsNEON()) {
+            converter = convertRow_neon;
+            name = "neon";
+        }
+#endif
+        return converter;
+    }
+
+    static const char* s_detectedConverterName = nullptr;
+    static RowConverterFunc s_bestConverter = SelectBestConverter(s_detectedConverterName);
+}
+
 static std::atomic<bool> s_converterMethodLogged{ false };
 
 static void LogConverterMethodOnce(const char* method) {
@@ -626,57 +657,28 @@ std::vector<uint8_t> ConvertPixelBuffer(
     const size_t totalPixels = static_cast<size_t>(width) * height;
     const bool isPacked = srcRowBytes == dstRowBytes;
 
-    RowConverterFunc converter = convertRow_scalar;
-    const char* converterName = "scalar";
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    if (SupportsAVX512()) {
-        converter = convertRow_avx512;
-        converterName = "avx512";
-    } else
-#endif
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-        if (SupportsAVX2()) {
-            converter = convertRow_avx2;
-            converterName = "avx2";
-        } else
-#endif
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-            if (SupportsSSSE3()) {
-                converter = convertRow_ssse3;
-                converterName = "ssse3";
-            }
-#endif
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        if (converter == convertRow_scalar && SupportsNEON()) {
-            converter = convertRow_neon;
-            converterName = "neon";
-        }
-#endif
+    RowConverterFunc converter = s_bestConverter;
+    LogConverterMethodOnce(s_detectedConverterName);
 
-        LogConverterMethodOnce(converterName);
-
-        if (srcLayout == dstLayout) {
-            if (isPacked) {
-                std::memcpy(dst.data(), src.data(), totalPixels * 4);
-            } else {
-                for (uint32_t row = 0; row < height; ++row) {
-                    const uint8_t* srcRow = src.data() + static_cast<size_t>(row) * srcRowBytes;
-                    uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
-                    for (uint32_t col = 0; col < width; ++col) {
-                        StoreUInt32(dstRow + static_cast<size_t>(col) * 4,
-                            LoadUInt32(srcRow + static_cast<size_t>(col) * 4));
-                    }
-                }
-            }
-        } else if (isPacked) {
-            converter(src.data(), dst.data(), totalPixels, srcLayout, dstLayout);
+    if (srcLayout == dstLayout) {
+        if (isPacked) {
+            std::memcpy(dst.data(), src.data(), totalPixels * 4);
         } else {
             for (uint32_t row = 0; row < height; ++row) {
                 const uint8_t* srcRow = src.data() + static_cast<size_t>(row) * srcRowBytes;
                 uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
-                converter(srcRow, dstRow, width, srcLayout, dstLayout);
+                std::memcpy(dstRow, srcRow, dstRowBytes);
             }
         }
+    } else if (isPacked) {
+        converter(src.data(), dst.data(), totalPixels, srcLayout, dstLayout);
+    } else {
+        for (uint32_t row = 0; row < height; ++row) {
+            const uint8_t* srcRow = src.data() + static_cast<size_t>(row) * srcRowBytes;
+            uint8_t* dstRow = dst.data() + static_cast<size_t>(row) * dstRowBytes;
+            converter(srcRow, dstRow, width, srcLayout, dstLayout);
+        }
+    }
 
-        return dst;
+    return dst;
 };
