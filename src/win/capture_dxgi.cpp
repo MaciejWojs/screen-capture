@@ -131,8 +131,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> m_duplication;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex[2];
+    HANDLE m_sharedHandleInternal[2]{ nullptr, nullptr };
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
+    int m_currentIndex = 0;
 
     std::function<void()> m_frameAvailableCallback;
     std::mutex m_frameCallbackMutex;
@@ -212,33 +214,27 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         texDesc.CPUAccessFlags = 0;
         texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
-        hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex);
-        if (FAILED(hr)) {
-            sc_logger::Error("DXGI: CreateTexture2D failed with 0x{:08X}", hr);
-            return false;
+        for (int i = 0; i < 2; i++) {
+            hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex[i]);
+            if (FAILED(hr)) return false;
+
+            Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
+            m_sharedTex[i].As(&dxgiRes);
+            hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &m_sharedHandleInternal[i]);
+            if (FAILED(hr)) return false;
         }
 
-        Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
-        if (FAILED(m_sharedTex.As(&dxgiRes))) {
-            sc_logger::Error("DXGI: failed to query IDXGIResource1");
-            return false;
-        }
-
-        HANDLE sharedHandle = nullptr;
-        if (FAILED(dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &sharedHandle))) {
-            sc_logger::Error("DXGI: CreateSharedHandle failed");
-            return false;
-        }
-
-        m_sharedHandle.store(sharedHandle);
-        sc_logger::Info("DXGI: shared handle created {}", reinterpret_cast<void*>(sharedHandle));
+        m_sharedHandle.store(m_sharedHandleInternal[0]);
         return true;
     }
 
     void CleanupDirect3D() {
-        HANDLE handle = m_sharedHandle.exchange(nullptr);
-        if (handle) CloseHandle(handle);
-        m_sharedTex = nullptr;
+        m_sharedHandle.store(nullptr);
+        for (int i = 0; i < 2; i++) {
+            if (m_sharedHandleInternal[i]) CloseHandle(m_sharedHandleInternal[i]);
+            m_sharedHandleInternal[i] = nullptr;
+            m_sharedTex[i] = nullptr;
+        }
         m_duplication = nullptr;
         m_context = nullptr;
         m_device = nullptr;
@@ -277,10 +273,12 @@ class DXGIPlatformCapture final : public IPlatformCapture {
 
         m_frameCount++;
 
+        m_currentIndex = (m_currentIndex + 1) % 2;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> desktopTexture;
         if (SUCCEEDED(desktopResource.As(&desktopTexture))) {
-            m_context->CopyResource(m_sharedTex.Get(), desktopTexture.Get());
+            m_context->CopyResource(m_sharedTex[m_currentIndex].Get(), desktopTexture.Get());
             m_context->Flush();
+            m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex]);
             InvokeFrameAvailableCallback();
         }
 

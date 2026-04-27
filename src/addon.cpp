@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -72,6 +73,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         int stride = 0;
         uint32_t pixelFormat = 0;
         std::optional<SharedHandleInfo> sharedHandle;
+        int64_t timestamp = 0;
         std::optional<std::vector<uint8_t>> pixelData;
 
         ~FrameCallbackPayload() {
@@ -89,7 +91,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     std::mutex m_callbackMutex;
     Napi::ThreadSafeFunction m_frameCallback;
     bool m_frameCallbackActive = false;
-    std::atomic<int> m_framesInFlight{ 0 };
+    bool m_frameDispatchScheduled = false;
+    std::unique_ptr<FrameCallbackPayload> m_pendingFrame;
 
     void AttachFrameCallbackToBackend() {
         std::function<void()> callback;
@@ -108,12 +111,6 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     }
 
     void NotifyFrameAvailable() {
-        // Backpressure: Tylko 1 klatka w potoku IPC na raz. 
-        // Przy 8MB na klatkę, większa ilość zapycha proces główny Electrona.
-        if (m_framesInFlight.load(std::memory_order_relaxed) >= 1) {
-            return;
-        }
-
         Napi::ThreadSafeFunction tsfn;
         IPlatformCapture* backend = nullptr;
 
@@ -136,6 +133,9 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         payload->stride = backend->GetStride();
         payload->pixelFormat = backend->GetPixelFormat();
         payload->sharedHandle = backend->GetSharedHandle();
+        payload->timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
 
         // Optimization: Only fetch slow pixel data if GPU shared handle is not available.
         // This drastically reduces latency on the fast path (Wayland DMA-BUF / WinRT).
@@ -145,40 +145,98 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
 
         if (!payload->sharedHandle && !payload->pixelData) return;
 
-
-        sc_logger::Debug("NotifyFrameAvailable: Dispatching frame to JS (backend: {})", payload->backend);
-
-        m_framesInFlight.fetch_add(1, std::memory_order_relaxed);
-
-        // Przekazujemy payload do TSFN. Od tego momentu TSFN odpowiada za pamięć.
-        auto* rawPayload = payload.release();
-
-        auto status = tsfn.NonBlockingCall(rawPayload, [this](Napi::Env env, Napi::Function jsCallback, FrameCallbackPayload* p) {
-            m_framesInFlight.fetch_sub(1, std::memory_order_relaxed);
-            Napi::Object frame = Napi::Object::New(env);
-            frame.Set("backend", Napi::String::New(env, p->backend));
-            frame.Set("width", p->width);
-            frame.Set("height", p->height);
-            frame.Set("stride", p->stride);
-            frame.Set("pixelFormat", p->pixelFormat);
-            frame.Set("sharedTextureInfo", SerializeSharedTextureInfo(env, p->sharedHandle));
-            frame.Set("sharedHandle", SerializeSharedHandleLegacy(env, p->sharedHandle));
-            frame.Set("pixelData", SerializePixelData(env, p->pixelData));
-
-            try {
-                jsCallback.Call({ frame });
-            } catch (const Napi::Error& e) {
-                sc_logger::Error("Frame callback threw JS error: {}", e.Message());
-            } catch (...) {
-                sc_logger::Error("Frame callback threw unknown JS error");
+        bool scheduleDispatch = false;
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            m_pendingFrame = std::move(payload);
+            if (!m_frameDispatchScheduled) {
+                m_frameDispatchScheduled = true;
+                scheduleDispatch = true;
             }
-            delete p;
+        }
+
+        if (!scheduleDispatch) {
+            return;
+        }
+
+        auto status = tsfn.NonBlockingCall([this](Napi::Env env, Napi::Function jsCallback) {
+            DispatchPendingFrame(env, jsCallback);
             });
 
         if (status != napi_ok) {
             sc_logger::Warn("Failed to queue frame callback to JS");
-            m_framesInFlight.fetch_sub(1, std::memory_order_relaxed);
-            delete rawPayload;
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            m_frameDispatchScheduled = false;
+        }
+    }
+
+    void DispatchPendingFrame(Napi::Env env, Napi::Function jsCallback) {
+        std::unique_ptr<FrameCallbackPayload> payload;
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            payload = std::move(m_pendingFrame);
+        }
+
+        if (!payload) {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            m_frameDispatchScheduled = false;
+            return;
+        }
+
+        Napi::Object frame = Napi::Object::New(env);
+        frame.Set("backend", Napi::String::New(env, payload->backend));
+        frame.Set("width", payload->width);
+        frame.Set("height", payload->height);
+        frame.Set("stride", payload->stride);
+        frame.Set("pixelFormat", payload->pixelFormat);
+        frame.Set("timestamp", Napi::Number::New(env, static_cast<double>(payload->timestamp)));
+        frame.Set("sharedTextureInfo", SerializeSharedTextureInfo(env, payload->sharedHandle));
+        frame.Set("sharedHandle", SerializeSharedHandleLegacy(env, payload->sharedHandle));
+        frame.Set("pixelData", SerializePixelData(env, payload->pixelData));
+
+        try {
+            jsCallback.Call({ frame });
+        } catch (const Napi::Error& e) {
+            sc_logger::Error("Frame callback threw JS error: {}", e.Message());
+        } catch (...) {
+            sc_logger::Error("Frame callback threw unknown JS error");
+        }
+
+        bool needReschedule = false;
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            needReschedule = static_cast<bool>(m_pendingFrame);
+            if (!needReschedule) {
+                m_frameDispatchScheduled = false;
+            }
+        }
+
+        if (needReschedule) {
+            Napi::ThreadSafeFunction tsfn;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                if (!m_frameCallbackActive) {
+                    m_frameDispatchScheduled = false;
+                    return;
+                }
+                tsfn = m_frameCallback;
+            }
+
+            if (!tsfn) {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                m_frameDispatchScheduled = false;
+                return;
+            }
+
+            auto status = tsfn.NonBlockingCall([this](Napi::Env env, Napi::Function jsCallback) {
+                DispatchPendingFrame(env, jsCallback);
+                });
+
+            if (status != napi_ok) {
+                sc_logger::Warn("Failed to queue frame callback to JS");
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                m_frameDispatchScheduled = false;
+            }
         }
     }
 

@@ -74,6 +74,8 @@ export interface FrameUpdate {
     stride: number;
     /** Pixel format code for the captured frame. */
     pixelFormat: number;
+    /** Capture timestamp in microseconds since steady clock epoch. */
+    timestamp: number;
     /** Shared texture information for Electron import, when available. */
     sharedTextureInfo: SharedTextureImportTextureInfo | null;
     /** Legacy shared handle information for the current frame. */

@@ -257,8 +257,10 @@ class WinPlatformCapture final : public IPlatformCapture {
     com_ptr<ID3D11Device> m_device;
     com_ptr<ID3D11DeviceContext> m_context;
     IDirect3DDevice m_winrtDevice{ nullptr };
-    com_ptr<ID3D11Texture2D> m_sharedTex;
+    com_ptr<ID3D11Texture2D> m_sharedTex[2];
+    HANDLE m_sharedHandleInternal[2]{ nullptr, nullptr };
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
+    int m_currentIndex = 0;
 
     std::function<void()> m_frameAvailableCallback;
     std::mutex m_frameCallbackMutex;
@@ -380,7 +382,9 @@ class WinPlatformCapture final : public IPlatformCapture {
 
         m_item = nullptr;
         m_winrtDevice = nullptr;
-        m_sharedTex = nullptr;
+        for (int i = 0; i < 2; i++) {
+            m_sharedTex[i] = nullptr;
+        }
         m_device = nullptr;
         m_context = nullptr;
         m_deviceReady.store(false, std::memory_order_release);
@@ -510,12 +514,12 @@ class WinPlatformCapture final : public IPlatformCapture {
 
         {
             std::lock_guard<std::mutex> lock(m_stateMutex);
-            HANDLE oldHandle = m_sharedHandle.exchange(nullptr);
-            if (oldHandle) {
-                sc_logger::Info("Closing old shared handle");
-                CloseHandle(oldHandle);
+            m_sharedHandle.store(nullptr);
+            for (int i = 0; i < 2; i++) {
+                if (m_sharedHandleInternal[i]) CloseHandle(m_sharedHandleInternal[i]);
+                m_sharedHandleInternal[i] = nullptr;
+                m_sharedTex[i] = nullptr;
             }
-            m_sharedTex = nullptr;
         }
 
         if (m_width == 0 || m_height == 0) {
@@ -534,42 +538,33 @@ class WinPlatformCapture final : public IPlatformCapture {
         desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
-        HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, m_sharedTex.put());
-        if (FAILED(hr)) {
-            sc_logger::Error("CreateTexture2D failed with error 0x{:08X}", hr);
-            throw std::runtime_error("Failed to create shared texture");
-        }
+        for (int i = 0; i < 2; i++) {
+            check_hresult(m_device->CreateTexture2D(&desc, nullptr, m_sharedTex[i].put()));
 
-        com_ptr<IDXGIResource1> res;
-        hr = m_sharedTex->QueryInterface(__uuidof(IDXGIResource1), res.put_void());
-        if (FAILED(hr)) {
-            sc_logger::Error("QueryInterface for IDXGIResource1 failed with error 0x{:08X}", hr);
-            throw std::runtime_error("Failed to get IDXGIResource1");
-        }
+            auto res = m_sharedTex[i].as<IDXGIResource1>();
+            HANDLE handle = nullptr;
+            HRESULT createHandleResult = E_FAIL;
 
-        HANDLE handle = nullptr;
-        HRESULT createHandleResult = E_FAIL;
-        for (int i = 0; i < 3; i++) {
-            createHandleResult = res->CreateSharedHandle(
-                nullptr,
-                DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-                nullptr,
-                &handle
-            );
-            if (SUCCEEDED(createHandleResult)) {
-                break;
+            for (int retry = 0; retry < 3; retry++) {
+                createHandleResult = res->CreateSharedHandle(
+                    nullptr,
+                    DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                    nullptr,
+                    &handle
+                );
+                if (SUCCEEDED(createHandleResult)) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            sc_logger::Warn("CreateSharedHandle failed retry {} with error 0x{:08X}", i, createHandleResult);
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        if (FAILED(createHandleResult)) {
-            sc_logger::Error("CreateSharedHandle failed after retries with error 0x{:08X}", createHandleResult);
-            throw std::runtime_error("Failed to create shared handle");
+
+            if (FAILED(createHandleResult)) {
+                throw std::runtime_error("Failed to create shared handle for WinRT");
+            }
+            m_sharedHandleInternal[i] = handle;
         }
 
-        m_sharedHandle.store(handle);
+        m_sharedHandle.store(m_sharedHandleInternal[0]);
         m_textureReady.store(true, std::memory_order_release);
-        sc_logger::Info("Shared texture and handle created successfully, handle = {}", reinterpret_cast<void*>(handle));
+        sc_logger::Info("Double shared textures and handles created for WinRT");
     }
 
     void OnFrame(Direct3D11CaptureFramePool const& sender,
@@ -614,22 +609,9 @@ class WinPlatformCapture final : public IPlatformCapture {
             return;
         }
 
-        com_ptr<ID3D11Texture2D> localSharedTex;
-        com_ptr<ID3D11DeviceContext> localContext;
-        {
-            std::lock_guard<std::mutex> stateLock(m_stateMutex);
-            if (!m_sharedTex || !m_context) {
-                sc_logger::Warn("OnFrame: sharedTex or context is null");
-                return;
-            }
-            localSharedTex = m_sharedTex;
-            localContext = m_context;
-        }
-
-        if (!localContext || !localSharedTex) {
-            sc_logger::Warn("OnFrame: localSharedTex or localContext is null");
-            return;
-        }
+        m_currentIndex = (m_currentIndex + 1) % 2;
+        auto localSharedTex = m_sharedTex[m_currentIndex];
+        auto localContext = m_context;
 
         m_frameCount.fetch_add(1, std::memory_order_relaxed);
 
@@ -646,6 +628,7 @@ class WinPlatformCapture final : public IPlatformCapture {
 
             localContext->CopyResource(localSharedTex.get(), srcTex.get());
             localContext->Flush();
+            m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex]);
 
             InvokeFrameAvailableCallback();
 
