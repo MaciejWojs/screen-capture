@@ -1566,7 +1566,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                 static_cast<uint64_t>(size), // planeSize
                 detectedFormat,
                 0, // modifier
-                1, // Przywrócono typ 1 (MemFd), w 'preload' dodano wsparcie dla type=1
+                SPA_DATA_MemFd, // MemFd handle type for X11 shared memory capture
                 static_cast<uint32_t>(size) // chunkSize
             };
             m_frameConsumed = false;
@@ -1592,7 +1592,7 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
                             static_cast<uint64_t>(size),
                             detectedFormat,
                             0,
-                            1,
+                            SPA_DATA_MemFd,
                             static_cast<uint32_t>(size),
                     };
 
