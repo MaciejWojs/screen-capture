@@ -9,6 +9,10 @@
 #include <mutex>
 #include <string>
 
+#ifdef __linux__
+#include <spa/buffer/buffer.h>
+#endif
+
 #include "logger.hpp"
 #include "platform_capture.hpp"
 #include "serialize.hpp"
@@ -137,9 +141,15 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             std::chrono::steady_clock::now().time_since_epoch()
         ).count();
 
-        // Optimization: Only fetch slow pixel data if GPU shared handle is not available.
-        // This drastically reduces latency on the fast path (Wayland DMA-BUF / WinRT).
-        if (!payload->sharedHandle) {
+        // Optimization: Only fetch slow pixel data if GPU shared handle is not available,
+        // or if the shared handle is not usable as an Electron shared texture.
+        bool shouldFetchPixelData = !payload->sharedHandle;
+#ifdef __linux__
+        if (payload->sharedHandle && payload->sharedHandle->bufferType != SPA_DATA_DmaBuf) {
+            shouldFetchPixelData = true;
+        }
+#endif
+        if (shouldFetchPixelData) {
             payload->pixelData = backend->GetPixelData("rgba");
         }
 
