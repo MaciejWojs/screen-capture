@@ -123,6 +123,11 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             if (!m_frameCallbackActive || !m_backend) {
                 return;
             }
+            if (m_frameDispatchScheduled) {
+                // A frame is already queued for dispatch; skip expensive pixel data conversion
+                // until the previous frame reaches the JS side.
+                return;
+            }
             tsfn = m_frameCallback;
             backend = m_backend.get();
         }
