@@ -4,16 +4,45 @@
         {
             "label": "cleanup",
             "type": "shell",
-            "detail": "Removes build artifacts and prebuilds. Also removes the packed tarball if it exists.",
+            "detail": "Removes artifacts and prebuilds. Also removes the packed tarball if it exists.",
             "linux": {
-                "command": "rm -rf build dist prebuilds maciejwojs-screen-capture-*.tgz playground/input_bridge_addon.node",
+                "command": "rm -rf dist prebuilds maciejwojs-screen-capture-*.tgz playground/input_bridge_addon.node",
             },
             "windows": {
                 "command": "powershell",
                 "args": [
                     "-NoProfile",
                     "-Command",
-                    "Remove-Item -Recurse -Force build,dist,prebuilds -ErrorAction SilentlyContinue; Remove-Item -Force playground/input_bridge_addon.node -ErrorAction SilentlyContinue; Get-ChildItem -Path . -Filter 'maciejwojs-screen-capture-*.tgz' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue"
+                    "Remove-Item -Recurse -Force dist,prebuilds -ErrorAction SilentlyContinue; Remove-Item -Force playground/input_bridge_addon.node -ErrorAction SilentlyContinue; Get-ChildItem -Path . -Filter 'maciejwojs-screen-capture-*.tgz' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue"
+                ]
+            },
+            "presentation": {
+                "reveal": "silent",
+                "clear": true,
+                "close": true
+            },
+            "group": "build",
+            "icon": {
+                "id": "trashcan",
+                "color": "terminal.ansiRed"
+            }
+        },
+        {
+            "label": "full clean",
+            "type": "shell",
+            "dependsOn": [
+                "cleanup"
+            ],
+            "detail": "Performs a full clean by running 'cleanup' and then removing node_modules and the prebuild cache.",
+            "linux": {
+                "command": "rm -rf node_modules build/",
+            },
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-NoProfile",
+                    "-Command",
+                    "Remove-Item -Recurse -Force node_modules,build/ -ErrorAction SilentlyContinue"
                 ]
             },
             "presentation": {
@@ -48,6 +77,16 @@
             }
         },
         {
+            "label": "build:cpp",
+            "detail": "Builds the native addon. Incremental build that does not clean previous artifacts. Use 'rebuild' for a clean build.",
+            "type": "shell",
+            "command": "bun build:cpp",
+            "group": "build",
+            "icon": {
+                "id": "refresh"
+            }
+        },
+        {
             "label": "rebuild",
             "detail": "Rebuilds the native addon.",
             "type": "shell",
@@ -62,6 +101,48 @@
             "detail": "Creates prebuilt binaries for the native addon.",
             "type": "shell",
             "command": "bun prebuildify",
+            "runOptions": {
+                "instancePolicy": "terminateNewest",
+                "reevaluateOnRerun": true
+            },
+            "group": "build",
+            "icon": {
+                "id": "cloud-upload"
+            }
+        },
+        {
+            "label": "prebuild:wsl",
+            "detail": "Creates prebuilt binaries for the native addon.",
+            "type": "shell",
+            "linux": {
+                "command": "echo 'Skipping WSL prebuild on Linux host'",
+            },
+            "windows": {
+                "options": {
+                    "shell": {
+                        "executable": "wsl",
+                    },
+                },
+                "command": "export PATH=$HOME/.bun/bin/:$PATH && bun prebuildify",
+            },
+            "group": "build",
+            "runOptions": {
+                "instancePolicy": "terminateNewest",
+                "reevaluateOnRerun": true
+            },
+            "icon": {
+                "id": "cloud-upload"
+            }
+        },
+        {
+            "label": "prebuild:all",
+            "detail": "Creates prebuilt binaries for the native addon.",
+            "type": "shell",
+            "dependsOn": [
+                "prebuild",
+                "prebuild:wsl"
+            ],
+            "dependsOrder": "sequence",
             "group": "build",
             "icon": {
                 "id": "cloud-upload"
@@ -69,7 +150,7 @@
         },
         {
             "label": "prepare",
-            "detail": "Prepares the environment for building. (cleanup+build+rebuild)",
+            "detail": "Prepares the environment for building. (cleanup+build)",
             "dependsOn": [
                 "cleanup",
                 "make addon and compile types"
@@ -83,7 +164,7 @@
             "detail": "Builds the native addon and compiles TypeScript types.",
             "dependsOn": [
                 "build",
-                "rebuild"
+                "build:cpp"
             ],
             "dependsOrder": "parallel",
             "hide": true,
@@ -95,13 +176,18 @@
             "type": "shell",
             "command": "bun pm pack",
             "dependsOn": [
-                "prepare",
-                "prebuild"
+                "prebuild:all",
+                "build:cpp",
+                "build"
             ],
             "dependsOrder": "sequence",
             "presentation": {
                 "reveal": "always",
                 "clear": true
+            },
+            "runOptions": {
+                "instancePolicy": "terminateNewest",
+                "reevaluateOnRerun": true
             },
             "icon": {
                 "id": "package"
@@ -128,6 +214,70 @@
                 "id": "play"
             },
             "group": "build"
+        },
+        {
+            "label": "build forced",
+            "detail": "Builds the native addon with an environment variable that forces the Windows backend. Useful for testing and debugging.",
+            "type": "shell",
+            "command": "echo 'Skipping forced API build on Linux host && exit 1'",
+            "windows": {
+                "options": {
+                    "env": {
+                        "force_api": "${input:forceApi}"
+                    }
+                },
+                "command": "bun prebuildify",
+            },
+            "presentation": {
+                "reveal": "always",
+                "clear": true,
+                "focus": true
+            },
+            "runOptions": {
+                "instancePolicy": "terminateNewest",
+                "reevaluateOnRerun": true
+            },
+            "group": "build"
+        },
+        {
+            "label": "pack only",
+            "detail": "Packs the module into a tarball using bun. Does not build or prepare anything, so it assumes everything is already up to date.",
+            "type": "shell",
+            "command": "bun pm pack",
+            "presentation": {
+                "reveal": "always",
+                "clear": true
+            },
+            "runOptions": {
+                "instancePolicy": "terminateNewest",
+                "reevaluateOnRerun": true
+            },
+            "icon": {
+                "id": "package"
+            },
+            "group": "build"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "forceApi",
+            "type": "pickString",
+            "description": "Select a specific API to force for the build (Windows only).",
+            "options": [
+                {
+                    "label": "WinRT",
+                    "value": "winrt"
+                },
+                {
+                    "label": "GDI",
+                    "value": "gdi"
+                },
+                {
+                    "label": "DXGI",
+                    "value": "dxgi"
+                }
+            ],
+            "default": "winrt"
         }
     ]
 }

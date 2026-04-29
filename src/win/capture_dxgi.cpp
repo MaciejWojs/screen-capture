@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <stop_token>
 #include <stdexcept>
@@ -33,6 +34,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         napi_add_env_cleanup_hook(m_env, CleanupHook, this);
 
         m_thread = std::jthread([this](std::stop_token stopToken) {
+            sc_logger::Info("DXGI capture thread started");
             if (!InitializeDirect3D()) {
                 sc_logger::Error("DXGI: Initialization failed");
                 return;
@@ -45,8 +47,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                     CleanupDirect3D();
 
                     while (!stopToken.stop_requested()) {
-                        if (InitializeDirect3D())
+                        if (InitializeDirect3D()) {
+                            sc_logger::Info("DXGI: Reinitialized successfully");
                             break;
+                        }
                         std::unique_lock lock(m_reinitMutex);
                         m_reinitCv.wait_for(lock, std::chrono::milliseconds(100),
                             [&stopToken] { return stopToken.stop_requested(); });
@@ -73,13 +77,25 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        HANDLE handle = m_sharedHandle.load();
+        // HANDLE handle = m_sharedHandle.load();
+        HANDLE handle = m_sharedHandle.load(std::memory_order_acquire);
         if (!handle) return std::nullopt;
 
+        HANDLE duplicate = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            sc_logger::Error("DXGI GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
+            return std::nullopt;
+        }
+
         SharedHandleInfo info;
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        // info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
         info.width = m_width;
         info.height = m_height;
+        info.stride = m_width * 4;
+        info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+
+        sc_logger::Debug("DXGI GetSharedHandle: duplicated handle={}", reinterpret_cast<void*>(duplicate));
         return info;
     }
 
@@ -90,6 +106,22 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     std::string GetBackendName() const override { return "dxgi"; }
     int GetFps() const override { return m_lastFps.load(); }
 
+    void SetFrameAvailableCallback(std::function<void()> callback) override {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        m_frameAvailableCallback = std::move(callback);
+    }
+
+    void InvokeFrameAvailableCallback() {
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+            callback = m_frameAvailableCallback;
+        }
+        if (callback) {
+            callback();
+        }
+    }
+
     private:
     napi_env m_env{ nullptr };
     std::jthread m_thread;                      // automatyczne zarządzanie wątkiem
@@ -99,8 +131,13 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> m_duplication;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex[2];
+    HANDLE m_sharedHandleInternal[2]{ nullptr, nullptr };
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
+    int m_currentIndex = 0;
+
+    std::function<void()> m_frameAvailableCallback;
+    std::mutex m_frameCallbackMutex;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -117,29 +154,53 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             levels, ARRAYSIZE(levels),
             D3D11_SDK_VERSION, &m_device, nullptr, &m_context
         );
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: D3D11CreateDevice failed with 0x{:08X}", hr);
+            return false;
+        }
+
+        sc_logger::Info("DXGI: D3D11 device created");
 
         Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
-        if (FAILED(m_device.As(&dxgiDevice))) return false;
+        if (FAILED(m_device.As(&dxgiDevice))) {
+            sc_logger::Error("DXGI: failed to query IDXGIDevice");
+            return false;
+        }
 
         Microsoft::WRL::ComPtr<IDXGIAdapter> dxgiAdapter;
-        if (FAILED(dxgiDevice->GetAdapter(&dxgiAdapter))) return false;
+        if (FAILED(dxgiDevice->GetAdapter(&dxgiAdapter))) {
+            sc_logger::Error("DXGI: failed to get DXGI adapter");
+            return false;
+        }
 
         Microsoft::WRL::ComPtr<IDXGIOutput> dxgiOutput;
-        if (FAILED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) return false;
+        if (FAILED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) {
+            sc_logger::Error("DXGI: failed to enumerate output");
+            return false;
+        }
 
         Microsoft::WRL::ComPtr<IDXGIOutput1> dxgiOutput1;
-        if (FAILED(dxgiOutput.As(&dxgiOutput1))) return false; // wymaga DXGI 1.2 (Win8+)
+        if (FAILED(dxgiOutput.As(&dxgiOutput1))) {
+            sc_logger::Error("DXGI: failed to cast output to IDXGIOutput1");
+            return false;
+        }
 
         hr = dxgiOutput1->DuplicateOutput(m_device.Get(), &m_duplication);
-        if (FAILED(hr)) return false; // np. E_ACCESSDENIED
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: DuplicateOutput failed with 0x{:08X}", hr);
+            return false;
+        }
 
         DXGI_OUTDUPL_DESC desc;
         m_duplication->GetDesc(&desc);
-        if (desc.DesktopImageInSystemMemory) return false; // nie chcemy tej ścieżki
+        if (desc.DesktopImageInSystemMemory) {
+            sc_logger::Error("DXGI: DesktopImageInSystemMemory path is not supported");
+            return false;
+        }
 
         m_width = desc.ModeDesc.Width;
         m_height = desc.ModeDesc.Height;
+        sc_logger::Info("DXGI: capture size {}x{}", m_width, m_height);
 
         D3D11_TEXTURE2D_DESC texDesc = {};
         texDesc.Width = m_width;
@@ -151,33 +212,39 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         texDesc.Usage = D3D11_USAGE_DEFAULT;
         texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         texDesc.CPUAccessFlags = 0;
-        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
-        hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex);
-        if (FAILED(hr)) return false;
+        for (int i = 0; i < 2; i++) {
+            hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex[i]);
+            if (FAILED(hr)) return false;
 
-        Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
-        if (SUCCEEDED(m_sharedTex.As(&dxgiRes))) {
-            HANDLE sharedHandle = nullptr;
-            if (SUCCEEDED(dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &sharedHandle))) {
-                m_sharedHandle.store(sharedHandle);
-                return true;
-            }
+            Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
+            m_sharedTex[i].As(&dxgiRes);
+            hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &m_sharedHandleInternal[i]);
+            if (FAILED(hr)) return false;
         }
-        return false;
+
+        m_sharedHandle.store(m_sharedHandleInternal[0]);
+        return true;
     }
 
     void CleanupDirect3D() {
-        HANDLE handle = m_sharedHandle.exchange(nullptr);
-        if (handle) CloseHandle(handle);
-        m_sharedTex = nullptr;
+        m_sharedHandle.store(nullptr);
+        for (int i = 0; i < 2; i++) {
+            if (m_sharedHandleInternal[i]) CloseHandle(m_sharedHandleInternal[i]);
+            m_sharedHandleInternal[i] = nullptr;
+            m_sharedTex[i] = nullptr;
+        }
         m_duplication = nullptr;
         m_context = nullptr;
         m_device = nullptr;
     }
 
     bool CaptureFrame(std::stop_token stopToken) {
-        if (!m_duplication) return false;
+        if (!m_duplication) {
+            sc_logger::Error("DXGI: CaptureFrame called with no duplication object");
+            return false;
+        }
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         Microsoft::WRL::ComPtr<IDXGIResource> desktopResource;
@@ -187,32 +254,36 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return true;
         }
         if (FAILED(hr)) {
-            // DXGI_ERROR_ACCESS_LOST etc.
+            sc_logger::Warn("DXGI: AcquireNextFrame failed with 0x{:08X}", hr);
             return false;
         }
 
-        // check if stop was requested while waiting for the frame
         if (stopToken.stop_requested()) {
             m_duplication->ReleaseFrame();
             return false;
         }
 
-        if (frameInfo.AccumulatedFrames == 0 || frameInfo.LastPresentTime.QuadPart == 0) {
+        // We only care about AccumulatedFrames. LastPresentTime can be 0 even for valid 
+        // frames on some systems/drivers, leading to rhythmic stuttering if discarded.
+        // Mouse-only updates (AccumulatedFrames == 0) are handled by ReleaseFrame without copy.
+        if (frameInfo.AccumulatedFrames == 0) {
             m_duplication->ReleaseFrame();
             return true;
         }
 
         m_frameCount++;
 
+        m_currentIndex = (m_currentIndex + 1) % 2;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> desktopTexture;
         if (SUCCEEDED(desktopResource.As(&desktopTexture))) {
-            m_context->CopyResource(m_sharedTex.Get(), desktopTexture.Get());
+            m_context->CopyResource(m_sharedTex[m_currentIndex].Get(), desktopTexture.Get());
             m_context->Flush();
+            m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex]);
+            InvokeFrameAvailableCallback();
         }
 
         m_duplication->ReleaseFrame();
 
-        // FPS
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
         if (elapsed >= 1) {

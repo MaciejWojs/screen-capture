@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <stop_token>
 #include <stdexcept>
@@ -64,13 +65,25 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        HANDLE handle = m_sharedHandle.load();
+        // HANDLE handle = m_sharedHandle.load();
+        HANDLE handle = m_sharedHandle.load(std::memory_order_acquire);
         if (!handle) return std::nullopt;
 
+        HANDLE duplicate = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            sc_logger::Error("GDI GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
+            return std::nullopt;
+        }
+
         SharedHandleInfo info;
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        // info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
         info.width = m_width;
         info.height = m_height;
+        info.stride = m_width * 4;
+        info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+
+        sc_logger::Debug("GDI GetSharedHandle: duplicated handle={}", reinterpret_cast<void*>(duplicate));
         return info;
     }
 
@@ -80,6 +93,22 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
     std::string GetBackendName() const override { return "gdi"; }
     int GetFps() const override { return m_lastFps.load(); }
+
+    void SetFrameAvailableCallback(std::function<void()> callback) override {
+        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+        m_frameAvailableCallback = std::move(callback);
+    }
+
+    void InvokeFrameAvailableCallback() {
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
+            callback = m_frameAvailableCallback;
+        }
+        if (callback) {
+            callback();
+        }
+    }
 
     private:
     napi_env m_env{ nullptr };
@@ -92,6 +121,9 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingTex;
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
+
+    std::function<void()> m_frameAvailableCallback;
+    std::mutex m_frameCallbackMutex;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -188,6 +220,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             m_context->Unmap(m_stagingTex.Get(), 0);
             m_context->CopyResource(m_sharedTex.Get(), m_stagingTex.Get());
             m_context->Flush();
+            InvokeFrameAvailableCallback();
         }
 
         // zwolnij GDI

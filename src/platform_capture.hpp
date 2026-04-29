@@ -2,6 +2,7 @@
 
 #include <napi.h>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -35,6 +36,7 @@ class IPlatformCapture {
     virtual int GetStride() const { return 0; }
     virtual uint32_t GetPixelFormat() const { return 0; }
     virtual std::string GetBackendName() const { return "unknown"; }
+    virtual void SetFrameAvailableCallback(std::function<void()> callback) {}
     // Returns FPS or -1 if not implemented
     virtual int GetFps() const { return -1; }
 };
