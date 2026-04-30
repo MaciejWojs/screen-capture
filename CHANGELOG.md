@@ -1,15 +1,26 @@
+## 0.5.0 (2026-04-30)
+
+* feat: add build:cpp script for node-gyp configuration
+* feat: add support for dirty rectangle tracking in frame updates and optimize pixel conversion
+* feat: add timestamp to FrameUpdate interface and update the frame callback to include timestamp notifications
+* feat: enable D3D11 multithread protection and improve frame handling logic
+* feat: enhance Linux pixel data fetching and DXGI capture initialization logging
+* feat: implement push-based frame delivery for Node/Electron integration
+* refactor: improve thread safety and cleanup across Windows capture backends
+* fix: add alpha mask handling and pixel format detection for X11 capture
+* fix: add AVX2/AVX512 support and fallback handling for pixel conversion
+* fix: validate pixel data retrieval and stride handling on Linux
+
 ## <small>0.4.2 (2026-04-24)</small>
 
 * refactor: enhance error handling and capture size validation in WinRT capture ([e818e9b](https://github.com/MaciejWojs/screen-capture/commit/e818e9b))
 * refactor: enhance frame pool management and cleanup in WinRT capture ([218e3f9](https://github.com/MaciejWojs/screen-capture/commit/218e3f9))
-* refactor: enhance logging and error handling in WinPlatformCapture class ([fe7ce21](https://github.com/MaciejWojs/screen-capture/commit/fe7ce21))
 * refactor: enhance thread management and cleanup in DXGI capture ([fc4fcf8](https://github.com/MaciejWojs/screen-capture/commit/fc4fcf8))
 * refactor: enhance thread safety and state management in WinRT capture ([0d11488](https://github.com/MaciejWojs/screen-capture/commit/0d11488))
 * refactor: improve capture state management and error handling in WinPlatformCapture ([9e313ee](https://github.com/MaciejWojs/screen-capture/commit/9e313ee))
 * refactor: improve frame pool management and enhance thread safety in WinRT capture ([64d6f0f](https://github.com/MaciejWojs/screen-capture/commit/64d6f0f))
 * refactor: improve pool recreation handling and frame processing in WinRT capture ([a5ed50b](https://github.com/MaciejWojs/screen-capture/commit/a5ed50b))
 * refactor: improve thread handling and cleanup in GDI capture ([643c449](https://github.com/MaciejWojs/screen-capture/commit/643c449))
-* refactor: simplify texture creation and improve thread handling in WinRT capture ([afd0cf0](https://github.com/MaciejWojs/screen-capture/commit/afd0cf0))
 * feat: add TypeScript package build and release steps to CI workflow ([9ef755d](https://github.com/MaciejWojs/screen-capture/commit/9ef755d))
 * feat: implement frame buffer pool and enhance pixel data retrieval for X11 and Wayland ([b78a7c4](https://github.com/MaciejWojs/screen-capture/commit/b78a7c4))
 
@@ -24,7 +35,6 @@
 
 * refactor: replace unique_ptr with shared_ptr for memory management and simplify atomic operations in ([0ec0b0e](https://github.com/MaciejWojs/screen-capture/commit/0ec0b0e))
 * fix: add pixel format detection for X11 in X11PlatformCapture ([d7c918f](https://github.com/MaciejWojs/screen-capture/commit/d7c918f))
-* fix: implement GetPixelData method for X11PlatformCapture ([1420a79](https://github.com/MaciejWojs/screen-capture/commit/1420a79))
 * fix: improve Linux texture serialization with buffer type validation and correct modifier handling ([bfdbe7b](https://github.com/MaciejWojs/screen-capture/commit/bfdbe7b))
 * fix: refactor pixel data retrieval into ReadPixelDataFromSharedFd for X11 and Wayland ([aae0ea2](https://github.com/MaciejWojs/screen-capture/commit/aae0ea2))
 * fix: remove duplicate entries and outdated references in CHANGELOG.md ([70dadb3](https://github.com/MaciejWojs/screen-capture/commit/70dadb3))
@@ -32,11 +42,8 @@
 ## <small>0.3.4 (2026-04-17)</small>
 
 * fix: add AVX2 target attribute to BroadcastShuffleMask and declare convertRow_avx2 function ([ad5362d](https://github.com/MaciejWojs/screen-capture/commit/ad5362d))
-* fix: refine CPU feature checks for SSSE3 and AVX2 support on x86 architectures ([ab537c6](https://github.com/MaciejWojs/screen-capture/commit/ab537c6))
 * fix: streamline AVX512 support checks and improve fallback handling in pixel conversion ([4c1f509](https://github.com/MaciejWojs/screen-capture/commit/4c1f509))
 * fix: update cache key to use matrix.os for build artifacts ([f599282](https://github.com/MaciejWojs/screen-capture/commit/f599282))
-* fix: update upload-artifact action to version 7.0.1 in build workflow ([bff7065](https://github.com/MaciejWojs/screen-capture/commit/bff7065))
-
 ## <small>0.3.3 (2026-04-17)</small>
 
 * fix: add fallback implementation for convertRow_avx2 when AVX2 is not defined ([5894293](https://github.com/MaciejWojs/screen-capture/commit/5894293))
