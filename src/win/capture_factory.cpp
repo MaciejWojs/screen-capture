@@ -192,7 +192,8 @@ class WindowsPlatformCapture final : public IPlatformCapture {
                         { std::lock_guard cbLock(m_callbackMutex); cb = m_userCallback; }
                         if (cb) cb();
                         });
-                    m_activeCapture->Start(m_env);
+                    // Przekazujemy nullptr jako Env, bo Start wywołujemy z wątku roboczego.
+                    m_activeCapture->Start(nullptr);
                     m_currentIdx.store(target);
                 }
             }
@@ -230,7 +231,7 @@ std::unique_ptr<IPlatformCapture> WindowsPlatformCapture::CreateInternalCapture(
 #else
             return nullptr;
 #endif
-    }
+        }
         if (backend == "dxgi") return CreateDXGICapture(mon);
         if (backend == "gdi") return CreateGDICapture(mon);
         return nullptr;

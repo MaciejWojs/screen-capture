@@ -72,7 +72,9 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_env = env;
         sc_logger::Info("Screen capture started via WinRT Graphics Capture (jthread)");
 
-        napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        if (m_env) {
+            napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        }
 
         m_jthread = std::jthread([this](std::stop_token stopToken) {
             sc_logger::Info("Capture thread started");
@@ -330,7 +332,7 @@ class WinPlatformCapture final : public IPlatformCapture {
         sc_logger::Info("StopInternal called");
         m_running.store(false, std::memory_order_release);
 
-        if (m_env) {
+        if (m_env && m_jthread.joinable()) {
             napi_remove_env_cleanup_hook(m_env, CleanupHook, this);
             sc_logger::Info("Removed cleanup hook");
             m_env = nullptr;

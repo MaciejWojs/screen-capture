@@ -70,6 +70,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     }
 
     ~ScreenCapture() override {
+        if (m_backend) m_backend->Stop();
         ResetFrameCallback();
     }
 

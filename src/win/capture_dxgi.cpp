@@ -31,7 +31,9 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         m_env = env;
         sc_logger::Info("Screen capture started via DXGI Desktop Duplication API with jthread");
 
-        napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        if (m_env) {
+            napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        }
 
         m_thread = std::jthread([this](std::stop_token stopToken) {
             sc_logger::Info("DXGI capture thread started");
@@ -64,7 +66,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     void Stop() override {
-        if (m_env) {
+        if (m_env && m_thread.joinable()) {
             napi_remove_env_cleanup_hook(m_env, CleanupHook, this);
             m_env = nullptr;
         }

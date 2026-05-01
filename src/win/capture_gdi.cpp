@@ -32,7 +32,9 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         m_env = env;
         sc_logger::Info("Screen capture started via GDI BitBlt fallback (C++20 jthread)");
 
-        napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        if (m_env) {
+            napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        }
 
         // Uruchom wątek z obsługą stop_token
         m_thread = std::jthread([this](std::stop_token stopToken) {
@@ -52,7 +54,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     }
 
     void Stop() override {
-        if (m_env) {
+        if (m_env && m_thread.joinable()) {
             napi_remove_env_cleanup_hook(m_env, CleanupHook, this);
             m_env = nullptr;
         }
