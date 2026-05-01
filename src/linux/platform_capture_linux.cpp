@@ -8,6 +8,7 @@
 #include <gio/gunixfdlist.h>
 #include <pipewire/keys.h>
 #include <pipewire/pipewire.h>
+#include <pipewire/thread-loop.h>
 #include <pipewire/stream.h>
 #include <spa/param/buffers.h>
 #include <spa/buffer/meta.h>
@@ -766,7 +767,17 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     void StopCurrentPipewireStream() {
-        if (m_streamState.stream) {
+        if (!m_streamState.stream) return;
+
+        if (m_streamState.pw_loop) {
+            pw_thread_loop* loop = m_streamState.pw_loop.get();
+            pw_thread_loop_lock(loop);
+            if (m_streamState.stream) {
+                pw_stream* raw = m_streamState.stream.release();
+                if (raw) pw_stream_destroy(raw);
+            }
+            pw_thread_loop_unlock(loop);
+        } else {
             m_streamState.stream.reset();
         }
     }
@@ -778,6 +789,14 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     void CreatePipewireStream(uint32_t targetNodeId) {
+        struct LoopLockGuard {
+            pw_thread_loop* loop;
+            explicit LoopLockGuard(pw_thread_loop* l) : loop(l) { if (loop) pw_thread_loop_lock(loop); }
+            ~LoopLockGuard() { if (loop) pw_thread_loop_unlock(loop); }
+        };
+        
+        LoopLockGuard pwLock(m_streamState.pw_loop.get());
+
         m_streamState.stream.reset(pw_stream_new(
             m_streamState.core.get(),
             "electron-capture",
@@ -889,7 +908,9 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         }
 
         if (m_streamState.pw_loop) {
+            pw_thread_loop_unlock(m_streamState.pw_loop.get());
             pw_thread_loop_start(m_streamState.pw_loop.get());
+            pw_thread_loop_lock(m_streamState.pw_loop.get());
         }
     }
 
@@ -980,15 +1001,22 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         }
 
         pw_loop* loop = pw_thread_loop_get_loop(m_streamState.pw_loop.get());
+        
+        pw_thread_loop_lock(m_streamState.pw_loop.get());
+        
         m_streamState.context.reset(pw_context_new(loop, nullptr, 0));
         if (!m_streamState.context) {
+            pw_thread_loop_unlock(m_streamState.pw_loop.get());
             throw std::runtime_error("Unable to create the PipeWire context");
         }
 
         m_streamState.core.reset(pw_context_connect_fd(m_streamState.context.get(), std::exchange(pipewireFd, -1), nullptr, 0));
         if (!m_streamState.core) {
+            pw_thread_loop_unlock(m_streamState.pw_loop.get());
             throw std::runtime_error("Unable to connect to the PipeWire core through the portal FD");
         }
+        
+        pw_thread_loop_unlock(m_streamState.pw_loop.get());
 
         CreatePipewireStream(m_streamNodeId.load());
     }
@@ -1010,13 +1038,33 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     void CleanupPipewire() {
+        // Ensure destruction of PipeWire objects happens on the PipeWire thread-loop
         if (m_streamState.pw_loop) {
-            pw_thread_loop_stop(m_streamState.pw_loop.get());
+            pw_thread_loop* loop = m_streamState.pw_loop.get();
+            pw_thread_loop_lock(loop);
+            if (m_streamState.stream) {
+                pw_stream* raw = m_streamState.stream.release();
+                if (raw) pw_stream_destroy(raw);
+            }
+            if (m_streamState.core) {
+                pw_core* raw = m_streamState.core.release();
+                if (raw) pw_core_disconnect(raw);
+            }
+            if (m_streamState.context) {
+                pw_context* raw = m_streamState.context.release();
+                if (raw) pw_context_destroy(raw);
+            }
+            pw_thread_loop_unlock(loop);
+
+            // Stop and destroy the thread loop
+            pw_thread_loop_stop(loop);
+            pw_thread_loop_signal(loop, false);
+            m_streamState.pw_loop.reset();
+        } else {
+            m_streamState.stream.reset();
+            m_streamState.core.reset();
+            m_streamState.context.reset();
         }
-        m_streamState.stream.reset();
-        m_streamState.core.reset();
-        m_streamState.context.reset();
-        m_streamState.pw_loop.reset();
 
         CleanupSharedHandle();
     }
