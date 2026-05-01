@@ -785,6 +785,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     void RecreatePipewireStream(uint32_t targetNodeId) {
         std::lock_guard<std::shared_mutex> lock(m_stateMutex);
         StopCurrentPipewireStream();
+        CleanupSharedHandleLocked();
         CreatePipewireStream(targetNodeId);
     }
 
@@ -1069,12 +1070,9 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         CleanupSharedHandle();
     }
 
-    void CleanupSharedHandle() {
-        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+    void CleanupSharedHandleLocked() {
         m_sharedHandle.reset();
-
         m_sharedFd.reset();
-
         m_streamConfig.reset();
         m_stride = 0;
         m_offset = 0;
@@ -1086,6 +1084,11 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_fdCache.clear();
         m_loggedNonDmabuf = false;
         m_frameConsumed = false;
+    }
+
+    void CleanupSharedHandle() {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        CleanupSharedHandleLocked();
     }
 
     void PublishSharedHandleLocked() {
