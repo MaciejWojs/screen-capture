@@ -388,6 +388,10 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_winrtDevice = nullptr;
         for (int i = 0; i < 2; i++) {
             m_sharedTex[i] = nullptr;
+            if (m_sharedHandleInternal[i]) {
+                CloseHandle(m_sharedHandleInternal[i]);
+                m_sharedHandleInternal[i] = nullptr;
+            }
         }
         m_device = nullptr;
         m_context = nullptr;
@@ -395,11 +399,8 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_textureReady.store(false, std::memory_order_release);
         m_captureStarted.store(false, std::memory_order_release);
 
-        HANDLE handle = m_sharedHandle.exchange(nullptr);
-        if (handle) {
-            sc_logger::Info("Closing shared handle");
-            CloseHandle(handle);
-        }
+        m_sharedHandle.store(nullptr);
+
         sc_logger::Info("CleanupCapture finished");
     }
 
@@ -653,6 +654,8 @@ class WinPlatformCapture final : public IPlatformCapture {
                 m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
                 sc_logger::Debug("OnFrame: FPS updated to {}", frames);
             }
+
+            frame.Close();
         } catch (const winrt::hresult_error& e) {
             sc_logger::Error("WinRT error in OnFrame: {}", winrt::to_string(e.message()));
         } catch (const std::exception& e) {

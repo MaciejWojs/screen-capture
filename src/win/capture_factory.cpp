@@ -95,8 +95,12 @@ class WindowsPlatformCapture final : public IPlatformCapture {
         m_cv.notify_all();
         if (m_thread.joinable()) m_thread.join();
 
-        std::lock_guard lock(m_activeMutex);
-        if (m_activeCapture) m_activeCapture->Stop();
+        std::unique_ptr<IPlatformCapture> active;
+        {
+            std::lock_guard lock(m_activeMutex);
+            active = std::move(m_activeCapture);
+        }
+        if (active) active->Stop();
     }
 
     // Proxy methods to active backend
@@ -181,21 +185,26 @@ class WindowsPlatformCapture final : public IPlatformCapture {
             if (target == -1) target = m_currentIdx.load();
             if (target >= (int)m_monitors.size()) continue;
 
+            std::unique_ptr<IPlatformCapture> oldCapture;
             {
                 std::lock_guard lock(m_activeMutex);
-                if (m_activeCapture) m_activeCapture->Stop();
+                oldCapture = std::move(m_activeCapture);
+            }
 
-                m_activeCapture = CreateInternalCapture(m_monitors[target].handle);
-                if (m_activeCapture) {
-                    m_activeCapture->SetFrameAvailableCallback([this]() {
-                        std::function<void()> cb;
-                        { std::lock_guard cbLock(m_callbackMutex); cb = m_userCallback; }
-                        if (cb) cb();
-                        });
-                    // Przekazujemy nullptr jako Env, bo Start wywołujemy z wątku roboczego.
-                    m_activeCapture->Start(nullptr);
-                    m_currentIdx.store(target);
-                }
+            if (oldCapture) oldCapture->Stop();
+
+            auto nextCapture = CreateInternalCapture(m_monitors[target].handle);
+            if (nextCapture) {
+                nextCapture->SetFrameAvailableCallback([this]() {
+                    std::function<void()> cb;
+                    { std::lock_guard cbLock(m_callbackMutex); cb = m_userCallback; }
+                    if (cb) cb();
+                    });
+                nextCapture->Start(nullptr);
+
+                std::lock_guard lock(m_activeMutex);
+                m_activeCapture = std::move(nextCapture);
+                m_currentIdx.store(target);
             }
         }
     }
@@ -245,7 +254,7 @@ std::unique_ptr<IPlatformCapture> WindowsPlatformCapture::CreateInternalCapture(
     if (auto cap = CreateDXGICapture(mon)) return cap;
     return CreateGDICapture(mon);
 #endif
-}
+    }
 
 std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& forceBackend) {
     return std::make_unique<WindowsPlatformCapture>(forceBackend);
