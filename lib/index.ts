@@ -138,6 +138,24 @@ export interface IScreenCapture {
      */
     getPixelFormat(): number;
     /**
+     * Returns the number of monitors selected by the Wayland portal.
+     * This is only useful on Wayland.
+     */
+    getMonitorCount(): number;
+    /**
+     * Returns the index of the currently active monitor capture.
+     * This is only useful on Wayland.
+     */
+    getCurrentMonitorIndex(): number;
+    /**
+     * Switches capture to the next selected Wayland monitor.
+     */
+    nextMonitor(): void;
+    /**
+     * Switches capture to a specific selected Wayland monitor by index.
+     */
+    selectMonitor(index: number): void;
+    /**
      * Retrieves the texture info formulated for Electron's shared-texture.
      * @returns The shared texture info if available, otherwise null.
      */
@@ -253,6 +271,22 @@ class ScreenCaptureWrapper implements IScreenCapture {
 
     getPixelFormat(): number {
         return this.inner.getPixelFormat();
+    }
+
+    getMonitorCount(): number {
+        return this.inner.getMonitorCount();
+    }
+
+    getCurrentMonitorIndex(): number {
+        return this.inner.getCurrentMonitorIndex();
+    }
+
+    nextMonitor(): void {
+        this.inner.nextMonitor();
+    }
+
+    selectMonitor(index: number): void {
+        this.inner.selectMonitor(index);
     }
 
     getSharedTextureInfo(): SharedTextureImportTextureInfo | null {

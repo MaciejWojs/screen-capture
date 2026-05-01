@@ -398,6 +398,16 @@ namespace {
         OpeningRemote,
     };
 
+    struct MonitorInfo {
+        uint32_t nodeId = PW_ID_ANY;
+        int32_t x = 0;
+        int32_t y = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        std::string connector;
+        std::string title;
+    };
+
 } // namespace
 
 struct StreamConfig {
@@ -582,6 +592,11 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         return "wayland";
     }
 
+    int GetMonitorCount() const override;
+    int GetCurrentMonitorIndex() const override;
+    void NextMonitor() override;
+    void SelectMonitor(int index) override;
+
     private:
 
     GMainLoopPtr m_glibLoop;
@@ -593,6 +608,9 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     std::string m_sessionHandle;
     std::optional<StreamConfig> m_streamConfig;
     std::atomic<uint32_t> m_streamNodeId{ PW_ID_ANY };
+    std::vector<MonitorInfo> m_monitors;
+    std::atomic<int> m_currentMonitorIndex{ 0 };
+    std::atomic<int> m_requestedMonitorIndex{ -1 };
     uint32_t m_stride = 0;
     uint32_t m_offset = 0;
     uint64_t m_planeSize = 0;
@@ -682,9 +700,28 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
             StartPipewireStream(pipewireFd);
 
-            {
-                std::unique_lock<std::mutex> waitLock(m_captureMutex);
-                m_captureCv.wait(waitLock, [&stopToken] { return stopToken.stop_requested(); });
+            while (!stopToken.stop_requested()) {
+                int requestedIndex = -1;
+                {
+                    std::unique_lock<std::mutex> waitLock(m_captureMutex);
+                    m_captureCv.wait(waitLock, [&stopToken, this] {
+                        return stopToken.stop_requested() || m_requestedMonitorIndex.load() >= 0;
+                        });
+                    if (stopToken.stop_requested()) {
+                        break;
+                    }
+                    requestedIndex = m_requestedMonitorIndex.exchange(-1);
+                }
+
+                if (requestedIndex >= 0) {
+                    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                    if (requestedIndex >= 0 && requestedIndex < static_cast<int>(m_monitors.size())) {
+                        m_currentMonitorIndex = requestedIndex;
+                        m_streamNodeId = m_monitors[requestedIndex].nodeId;
+                        StopCurrentPipewireStream();
+                        CreatePipewireStream(m_streamNodeId.load());
+                    }
+                }
             }
 
         } catch (const std::exception& e) {
@@ -728,6 +765,134 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         }
     }
 
+    void StopCurrentPipewireStream() {
+        if (m_streamState.stream) {
+            m_streamState.stream.reset();
+        }
+    }
+
+    void RecreatePipewireStream(uint32_t targetNodeId) {
+        std::lock_guard<std::shared_mutex> lock(m_stateMutex);
+        StopCurrentPipewireStream();
+        CreatePipewireStream(targetNodeId);
+    }
+
+    void CreatePipewireStream(uint32_t targetNodeId) {
+        m_streamState.stream.reset(pw_stream_new(
+            m_streamState.core.get(),
+            "electron-capture",
+            pw_properties_new(
+                PW_KEY_MEDIA_TYPE, "Video",
+                PW_KEY_MEDIA_CATEGORY, "Capture",
+                PW_KEY_MEDIA_ROLE, "Screen",
+                nullptr)));
+
+        if (!m_streamState.stream) {
+            throw std::runtime_error("Unable to create the PipeWire stream");
+        }
+
+        uint8_t buffer[Config::POD_BUFFER_SIZE_CONNECT];
+        spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+        const spa_pod* params[3];
+
+        const spa_rectangle minSize = SPA_RECTANGLE(1, 1);
+        const spa_rectangle defaultSize = SPA_RECTANGLE(1920, 1080);
+        const spa_rectangle maxSize = SPA_RECTANGLE(8192, 8192);
+        const spa_fraction minFramerate = SPA_FRACTION(0, 1);
+        const spa_fraction defaultFramerate = SPA_FRACTION(60, 1);
+        const spa_fraction maxFramerate = SPA_FRACTION(144, 1);
+
+        bool forceMemFd = IsNvidiaGPU();
+
+        if (forceMemFd) {
+            params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_Format,
+                SPA_PARAM_EnumFormat,
+                SPA_FORMAT_mediaType,
+                SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype,
+                SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                SPA_FORMAT_VIDEO_format,
+                SPA_POD_CHOICE_ENUM_Id(6, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
+                SPA_FORMAT_VIDEO_size,
+                SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
+                SPA_FORMAT_VIDEO_framerate,
+                SPA_POD_CHOICE_RANGE_Fraction(&defaultFramerate, &minFramerate, &maxFramerate)));
+        } else {
+            params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_Format,
+                SPA_PARAM_EnumFormat,
+                SPA_FORMAT_mediaType,
+                SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype,
+                SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                SPA_FORMAT_VIDEO_format,
+                SPA_POD_CHOICE_ENUM_Id(6, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
+                SPA_FORMAT_VIDEO_size,
+                SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
+                SPA_FORMAT_VIDEO_framerate,
+                SPA_POD_CHOICE_RANGE_Fraction(&defaultFramerate, &minFramerate, &maxFramerate),
+                SPA_FORMAT_VIDEO_modifier,
+                SPA_POD_CHOICE_ENUM_Long(3, 0ULL, 0ULL, 0x00ffffffffffffffULL)));
+        }
+
+        if (forceMemFd) {
+            params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_ParamBuffers,
+                SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
+                SPA_PARAM_BUFFERS_dataType,
+                SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd)));
+        } else {
+            params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+                &builder,
+                SPA_TYPE_OBJECT_ParamBuffers,
+                SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
+                SPA_PARAM_BUFFERS_dataType,
+                SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
+        }
+
+        params[2] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+            &builder,
+            SPA_TYPE_OBJECT_ParamMeta,
+            SPA_PARAM_Meta,
+            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage),
+            SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_region))));
+
+        if (!params[0] || !params[1] || !params[2]) {
+            sc_logger::Error("Failed to build PW connection params (format={}, buffers={}, meta={})",
+                static_cast<const void*>(params[0]), static_cast<const void*>(params[1]), static_cast<const void*>(params[2]));
+            throw std::runtime_error("PipeWire POD buffer overflow during stream connection initialization");
+        }
+
+        pw_stream_add_listener(
+            m_streamState.stream.get(),
+            &m_streamState.stream_listener,
+            &kStreamEvents,
+            this);
+
+        uint32_t targetId = targetNodeId == PW_ID_ANY ? PW_ID_ANY : targetNodeId;
+        int result = pw_stream_connect(
+            m_streamState.stream.get(),
+            PW_DIRECTION_INPUT,
+            targetId,
+            static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
+            params,
+            3);
+
+        if (result < 0) {
+            throw std::runtime_error(std::string("pw_stream_connect failed: ") + spa_strerror(result));
+        }
+
+        if (m_streamState.pw_loop) {
+            pw_thread_loop_start(m_streamState.pw_loop.get());
+        }
+    }
+
     void StartSession() {
         GVariantBuilderWrapper builder;
         m_stage = PortalStage::StartingSession;
@@ -742,7 +907,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     void SelectSources() {
         GVariantBuilderWrapper builder;
         g_variant_builder_add(builder, "{sv}", "types", g_variant_new_uint32(1));
-        g_variant_builder_add(builder, "{sv}", "multiple", g_variant_new_boolean(FALSE));
+        g_variant_builder_add(builder, "{sv}", "multiple", g_variant_new_boolean(TRUE));
         g_variant_builder_add(builder, "{sv}", "cursor_mode", g_variant_new_uint32(1));
 
         m_stage = PortalStage::SelectingSources;
@@ -825,121 +990,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             throw std::runtime_error("Unable to connect to the PipeWire core through the portal FD");
         }
 
-        m_streamState.stream.reset(pw_stream_new(
-            m_streamState.core.get(),
-            "electron-capture",
-            pw_properties_new(
-                PW_KEY_MEDIA_TYPE, "Video",
-                PW_KEY_MEDIA_CATEGORY, "Capture",
-                PW_KEY_MEDIA_ROLE, "Screen",
-                nullptr)));
-
-        if (!m_streamState.stream) {
-            throw std::runtime_error("Unable to create the PipeWire stream");
-        }
-
-        uint8_t buffer[Config::POD_BUFFER_SIZE_CONNECT];
-        spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-        const spa_pod* params[3];
-
-        const spa_rectangle minSize = SPA_RECTANGLE(1, 1);
-        const spa_rectangle defaultSize = SPA_RECTANGLE(1920, 1080);
-        const spa_rectangle maxSize = SPA_RECTANGLE(8192, 8192);
-        const spa_fraction minFramerate = SPA_FRACTION(0, 1);
-        const spa_fraction defaultFramerate = SPA_FRACTION(60, 1);
-        const spa_fraction maxFramerate = SPA_FRACTION(144, 1);
-
-        bool forceMemFd = IsNvidiaGPU();
-
-        if (forceMemFd) {
-            // On some NVIDIA drivers DMA-BUFs are problematic
-            // if DMA-BUFs are not working, we should use raw getPixelData with format conversion (which is slower), instead of completely failing to capture
-            params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-                &builder,
-                SPA_TYPE_OBJECT_Format,
-                SPA_PARAM_EnumFormat,
-                SPA_FORMAT_mediaType,
-                SPA_POD_Id(SPA_MEDIA_TYPE_video),
-                SPA_FORMAT_mediaSubtype,
-                SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-                SPA_FORMAT_VIDEO_format,
-                SPA_POD_CHOICE_ENUM_Id(6, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
-                SPA_FORMAT_VIDEO_size,
-                SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
-                SPA_FORMAT_VIDEO_framerate,
-                SPA_POD_CHOICE_RANGE_Fraction(&defaultFramerate, &minFramerate, &maxFramerate)));
-        } else {
-            params[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-                &builder,
-                SPA_TYPE_OBJECT_Format,
-                SPA_PARAM_EnumFormat,
-                SPA_FORMAT_mediaType,
-                SPA_POD_Id(SPA_MEDIA_TYPE_video),
-                SPA_FORMAT_mediaSubtype,
-                SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-                SPA_FORMAT_VIDEO_format,
-                SPA_POD_CHOICE_ENUM_Id(6, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_xRGB),
-                SPA_FORMAT_VIDEO_size,
-                SPA_POD_CHOICE_RANGE_Rectangle(&defaultSize, &minSize, &maxSize),
-                SPA_FORMAT_VIDEO_framerate,
-                SPA_POD_CHOICE_RANGE_Fraction(&defaultFramerate, &minFramerate, &maxFramerate),
-                SPA_FORMAT_VIDEO_modifier,
-                SPA_POD_CHOICE_ENUM_Long(3, 0ULL, 0ULL, 0x00ffffffffffffffULL)));
-        }
-
-        if (forceMemFd) {
-            params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-                &builder,
-                SPA_TYPE_OBJECT_ParamBuffers,
-                SPA_PARAM_Buffers,
-                SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
-                SPA_PARAM_BUFFERS_dataType,
-                SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd)));
-        } else {
-            params[1] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-                &builder,
-                SPA_TYPE_OBJECT_ParamBuffers,
-                SPA_PARAM_Buffers,
-                SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
-                SPA_PARAM_BUFFERS_dataType,
-                SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd))));
-        }
-
-        // Request VideoDamage metadata to enable dirty rectangles tracking
-        params[2] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
-            &builder,
-            SPA_TYPE_OBJECT_ParamMeta,
-            SPA_PARAM_Meta,
-            SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage),
-            SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_region))));
-
-        if (!params[0] || !params[1] || !params[2]) {
-            sc_logger::Error("Failed to build PW connection params (format={}, buffers={}, meta={})",
-                static_cast<const void*>(params[0]), static_cast<const void*>(params[1]), static_cast<const void*>(params[2]));
-            throw std::runtime_error("PipeWire POD buffer overflow during stream connection initialization");
-        }
-
-        pw_stream_add_listener(
-            m_streamState.stream.get(),
-            &m_streamState.stream_listener,
-            &kStreamEvents,
-            this);
-
-        uint32_t currentStreamNodeId = m_streamNodeId.load();
-        uint32_t targetId = currentStreamNodeId == PW_ID_ANY ? PW_ID_ANY : currentStreamNodeId;
-        int result = pw_stream_connect(
-            m_streamState.stream.get(),
-            PW_DIRECTION_INPUT,
-            targetId,
-            static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
-            params,
-            3);
-
-        if (result < 0) {
-            throw std::runtime_error(std::string("pw_stream_connect failed: ") + spa_strerror(result));
-        }
-
-        pw_thread_loop_start(m_streamState.pw_loop.get());
+        CreatePipewireStream(m_streamNodeId.load());
     }
 
     void CleanupPortal() {
@@ -949,6 +1000,9 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             std::unique_lock<std::shared_mutex> lock(m_stateMutex);
             m_sessionHandle.clear();
             m_glibLoop.reset();
+            m_monitors.clear();
+            m_currentMonitorIndex = 0;
+            m_requestedMonitorIndex = -1;
         }
 
         m_streamNodeId = PW_ID_ANY;
@@ -1327,30 +1381,71 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             if (self->m_stage == PortalStage::StartingSession) {
                 const gchar* key = nullptr;
                 GVariant* value = nullptr;
-                bool foundNode = false;
-                uint32_t nodeId = PW_ID_ANY;
+                std::vector<MonitorInfo> monitors;
 
                 while (results && g_variant_iter_next(results, "{sv}", &key, &value)) {
                     if (g_strcmp0(key, "streams") == 0 && g_variant_is_of_type(value, G_VARIANT_TYPE("a(ua{sv})"))) {
                         GVariantIter streamIter;
                         g_variant_iter_init(&streamIter, value);
-                        GVariant* streamTuple = g_variant_iter_next_value(&streamIter);
-                        if (streamTuple) {
+                        GVariant* streamTuple = nullptr;
+
+                        while ((streamTuple = g_variant_iter_next_value(&streamIter)) != nullptr) {
+                            uint32_t nodeId = PW_ID_ANY;
                             GVariant* props = nullptr;
                             g_variant_get(streamTuple, "(u@a{sv})", &nodeId, &props);
-                            if (props) g_variant_unref(props);
+
+                            MonitorInfo monitor;
+                            monitor.nodeId = nodeId;
+
+                            if (props) {
+                                GVariantIter propIter;
+                                g_variant_iter_init(&propIter, props);
+                                const gchar* propKey = nullptr;
+                                GVariant* propVal = nullptr;
+
+                                while (g_variant_iter_next(&propIter, "{sv}", &propKey, &propVal)) {
+                                    if (g_strcmp0(propKey, "size") == 0 && g_variant_is_of_type(propVal, G_VARIANT_TYPE("(ii)"))) {
+                                        int32_t width = 0;
+                                        int32_t height = 0;
+                                        g_variant_get(propVal, "(ii)", &width, &height);
+                                        monitor.width = static_cast<uint32_t>(width);
+                                        monitor.height = static_cast<uint32_t>(height);
+                                    } else if (g_strcmp0(propKey, "position") == 0 && g_variant_is_of_type(propVal, G_VARIANT_TYPE("(ii)"))) {
+                                        int32_t x = 0;
+                                        int32_t y = 0;
+                                        g_variant_get(propVal, "(ii)", &x, &y);
+                                        monitor.x = x;
+                                        monitor.y = y;
+                                    } else if (g_strcmp0(propKey, "connector") == 0 && g_variant_is_of_type(propVal, G_VARIANT_TYPE("s"))) {
+                                        monitor.connector = g_variant_get_string(propVal, nullptr);
+                                    } else if (g_strcmp0(propKey, "title") == 0 && g_variant_is_of_type(propVal, G_VARIANT_TYPE("s"))) {
+                                        monitor.title = g_variant_get_string(propVal, nullptr);
+                                    }
+                                    g_variant_unref(propVal);
+                                }
+                                g_variant_unref(props);
+                            }
+
+                            monitors.push_back(std::move(monitor));
                             g_variant_unref(streamTuple);
-                            foundNode = true;
                         }
                     }
                     g_variant_unref(value);
                 }
                 freeResults();
 
-                if (!foundNode || nodeId == PW_ID_ANY) {
-                    throw std::runtime_error("Start response did not include a valid PipeWire stream node id");
+                if (monitors.empty()) {
+                    throw std::runtime_error("Start response did not include any PipeWire streams");
                 }
-                self->m_streamNodeId = nodeId;
+
+                {
+                    std::lock_guard<std::shared_mutex> lock(self->m_stateMutex);
+                    self->m_monitors = std::move(monitors);
+                    self->m_currentMonitorIndex = 0;
+                    self->m_streamNodeId = self->m_monitors[0].nodeId;
+                }
+
+                sc_logger::Info("Wayland capture selected {} monitor(s)", static_cast<int>(self->m_monitors.size()));
                 self->OpenPipeWireRemote();
                 return;
             }
@@ -1374,6 +1469,38 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
     static const pw_stream_events kStreamEvents;
 };
+
+int WaylandPlatformCapture::GetMonitorCount() const {
+    std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+    return static_cast<int>(m_monitors.size());
+}
+
+int WaylandPlatformCapture::GetCurrentMonitorIndex() const {
+    return m_currentMonitorIndex.load();
+}
+
+void WaylandPlatformCapture::NextMonitor() {
+    std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+    if (m_monitors.empty()) {
+        return;
+    }
+    int nextIndex = (m_currentMonitorIndex.load() + 1) % static_cast<int>(m_monitors.size());
+    if (nextIndex != m_currentMonitorIndex.load()) {
+        m_requestedMonitorIndex.store(nextIndex);
+        m_captureCv.notify_all();
+    }
+}
+
+void WaylandPlatformCapture::SelectMonitor(int index) {
+    std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+    if (index < 0 || index >= static_cast<int>(m_monitors.size())) {
+        return;
+    }
+    if (index != m_currentMonitorIndex.load()) {
+        m_requestedMonitorIndex.store(index);
+        m_captureCv.notify_all();
+    }
+}
 
 const pw_stream_events WaylandPlatformCapture::kStreamEvents = [] {
     pw_stream_events events{};
