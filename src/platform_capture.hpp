@@ -37,6 +37,10 @@ class IPlatformCapture {
     virtual uint32_t GetPixelFormat() const { return 0; }
     virtual std::string GetBackendName() const { return "unknown"; }
     virtual void SetFrameAvailableCallback(std::function<void()> callback) {}
+    virtual int GetMonitorCount() const { return 0; }
+    virtual int GetCurrentMonitorIndex() const { return 0; }
+    virtual void NextMonitor() {}
+    virtual void SelectMonitor(int index) {}
     // Returns FPS or -1 if not implemented
     virtual int GetFps() const { return -1; }
 };

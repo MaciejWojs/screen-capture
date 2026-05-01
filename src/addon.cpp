@@ -35,7 +35,11 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             InstanceMethod("getHeight", &ScreenCapture::GetHeight),
             InstanceMethod("getStride", &ScreenCapture::GetStride),
             InstanceMethod("getPixelFormat", &ScreenCapture::GetPixelFormat),
-            InstanceMethod("getFps", &ScreenCapture::GetFps)
+            InstanceMethod("getFps", &ScreenCapture::GetFps),
+            InstanceMethod("getMonitorCount", &ScreenCapture::GetMonitorCount),
+            InstanceMethod("getCurrentMonitorIndex", &ScreenCapture::GetCurrentMonitorIndex),
+            InstanceMethod("nextMonitor", &ScreenCapture::NextMonitor),
+            InstanceMethod("selectMonitor", &ScreenCapture::SelectMonitor)
             });
 
         auto* constructor = new Napi::FunctionReference();
@@ -313,6 +317,42 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             fps = m_backend->GetFps();
         }
         return Napi::Number::New(info.Env(), fps);
+    }
+
+    Napi::Value GetMonitorCount(const Napi::CallbackInfo& info) {
+        int count = 0;
+        if (m_backend) {
+            count = m_backend->GetMonitorCount();
+        }
+        return Napi::Number::New(info.Env(), count);
+    }
+
+    Napi::Value GetCurrentMonitorIndex(const Napi::CallbackInfo& info) {
+        int index = 0;
+        if (m_backend) {
+            index = m_backend->GetCurrentMonitorIndex();
+        }
+        return Napi::Number::New(info.Env(), index);
+    }
+
+    Napi::Value NextMonitor(const Napi::CallbackInfo& info) {
+        if (m_backend) {
+            m_backend->NextMonitor();
+        }
+        return info.Env().Undefined();
+    }
+
+    Napi::Value SelectMonitor(const Napi::CallbackInfo& info) {
+        if (info.Length() == 0 || !info[0].IsNumber()) {
+            Napi::TypeError::New(info.Env(), "selectMonitor requires an index number").ThrowAsJavaScriptException();
+            return info.Env().Undefined();
+        }
+
+        int index = info[0].As<Napi::Number>().Int32Value();
+        if (m_backend) {
+            m_backend->SelectMonitor(index);
+        }
+        return info.Env().Undefined();
     }
 
     Napi::Value Start(const Napi::CallbackInfo& info) {
