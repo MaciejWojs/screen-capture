@@ -19,7 +19,7 @@
 
 class DXGIPlatformCapture final : public IPlatformCapture {
     public:
-    DXGIPlatformCapture() = default;
+    DXGIPlatformCapture(HMONITOR monitor) : m_targetMonitor(monitor) {}
     ~DXGIPlatformCapture() override { Stop(); }
 
     static void CleanupHook(void* arg) {
@@ -126,6 +126,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     napi_env m_env{ nullptr };
     std::jthread m_thread;                      // automatyczne zarządzanie wątkiem
     mutable std::mutex m_reinitMutex;           // dla condition_variable przy ponownej inicjalizacji
+    HMONITOR m_targetMonitor = nullptr;
     std::condition_variable_any m_reinitCv;     // może czekać na stop_token
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
@@ -146,46 +147,59 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     std::atomic<int> m_lastFps{ 0 };
     std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
 
+    Microsoft::WRL::ComPtr<IDXGIOutput1> FindTargetOutput(IDXGIAdapter* adapter) {
+        for (UINT i = 0; ; ++i) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> output;
+            if (adapter->EnumOutputs(i, &output) == DXGI_ERROR_NOT_FOUND) break;
+
+            DXGI_OUTPUT_DESC desc;
+            output->GetDesc(&desc);
+
+            if (!m_targetMonitor || desc.Monitor == m_targetMonitor) {
+                Microsoft::WRL::ComPtr<IDXGIOutput1> output1;
+                if (SUCCEEDED(output.As(&output1))) return output1;
+            }
+        }
+        return nullptr;
+    }
+
     bool InitializeDirect3D() {
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+
+        Microsoft::WRL::ComPtr<IDXGIAdapter> targetAdapter;
+        Microsoft::WRL::ComPtr<IDXGIOutput1> targetOutput;
+
+        for (UINT i = 0; ; ++i) {
+            Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+            if (factory->EnumAdapters(i, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+
+            targetOutput = FindTargetOutput(adapter.Get());
+            if (targetOutput) {
+                targetAdapter = adapter;
+                break;
+            }
+        }
+
+        if (!targetAdapter || !targetOutput) {
+            sc_logger::Error("DXGI: Could not find target monitor output");
+            return false;
+        }
+
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
         HRESULT hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            targetAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             levels, ARRAYSIZE(levels),
             D3D11_SDK_VERSION, &m_device, nullptr, &m_context
         );
+
         if (FAILED(hr)) {
             sc_logger::Error("DXGI: D3D11CreateDevice failed with 0x{:08X}", hr);
             return false;
         }
 
-        sc_logger::Info("DXGI: D3D11 device created");
-
-        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
-        if (FAILED(m_device.As(&dxgiDevice))) {
-            sc_logger::Error("DXGI: failed to query IDXGIDevice");
-            return false;
-        }
-
-        Microsoft::WRL::ComPtr<IDXGIAdapter> dxgiAdapter;
-        if (FAILED(dxgiDevice->GetAdapter(&dxgiAdapter))) {
-            sc_logger::Error("DXGI: failed to get DXGI adapter");
-            return false;
-        }
-
-        Microsoft::WRL::ComPtr<IDXGIOutput> dxgiOutput;
-        if (FAILED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) {
-            sc_logger::Error("DXGI: failed to enumerate output");
-            return false;
-        }
-
-        Microsoft::WRL::ComPtr<IDXGIOutput1> dxgiOutput1;
-        if (FAILED(dxgiOutput.As(&dxgiOutput1))) {
-            sc_logger::Error("DXGI: failed to cast output to IDXGIOutput1");
-            return false;
-        }
-
-        hr = dxgiOutput1->DuplicateOutput(m_device.Get(), &m_duplication);
+        hr = targetOutput->DuplicateOutput(m_device.Get(), &m_duplication);
         if (FAILED(hr)) {
             sc_logger::Error("DXGI: DuplicateOutput failed with 0x{:08X}", hr);
             return false;
@@ -315,9 +329,9 @@ bool IsWin8OrGreaterForDXGI() {
     return false;
 }
 
-std::unique_ptr<IPlatformCapture> CreateDXGICapture() {
+std::unique_ptr<IPlatformCapture> CreateDXGICapture(HMONITOR monitor) {
     if (IsWin8OrGreaterForDXGI()) {
-        return std::make_unique<DXGIPlatformCapture>();
+        return std::make_unique<DXGIPlatformCapture>(monitor);
     }
     return nullptr;
 }

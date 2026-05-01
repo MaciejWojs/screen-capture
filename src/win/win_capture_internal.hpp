@@ -3,6 +3,7 @@
 #ifdef _WIN32
 
 #include "../platform_capture.hpp"
+#include <windows.h>
 #include <memory>
 
 #if defined(__has_include)
@@ -15,8 +16,8 @@
 #  define HAS_WINRT_CAPTURE 0
 #endif
 
-std::unique_ptr<IPlatformCapture> CreateWinRTCapture();
-std::unique_ptr<IPlatformCapture> CreateDXGICapture();
-std::unique_ptr<IPlatformCapture> CreateGDICapture();
+std::unique_ptr<IPlatformCapture> CreateWinRTCapture(HMONITOR monitor = nullptr);
+std::unique_ptr<IPlatformCapture> CreateDXGICapture(HMONITOR monitor = nullptr);
+std::unique_ptr<IPlatformCapture> CreateGDICapture(HMONITOR monitor = nullptr);
 
 #endif // _WIN32

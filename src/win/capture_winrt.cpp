@@ -45,7 +45,7 @@ inline IDirect3DDevice CreateDirect3DDevice(IDXGIDevice* dxgiDevice) {
 
 class WinPlatformCapture final : public IPlatformCapture {
     public:
-    WinPlatformCapture() {
+    WinPlatformCapture(HMONITOR monitor) : m_targetMonitor(monitor) {
         sc_logger::Info("WinPlatformCapture constructor called");
     }
 
@@ -87,13 +87,14 @@ class WinPlatformCapture final : public IPlatformCapture {
 
                 InitializeD3D();
 
-                HMONITOR monitor = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
-                sc_logger::Info("Using primary monitor handle: {}", reinterpret_cast<void*>(monitor));
+                if (!m_targetMonitor) {
+                    m_targetMonitor = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
+                }
 
                 auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
                 check_hresult(
                     interop->CreateForMonitor(
-                        monitor,
+                        m_targetMonitor,
                         guid_of<GraphicsCaptureItem>(),
                         put_abi(m_item)
                     )
@@ -249,6 +250,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     mutable std::mutex m_stateMutex;
     std::atomic<bool> m_running{ false };
     std::atomic<bool> m_poolRecreationRequested{ false };
+    HMONITOR m_targetMonitor = nullptr;
     std::atomic<bool> m_cleaned{ false };
     std::atomic<bool> m_deviceReady{ false };
     std::atomic<bool> m_textureReady{ false };
@@ -661,9 +663,9 @@ class WinPlatformCapture final : public IPlatformCapture {
     }
 };
 
-std::unique_ptr<IPlatformCapture> CreateWinRTCapture() {
+std::unique_ptr<IPlatformCapture> CreateWinRTCapture(HMONITOR monitor) {
     sc_logger::Info("CreateWinRTCapture called");
-    return std::make_unique<WinPlatformCapture>();
+    return std::make_unique<WinPlatformCapture>(monitor);
 }
 
 #else // !HAS_WINRT_CAPTURE

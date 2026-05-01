@@ -3,6 +3,7 @@
 #include "win_capture_internal.hpp"
 #include <windows.h>
 #include <stdio.h>
+#include <vector>
 
 #if HAS_WINRT_CAPTURE
 #include <winrt/base.h>
@@ -64,7 +65,7 @@ bool IsWinRTCaptureAvailable() {
 static std::string NormalizeBackendName(std::string backend) {
     std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
-    });
+        });
     return backend;
 }
 
