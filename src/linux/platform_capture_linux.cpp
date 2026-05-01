@@ -132,8 +132,11 @@ namespace {
             std::lock_guard<std::mutex> lock(m_mutex);
             for (auto& slot : m_slots) {
                 slot.fd.reset();
+                slot.mapping.reset();
                 slot.handle.reset();
+                slot.damage.clear();
                 slot.ready = false;
+                slot.fullUpdate = true;
             }
             m_writeIndex = 0;
             m_latestIndex = -1;
@@ -720,6 +723,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                         m_currentMonitorIndex = requestedIndex;
                         m_streamNodeId = m_monitors[requestedIndex].nodeId;
                         StopCurrentPipewireStream();
+                        CleanupSharedHandleLocked();
                         CreatePipewireStream(m_streamNodeId.load());
                     }
                 }
@@ -907,12 +911,6 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         if (result < 0) {
             throw std::runtime_error(std::string("pw_stream_connect failed: ") + spa_strerror(result));
         }
-
-        if (m_streamState.pw_loop) {
-            pw_thread_loop_unlock(m_streamState.pw_loop.get());
-            pw_thread_loop_start(m_streamState.pw_loop.get());
-            pw_thread_loop_lock(m_streamState.pw_loop.get());
-        }
     }
 
     void StartSession() {
@@ -1020,6 +1018,10 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         pw_thread_loop_unlock(m_streamState.pw_loop.get());
 
         CreatePipewireStream(m_streamNodeId.load());
+
+        if (m_streamState.pw_loop) {
+            pw_thread_loop_start(m_streamState.pw_loop.get());
+        }
     }
 
     void CleanupPortal() {
@@ -1082,6 +1084,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_frameBuffers.Reset();
         m_mappingCache.clear();
         m_fdCache.clear();
+        m_pixelCache.clear();
+        m_cacheFormat.clear();
         m_loggedNonDmabuf = false;
         m_frameConsumed = false;
     }
