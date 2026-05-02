@@ -139,6 +139,31 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
         HANDLE handle = nullptr;
         std::chrono::steady_clock::time_point retireTime;
+
+        RetiredSharedResource(Microsoft::WRL::ComPtr<ID3D11Texture2D> t, HANDLE h, std::chrono::steady_clock::time_point rt)
+            : tex(std::move(t)), handle(h), retireTime(rt) {
+        }
+
+        ~RetiredSharedResource() {
+            if (handle) CloseHandle(handle);
+        }
+
+        RetiredSharedResource(RetiredSharedResource&& other) noexcept
+            : tex(std::move(other.tex)), handle(std::exchange(other.handle, nullptr)), retireTime(other.retireTime) {
+        }
+
+        RetiredSharedResource& operator=(RetiredSharedResource&& other) noexcept {
+            if (this != &other) {
+                if (handle) CloseHandle(handle);
+                tex = std::move(other.tex);
+                handle = std::exchange(other.handle, nullptr);
+                retireTime = other.retireTime;
+            }
+            return *this;
+        }
+
+        RetiredSharedResource(const RetiredSharedResource&) = delete;
+        RetiredSharedResource& operator=(const RetiredSharedResource&) = delete;
     };
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_ringTex[3];
@@ -289,19 +314,22 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         }
 
         m_context->Flush();
+
+        // Wymuszenie gotowości dla wrappera - pierwsza czarna klatka zapobiega zawieszeniu przy statycznym pulpicie
+        m_width.store(m_targetWidth, std::memory_order_relaxed);
+        m_height.store(m_targetHeight, std::memory_order_relaxed);
+        m_sharedHandle.store(m_publicSharedHandle, std::memory_order_release);
+        m_firstFrameCaptured.store(true, std::memory_order_release);
+
         return true;
     }
 
-    void CleanupRetiredResources() {
+    void CleanupRetiredResources(bool force = false) {
         std::lock_guard<std::mutex> lock(m_retiredMutex);
         auto now = std::chrono::steady_clock::now();
 
         for (auto it = m_retiredResources.begin(); it != m_retiredResources.end();) {
-            // Pozwalamy zasobom żyć przez 2 sekundy, aby Electron zdążył je zwolnić
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - it->retireTime).count() > 2000) {
-                if (it->handle) {
-                    CloseHandle(it->handle);
-                }
+            if (force || std::chrono::duration_cast<std::chrono::milliseconds>(now - it->retireTime).count() > 2000) {
                 it = m_retiredResources.erase(it);
             } else {
                 ++it;
@@ -328,11 +356,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         // 3. Zamiast zamykać od razu, przenieś do "poczekalni"
         if (m_publicSharedTex || m_publicSharedHandle) {
             std::lock_guard<std::mutex> lock(m_retiredMutex);
-            m_retiredResources.push_back({
-                m_publicSharedTex,
-                m_publicSharedHandle,
-                std::chrono::steady_clock::now()
-                });
+            m_retiredResources.emplace_back(m_publicSharedTex, m_publicSharedHandle, std::chrono::steady_clock::now());
         }
 
         m_publicSharedTex = nullptr;
@@ -376,7 +400,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         }
 
         // Ignoruj ramki typu mouse-only lub puste aktualizacje (dirty rects == 0)
-        if (frameInfo.AccumulatedFrames == 0) {
+        if (frameInfo.AccumulatedFrames == 0 && m_firstFrameCaptured.load(std::memory_order_acquire)) {
             m_duplication->ReleaseFrame();
             return true;
         }

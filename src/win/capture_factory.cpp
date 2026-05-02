@@ -106,20 +106,46 @@ class WindowsPlatformCapture final : public IPlatformCapture {
     // Proxy methods to active backend
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
         std::lock_guard lock(m_activeMutex);
+        if (m_pendingCapture && m_pendingCapture->GetWidth() > 0) return m_pendingCapture->GetSharedHandle();
         return m_activeCapture ? m_activeCapture->GetSharedHandle() : std::nullopt;
     }
 
     std::optional<std::vector<uint8_t>> GetPixelData(std::string_view desiredFormat) const override {
         std::lock_guard lock(m_activeMutex);
+        if (m_pendingCapture && m_pendingCapture->GetWidth() > 0) return m_pendingCapture->GetPixelData(desiredFormat);
         return m_activeCapture ? m_activeCapture->GetPixelData(desiredFormat) : std::nullopt;
     }
 
-    int GetWidth() const override { std::lock_guard lock(m_activeMutex); return m_activeCapture ? m_activeCapture->GetWidth() : 0; }
-    int GetHeight() const override { std::lock_guard lock(m_activeMutex); return m_activeCapture ? m_activeCapture->GetHeight() : 0; }
-    int GetStride() const override { std::lock_guard lock(m_activeMutex); return m_activeCapture ? m_activeCapture->GetStride() : 0; }
-    uint32_t GetPixelFormat() const override { std::lock_guard lock(m_activeMutex); return m_activeCapture ? m_activeCapture->GetPixelFormat() : 0; }
-    std::string GetBackendName() const override { std::lock_guard lock(m_activeMutex); return m_activeCapture ? m_activeCapture->GetBackendName() : "windows-wrapper"; }
-    int GetFps() const override { std::lock_guard lock(m_activeMutex); return m_activeCapture ? m_activeCapture->GetFps() : 0; }
+    int GetWidth() const override {
+        std::lock_guard lock(m_activeMutex);
+        if (m_pendingCapture && m_pendingCapture->GetWidth() > 0) return m_pendingCapture->GetWidth();
+        return m_activeCapture ? m_activeCapture->GetWidth() : 0;
+    }
+    int GetHeight() const override {
+        std::lock_guard lock(m_activeMutex);
+        if (m_pendingCapture && m_pendingCapture->GetHeight() > 0) return m_pendingCapture->GetHeight();
+        return m_activeCapture ? m_activeCapture->GetHeight() : 0;
+    }
+    int GetStride() const override {
+        std::lock_guard lock(m_activeMutex);
+        if (m_pendingCapture && m_pendingCapture->GetWidth() > 0) return m_pendingCapture->GetStride();
+        return m_activeCapture ? m_activeCapture->GetStride() : 0;
+    }
+    uint32_t GetPixelFormat() const override {
+        std::lock_guard lock(m_activeMutex);
+        if (m_pendingCapture && m_pendingCapture->GetWidth() > 0) return m_pendingCapture->GetPixelFormat();
+        return m_activeCapture ? m_activeCapture->GetPixelFormat() : 0;
+    }
+    std::string GetBackendName() const override {
+        std::lock_guard lock(m_activeMutex);
+        if (m_pendingCapture && m_pendingCapture->GetWidth() > 0) return m_pendingCapture->GetBackendName();
+        return m_activeCapture ? m_activeCapture->GetBackendName() : "windows-wrapper";
+    }
+    int GetFps() const override {
+        std::lock_guard lock(m_activeMutex);
+        if (m_pendingCapture && m_pendingCapture->GetWidth() > 0) return m_pendingCapture->GetFps();
+        return m_activeCapture ? m_activeCapture->GetFps() : 0;
+    }
 
     void SetFrameAvailableCallback(std::function<void()> callback) override {
         std::lock_guard lock(m_callbackMutex);
@@ -153,6 +179,8 @@ class WindowsPlatformCapture final : public IPlatformCapture {
 
     mutable std::mutex m_activeMutex;
     std::unique_ptr<IPlatformCapture> m_activeCapture;
+    std::unique_ptr<IPlatformCapture> m_pendingCapture;
+    std::unique_ptr<IPlatformCapture> m_zombieCapture;
 
     std::jthread m_thread;
     std::condition_variable_any m_cv;
@@ -190,9 +218,9 @@ class WindowsPlatformCapture final : public IPlatformCapture {
             uint64_t newGeneration = m_captureGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
 
             // 2. Tworzymy i uruchamiamy NOWY backend bez zabijania starego
-            auto nextCapture = CreateInternalCapture(m_monitors[target].handle);
-            if (nextCapture) {
-                nextCapture->SetFrameAvailableCallback([this, newGeneration]() {
+            auto next = CreateInternalCapture(m_monitors[target].handle);
+            if (next) {
+                next->SetFrameAvailableCallback([this, newGeneration]() {
                     // Odrzucamy callbacki z poprzednich generacji (starych backendów)
                     if (m_captureGeneration.load(std::memory_order_acquire) != newGeneration) {
                         return;
@@ -202,11 +230,15 @@ class WindowsPlatformCapture final : public IPlatformCapture {
                     if (cb) cb();
                     });
 
-                nextCapture->Start(nullptr);
+                {
+                    std::lock_guard lock(m_activeMutex);
+                    m_pendingCapture = std::move(next);
+                }
+                m_pendingCapture->Start(nullptr);
 
                 // 3. SEAMLESS HANDOFF: Czekamy, aż nowy backend faktycznie ma klatkę (do 3 sekund)
                 for (int i = 0; i < 300; ++i) {
-                    if (nextCapture->GetWidth() > 0 && nextCapture->GetSharedHandle().has_value()) {
+                    if (m_pendingCapture->GetWidth() > 0 && m_pendingCapture->GetSharedHandle().has_value()) {
                         break;
                     }
                     if (st.stop_requested()) break;
@@ -215,13 +247,19 @@ class WindowsPlatformCapture final : public IPlatformCapture {
 
                 // 4. Atomowa podmiana - w tym momencie JS zacznie dostawać nowe uchwyty
                 std::unique_ptr<IPlatformCapture> oldCapture;
-                std::lock_guard lock(m_activeMutex);
-                oldCapture = std::move(m_activeCapture);
-                m_activeCapture = std::move(nextCapture);
-                m_currentIdx.store(target);
+                {
+                    std::lock_guard lock(m_activeMutex);
+                    oldCapture = std::move(m_activeCapture);
+                    m_activeCapture = std::move(m_pendingCapture);
+                    m_currentIdx.store(target);
+                }
 
                 // 5. Dopiero teraz bezpiecznie zamykamy stary backend
-                if (oldCapture) oldCapture->Stop();
+                if (oldCapture) {
+                    oldCapture->Stop();
+                    // Przenosimy do zombie - zostanie trwale zniszczony DOPIERO przy kolejnej zmianie monitora
+                    m_zombieCapture = std::move(oldCapture);
+                }
             }
         }
     }
@@ -261,7 +299,7 @@ std::unique_ptr<IPlatformCapture> WindowsPlatformCapture::CreateInternalCapture(
         if (backend == "dxgi") return CreateDXGICapture(mon);
         if (backend == "gdi") return CreateGDICapture(mon);
         return nullptr;
-        }
+    }
 
 #if HAS_WINRT_CAPTURE
     if (IsWinRTCaptureAvailable()) {
