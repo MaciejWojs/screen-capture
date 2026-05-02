@@ -194,19 +194,13 @@ class WinPlatformCapture final : public IPlatformCapture {
             return std::nullopt;
         }
 
-        HANDLE duplicate = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            sc_logger::Error("GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
-            return std::nullopt;
-        }
-
         SharedHandleInfo info;
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
         info.width = m_width;
         info.height = m_height;
         info.stride = static_cast<uint32_t>(m_width * 4);
         info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
-        sc_logger::Info("GetSharedHandle succeeded: handle={}, size={}x{}", reinterpret_cast<void*>(duplicate), m_width, m_height);
+        sc_logger::Info("GetSharedHandle succeeded: handle={}, size={}x{}", reinterpret_cast<void*>(handle), m_width, m_height);
         return info;
     }
 

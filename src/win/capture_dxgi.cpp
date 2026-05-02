@@ -90,20 +90,14 @@ class DXGIPlatformCapture final : public IPlatformCapture {
 
         if (!handle || w == 0 || h == 0) return std::nullopt;
 
-        HANDLE duplicate = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            sc_logger::Error("DXGI GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
-            return std::nullopt;
-        }
-
         SharedHandleInfo info;
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
         info.width = w;
         info.height = h;
         info.stride = w * 4;
         info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
 
-        sc_logger::Debug("DXGI GetSharedHandle: duplicated handle={}", reinterpret_cast<void*>(duplicate));
+        sc_logger::Debug("DXGI GetSharedHandle: handle={}", reinterpret_cast<void*>(handle));
         return info;
     }
 

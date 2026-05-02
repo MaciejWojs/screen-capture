@@ -86,13 +86,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         std::optional<std::vector<uint8_t>> pixelData;
 
         ~FrameCallbackPayload() {
-            if (sharedHandle && sharedHandle->handle) {
-#ifdef _WIN32
-                CloseHandle(reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(sharedHandle->handle)));
-#else
-                close(static_cast<int>(sharedHandle->handle));
-#endif
-            }
+            // Handles are managed by the platform capture backend to ensure stability for Electron/Chromium.
         }
     };
 
@@ -337,6 +331,10 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     }
 
     Napi::Value NextMonitor(const Napi::CallbackInfo& info) {
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            m_pendingFrame.reset();
+        }
         if (m_backend) {
             m_backend->NextMonitor();
         }
@@ -347,6 +345,11 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         if (info.Length() == 0 || !info[0].IsNumber()) {
             Napi::TypeError::New(info.Env(), "selectMonitor requires an index number").ThrowAsJavaScriptException();
             return info.Env().Undefined();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            m_pendingFrame.reset();
         }
 
         int index = info[0].As<Napi::Number>().Int32Value();
@@ -409,6 +412,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             if (m_backend) {
                 m_backend->Stop();
             }
+            m_pendingFrame.reset();
 
             m_backend = std::move(nextBackend);
         }
