@@ -263,6 +263,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     IDirect3DDevice m_winrtDevice{ nullptr };
     com_ptr<ID3D11Texture2D> m_sharedTex[2];
     HANDLE m_sharedHandleInternal[2]{ nullptr, nullptr };
+    com_ptr<ID3D11Query> m_query[2];
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
     int m_currentIndex = 0;
 
@@ -392,6 +393,7 @@ class WinPlatformCapture final : public IPlatformCapture {
                 CloseHandle(m_sharedHandleInternal[i]);
                 m_sharedHandleInternal[i] = nullptr;
             }
+            m_query[i] = nullptr;
         }
         m_device = nullptr;
         m_context = nullptr;
@@ -485,6 +487,11 @@ class WinPlatformCapture final : public IPlatformCapture {
 
         sc_logger::Info("Creating shared texture before frame pool {}x{}", size.Width, size.Height);
         CreateOrRecreateSharedTexture();
+
+        D3D11_QUERY_DESC qDesc = { D3D11_QUERY_EVENT, 0 };
+        for (int i = 0; i < 2; i++) {
+            check_hresult(m_device->CreateQuery(&qDesc, m_query[i].put()));
+        }
 
         sc_logger::Info("Creating frame pool {}x{}", size.Width, size.Height);
         m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -632,7 +639,16 @@ class WinPlatformCapture final : public IPlatformCapture {
             }
 
             localContext->CopyResource(localSharedTex.get(), srcTex.get());
-            localContext->Flush();
+
+            if (m_query[m_currentIndex]) {
+                localContext->End(m_query[m_currentIndex].get());
+                localContext->Flush();
+                while (localContext->GetData(m_query[m_currentIndex].get(), nullptr, 0, 0) != S_OK) {
+                    if (!m_running.load(std::memory_order_acquire)) break;
+                    Sleep(0);
+                }
+            }
+
             m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex]);
 
             InvokeFrameAvailableCallback();

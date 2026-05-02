@@ -42,10 +42,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                 return;
             }
 
-            // Main capture loop
             while (!stopToken.stop_requested()) {
                 if (!CaptureFrame(stopToken)) {
-                    sc_logger::Info("DXGI: Session lost, reinitializing...");
+                    if (stopToken.stop_requested()) break;
+                    sc_logger::Warn("DXGI: Capture session interrupted, reinitializing...");
                     CleanupDirect3D();
 
                     while (!stopToken.stop_requested()) {
@@ -54,7 +54,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                             break;
                         }
                         std::unique_lock lock(m_reinitMutex);
-                        m_reinitCv.wait_for(lock, std::chrono::milliseconds(100),
+                        m_reinitCv.wait_for(lock, std::chrono::milliseconds(250),
                             [&stopToken] { return stopToken.stop_requested(); });
                     }
                 }
@@ -79,9 +79,16 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        // HANDLE handle = m_sharedHandle.load();
+        // Nie zwracaj uchwytu, jeśli nie mamy jeszcze ani jednej rzeczywistej klatki
+        if (!m_firstFrameCaptured.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+
         HANDLE handle = m_sharedHandle.load(std::memory_order_acquire);
-        if (!handle) return std::nullopt;
+        uint32_t w = m_width.load(std::memory_order_relaxed);
+        uint32_t h = m_height.load(std::memory_order_relaxed);
+
+        if (!handle || w == 0 || h == 0) return std::nullopt;
 
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
@@ -90,23 +97,22 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         }
 
         SharedHandleInfo info;
-        // info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
         info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
-        info.width = m_width;
-        info.height = m_height;
-        info.stride = m_width * 4;
+        info.width = w;
+        info.height = h;
+        info.stride = w * 4;
         info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
 
         sc_logger::Debug("DXGI GetSharedHandle: duplicated handle={}", reinterpret_cast<void*>(duplicate));
         return info;
     }
 
-    int GetWidth() const override { return static_cast<int>(m_width); }
-    int GetHeight() const override { return static_cast<int>(m_height); }
-    int GetStride() const override { return static_cast<int>(m_width * 4); }
+    int GetWidth() const override { return static_cast<int>(m_width.load(std::memory_order_relaxed)); }
+    int GetHeight() const override { return static_cast<int>(m_height.load(std::memory_order_relaxed)); }
+    int GetStride() const override { return static_cast<int>(m_width.load(std::memory_order_relaxed) * 4); }
     uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
     std::string GetBackendName() const override { return "dxgi"; }
-    int GetFps() const override { return m_lastFps.load(); }
+    int GetFps() const override { return m_lastFps.load(std::memory_order_relaxed); }
 
     void SetFrameAvailableCallback(std::function<void()> callback) override {
         std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
@@ -136,15 +142,19 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> m_duplication;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex[2];
     HANDLE m_sharedHandleInternal[2]{ nullptr, nullptr };
+    Microsoft::WRL::ComPtr<ID3D11Query> m_query[2];
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
     int m_currentIndex = 0;
 
     std::function<void()> m_frameAvailableCallback;
     std::mutex m_frameCallbackMutex;
 
-    uint32_t m_width = 0;
-    uint32_t m_height = 0;
+    std::atomic<uint32_t> m_width{ 0 };
+    std::atomic<uint32_t> m_height{ 0 };
+    uint32_t m_targetWidth = 0;
+    uint32_t m_targetHeight = 0;
 
+    std::atomic<bool> m_firstFrameCaptured{ false };
     std::atomic<uint64_t> m_frameCount{ 0 };
     std::atomic<int> m_lastFps{ 0 };
     std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
@@ -166,6 +176,8 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     bool InitializeDirect3D() {
+        CleanupDirect3D();
+
         Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
 
@@ -188,7 +200,12 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
+        D3D_FEATURE_LEVEL levels[] = {
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1
+        };
+
         HRESULT hr = D3D11CreateDevice(
             targetAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -201,7 +218,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        hr = targetOutput->DuplicateOutput(m_device.Get(), &m_duplication);
+        hr = targetOutput->DuplicateOutput(m_device.Get(), m_duplication.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             sc_logger::Error("DXGI: DuplicateOutput failed with 0x{:08X}", hr);
             return false;
@@ -214,13 +231,14 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        m_width = desc.ModeDesc.Width;
-        m_height = desc.ModeDesc.Height;
-        sc_logger::Info("DXGI: capture size {}x{}", m_width, m_height);
+        m_targetWidth = desc.ModeDesc.Width;
+        m_targetHeight = desc.ModeDesc.Height;
+        sc_logger::Info("DXGI: target capture size {}x{}", m_targetWidth, m_targetHeight);
+        m_firstFrameCaptured.store(false, std::memory_order_release);
 
         D3D11_TEXTURE2D_DESC texDesc = {};
-        texDesc.Width = m_width;
-        texDesc.Height = m_height;
+        texDesc.Width = m_targetWidth;
+        texDesc.Height = m_targetHeight;
         texDesc.MipLevels = 1;
         texDesc.ArraySize = 1;
         texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -231,25 +249,59 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
         for (int i = 0; i < 2; i++) {
-            hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex[i]);
-            if (FAILED(hr)) return false;
+            hr = m_device->CreateTexture2D(&texDesc, nullptr, m_sharedTex[i].ReleaseAndGetAddressOf());
+            if (FAILED(hr)) {
+                sc_logger::Error("DXGI: Failed to create shared texture {}", i);
+                return false;
+            }
+
+            // Clear textures to black to prevent white flashes or garbage data during transitions
+            float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
+            if (SUCCEEDED(m_device->CreateRenderTargetView(m_sharedTex[i].Get(), nullptr, &rtv))) {
+                m_context->ClearRenderTargetView(rtv.Get(), black);
+            }
 
             Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
             m_sharedTex[i].As(&dxgiRes);
             hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &m_sharedHandleInternal[i]);
+            if (FAILED(hr)) {
+                sc_logger::Error("DXGI: Failed to create shared handle {}", i);
+                return false;
+            }
+        }
+
+        D3D11_QUERY_DESC qDesc = { D3D11_QUERY_EVENT, 0 };
+        for (int i = 0; i < 2; i++) {
+            hr = m_device->CreateQuery(&qDesc, m_query[i].ReleaseAndGetAddressOf());
             if (FAILED(hr)) return false;
         }
 
-        m_sharedHandle.store(m_sharedHandleInternal[0]);
+        m_context->Flush();
         return true;
     }
 
     void CleanupDirect3D() {
-        m_sharedHandle.store(nullptr);
+        // 1. Od razu unieważnij publiczny uchwyt i stan gotowości
+        m_sharedHandle.store(nullptr, std::memory_order_release);
+        m_width.store(0, std::memory_order_relaxed);
+        m_height.store(0, std::memory_order_relaxed);
+        m_firstFrameCaptured.store(false, std::memory_order_release);
+
+        // 2. Poczekaj na zakończenie poleceń GPU (np. CopyResource)
+        if (m_context) {
+            m_context->Flush();
+            // Daj GPU chwilę na domknięcie operacji przed zwolnieniem uchwytów
+            std::this_thread::sleep_for(std::chrono::milliseconds(32));
+            m_context->ClearState();
+        }
+
+        // 3. Teraz bezpiecznie zamknij lokalne uchwyty i zwolnij tekstury
         for (int i = 0; i < 2; i++) {
             if (m_sharedHandleInternal[i]) CloseHandle(m_sharedHandleInternal[i]);
             m_sharedHandleInternal[i] = nullptr;
             m_sharedTex[i] = nullptr;
+            m_query[i] = nullptr;
         }
         m_duplication = nullptr;
         m_context = nullptr;
@@ -269,6 +321,11 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             return true;
         }
+        if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_SESSION_DISCONNECTED) {
+            sc_logger::Info("DXGI: Access lost or session disconnected (0x{:08X})", hr);
+            return false;
+        }
+
         if (FAILED(hr)) {
             sc_logger::Warn("DXGI: AcquireNextFrame failed with 0x{:08X}", hr);
             return false;
@@ -279,22 +336,46 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        // We only care about AccumulatedFrames. LastPresentTime can be 0 even for valid 
-        // frames on some systems/drivers, leading to rhythmic stuttering if discarded.
-        // Mouse-only updates (AccumulatedFrames == 0) are handled by ReleaseFrame without copy.
+        // Skip mouse-only frames during initialization to prevent flashes of uninitialized textures.
+        // Chromium's GPU process can crash if we provide textures that aren't fully ready.
+       // DOBRZE:
         if (frameInfo.AccumulatedFrames == 0) {
             m_duplication->ReleaseFrame();
             return true;
         }
 
-        m_frameCount++;
-
-        m_currentIndex = (m_currentIndex + 1) % 2;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> desktopTexture;
         if (SUCCEEDED(desktopResource.As(&desktopTexture))) {
+            D3D11_TEXTURE2D_DESC texDesc;
+            desktopTexture->GetDesc(&texDesc);
+
+            if (texDesc.Width != m_targetWidth || texDesc.Height != m_targetHeight) {
+                sc_logger::Info("DXGI: Surface size mismatch (prawdopodobnie zmiana rozdzielczości), reinit.");
+                m_duplication->ReleaseFrame();
+                return false;
+            }
+
+            m_currentIndex = (m_currentIndex + 1) % 2;
             m_context->CopyResource(m_sharedTex[m_currentIndex].Get(), desktopTexture.Get());
-            m_context->Flush();
-            m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex]);
+
+            if (m_query[m_currentIndex]) {
+                m_context->End(m_query[m_currentIndex].Get());
+                m_context->Flush();
+                while (m_context->GetData(m_query[m_currentIndex].Get(), nullptr, 0, 0) != S_OK) {
+                    if (stopToken.stop_requested()) return false;
+                    Sleep(0);
+                }
+            }
+
+            m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex], std::memory_order_release);
+            if (!m_firstFrameCaptured.load(std::memory_order_acquire)) {
+                m_width.store(m_targetWidth, std::memory_order_relaxed);
+                m_height.store(m_targetHeight, std::memory_order_relaxed);
+                m_firstFrameCaptured.store(true, std::memory_order_release);
+                sc_logger::Info("DXGI: First frame captured, backend ready");
+            }
+
+            m_frameCount++;
             InvokeFrameAvailableCallback();
         }
 

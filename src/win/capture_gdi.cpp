@@ -123,6 +123,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingTex;
+    Microsoft::WRL::ComPtr<ID3D11Query> m_query;
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
 
     std::function<void()> m_frameAvailableCallback;
@@ -186,6 +187,9 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
                 }
             }
         }
+
+        D3D11_QUERY_DESC qDesc = { D3D11_QUERY_EVENT, 0 };
+        m_device->CreateQuery(&qDesc, &m_query);
     }
 
     void CleanupDirect3D() {
@@ -195,6 +199,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         m_stagingTex = nullptr;
         m_context = nullptr;
         m_device = nullptr;
+        m_query = nullptr;
     }
 
     void CaptureScreenGDI() {
@@ -240,7 +245,15 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             }
             m_context->Unmap(m_stagingTex.Get(), 0);
             m_context->CopyResource(m_sharedTex.Get(), m_stagingTex.Get());
-            m_context->Flush();
+
+            if (m_query) {
+                m_context->End(m_query.Get());
+                m_context->Flush();
+                while (m_context->GetData(m_query.Get(), nullptr, 0, 0) != S_OK) {
+                    Sleep(0);
+                }
+            }
+
             InvokeFrameAvailableCallback();
         }
 
