@@ -189,6 +189,8 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     void CleanupDirect3D() {
         HANDLE handle = m_sharedHandle.exchange(nullptr);
         if (handle) CloseHandle(handle);
+        m_width = 0;
+        m_height = 0;
         m_sharedTex = nullptr;
         m_stagingTex = nullptr;
         m_context = nullptr;

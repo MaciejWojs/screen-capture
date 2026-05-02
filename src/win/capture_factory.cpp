@@ -148,6 +148,7 @@ class WindowsPlatformCapture final : public IPlatformCapture {
     std::vector<WindowsMonitor> m_monitors;
     std::atomic<int> m_currentIdx{ 0 };
     std::atomic<int> m_requestedIdx{ -1 };
+    std::atomic<uint64_t> m_captureGeneration{ 0 };
     std::atomic<bool> m_running{ false };
 
     mutable std::mutex m_activeMutex;
@@ -185,26 +186,42 @@ class WindowsPlatformCapture final : public IPlatformCapture {
             if (target == -1) target = m_currentIdx.load();
             if (target >= (int)m_monitors.size()) continue;
 
-            std::unique_ptr<IPlatformCapture> oldCapture;
-            {
-                std::lock_guard lock(m_activeMutex);
-                oldCapture = std::move(m_activeCapture);
-            }
+            // 1. Zwiększamy generację przed stworzeniem nowego backendu
+            uint64_t newGeneration = m_captureGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
 
-            if (oldCapture) oldCapture->Stop();
-
+            // 2. Tworzymy i uruchamiamy NOWY backend bez zabijania starego
             auto nextCapture = CreateInternalCapture(m_monitors[target].handle);
             if (nextCapture) {
-                nextCapture->SetFrameAvailableCallback([this]() {
+                nextCapture->SetFrameAvailableCallback([this, newGeneration]() {
+                    // Odrzucamy callbacki z poprzednich generacji (starych backendów)
+                    if (m_captureGeneration.load(std::memory_order_acquire) != newGeneration) {
+                        return;
+                    }
                     std::function<void()> cb;
                     { std::lock_guard cbLock(m_callbackMutex); cb = m_userCallback; }
                     if (cb) cb();
                     });
+
                 nextCapture->Start(nullptr);
 
+                // 3. SEAMLESS HANDOFF: Czekamy, aż nowy backend faktycznie ma klatkę (do 3 sekund)
+                for (int i = 0; i < 300; ++i) {
+                    if (nextCapture->GetWidth() > 0 && nextCapture->GetSharedHandle().has_value()) {
+                        break;
+                    }
+                    if (st.stop_requested()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+
+                // 4. Atomowa podmiana - w tym momencie JS zacznie dostawać nowe uchwyty
+                std::unique_ptr<IPlatformCapture> oldCapture;
                 std::lock_guard lock(m_activeMutex);
+                oldCapture = std::move(m_activeCapture);
                 m_activeCapture = std::move(nextCapture);
                 m_currentIdx.store(target);
+
+                // 5. Dopiero teraz bezpiecznie zamykamy stary backend
+                if (oldCapture) oldCapture->Stop();
             }
         }
     }
@@ -244,7 +261,7 @@ std::unique_ptr<IPlatformCapture> WindowsPlatformCapture::CreateInternalCapture(
         if (backend == "dxgi") return CreateDXGICapture(mon);
         if (backend == "gdi") return CreateGDICapture(mon);
         return nullptr;
-    }
+        }
 
 #if HAS_WINRT_CAPTURE
     if (IsWinRTCaptureAvailable()) {
@@ -254,7 +271,7 @@ std::unique_ptr<IPlatformCapture> WindowsPlatformCapture::CreateInternalCapture(
     if (auto cap = CreateDXGICapture(mon)) return cap;
     return CreateGDICapture(mon);
 #endif
-    }
+}
 
 std::unique_ptr<IPlatformCapture> CreatePlatformCapture(const std::string& forceBackend) {
     return std::make_unique<WindowsPlatformCapture>(forceBackend);

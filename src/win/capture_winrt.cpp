@@ -394,6 +394,8 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_deviceReady.store(false, std::memory_order_release);
         m_textureReady.store(false, std::memory_order_release);
         m_captureStarted.store(false, std::memory_order_release);
+        m_width = 0;
+        m_height = 0;
 
         m_sharedHandle.store(nullptr);
 

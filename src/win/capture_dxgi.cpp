@@ -134,11 +134,24 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> m_duplication;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex[2];
-    HANDLE m_sharedHandleInternal[2]{ nullptr, nullptr };
-    Microsoft::WRL::ComPtr<ID3D11Query> m_query[2];
+
+    struct RetiredSharedResource {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+        HANDLE handle = nullptr;
+        std::chrono::steady_clock::time_point retireTime;
+    };
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_ringTex[3];
+    Microsoft::WRL::ComPtr<ID3D11Query> m_ringQuery[3];
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_publicSharedTex;
+    Microsoft::WRL::ComPtr<ID3D11Query> m_publicQuery;
+    HANDLE m_publicSharedHandle = nullptr;
+
+    std::vector<RetiredSharedResource> m_retiredResources;
+    mutable std::mutex m_retiredMutex;
+
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
-    int m_currentIndex = 0;
+    int m_ringIndex = 0;
 
     std::function<void()> m_frameAvailableCallback;
     std::mutex m_frameCallbackMutex;
@@ -229,73 +242,105 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         m_targetHeight = desc.ModeDesc.Height;
         sc_logger::Info("DXGI: target capture size {}x{}", m_targetWidth, m_targetHeight);
         m_firstFrameCaptured.store(false, std::memory_order_release);
+        m_ringIndex = 0;
 
-        D3D11_TEXTURE2D_DESC texDesc = {};
-        texDesc.Width = m_targetWidth;
-        texDesc.Height = m_targetHeight;
-        texDesc.MipLevels = 1;
-        texDesc.ArraySize = 1;
-        texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        texDesc.SampleDesc.Count = 1;
-        texDesc.Usage = D3D11_USAGE_DEFAULT;
-        texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        texDesc.CPUAccessFlags = 0;
-        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
-
-        for (int i = 0; i < 2; i++) {
-            hr = m_device->CreateTexture2D(&texDesc, nullptr, m_sharedTex[i].ReleaseAndGetAddressOf());
-            if (FAILED(hr)) {
-                sc_logger::Error("DXGI: Failed to create shared texture {}", i);
-                return false;
-            }
-
-            // Clear textures to black to prevent white flashes or garbage data during transitions
-            float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-            Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
-            if (SUCCEEDED(m_device->CreateRenderTargetView(m_sharedTex[i].Get(), nullptr, &rtv))) {
-                m_context->ClearRenderTargetView(rtv.Get(), black);
-            }
-
-            Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
-            m_sharedTex[i].As(&dxgiRes);
-            hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &m_sharedHandleInternal[i]);
-            if (FAILED(hr)) {
-                sc_logger::Error("DXGI: Failed to create shared handle {}", i);
-                return false;
-            }
-        }
+        D3D11_TEXTURE2D_DESC descRing = {};
+        descRing.Width = m_targetWidth;
+        descRing.Height = m_targetHeight;
+        descRing.MipLevels = 1;
+        descRing.ArraySize = 1;
+        descRing.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        descRing.SampleDesc.Count = 1;
+        descRing.Usage = D3D11_USAGE_DEFAULT;
+        descRing.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
         D3D11_QUERY_DESC qDesc = { D3D11_QUERY_EVENT, 0 };
-        for (int i = 0; i < 2; i++) {
-            hr = m_device->CreateQuery(&qDesc, m_query[i].ReleaseAndGetAddressOf());
-            if (FAILED(hr)) return false;
+
+        for (int i = 0; i < 3; i++) {
+            if (FAILED(m_device->CreateTexture2D(&descRing, nullptr, &m_ringTex[i]))) return false;
+            if (FAILED(m_device->CreateQuery(&qDesc, &m_ringQuery[i]))) return false;
+        }
+
+        // Tekstura publiczna (stabilny HANDLE dla Electrona)
+        D3D11_TEXTURE2D_DESC descPublic = descRing;
+        descPublic.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+
+        hr = m_device->CreateTexture2D(&descPublic, nullptr, &m_publicSharedTex);
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: Failed to create public shared texture");
+            return false;
+        }
+
+        if (FAILED(m_device->CreateQuery(&qDesc, &m_publicQuery))) return false;
+
+        // Czyszczenie na czarno tekstury publicznej
+        float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
+        if (SUCCEEDED(m_device->CreateRenderTargetView(m_publicSharedTex.Get(), nullptr, &rtv))) {
+            m_context->ClearRenderTargetView(rtv.Get(), black);
+        }
+
+        Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
+        m_publicSharedTex.As(&dxgiRes);
+        hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &m_publicSharedHandle);
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: Failed to create stable public shared handle");
+            return false;
         }
 
         m_context->Flush();
         return true;
     }
 
+    void CleanupRetiredResources() {
+        std::lock_guard<std::mutex> lock(m_retiredMutex);
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto it = m_retiredResources.begin(); it != m_retiredResources.end();) {
+            // Pozwalamy zasobom żyć przez 2 sekundy, aby Electron zdążył je zwolnić
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - it->retireTime).count() > 2000) {
+                if (it->handle) {
+                    CloseHandle(it->handle);
+                }
+                it = m_retiredResources.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     void CleanupDirect3D() {
         // 1. Od razu unieważnij publiczny uchwyt i stan gotowości
         m_sharedHandle.store(nullptr, std::memory_order_release);
+        m_firstFrameCaptured.store(false, std::memory_order_release);
         m_width.store(0, std::memory_order_relaxed);
         m_height.store(0, std::memory_order_relaxed);
-        m_firstFrameCaptured.store(false, std::memory_order_release);
+        m_targetWidth = 0;
+        m_targetHeight = 0;
+        m_ringIndex = 0;
 
         // 2. Poczekaj na zakończenie poleceń GPU (np. CopyResource)
         if (m_context) {
             m_context->Flush();
-            // Daj GPU chwilę na domknięcie operacji przed zwolnieniem uchwytów
-            std::this_thread::sleep_for(std::chrono::milliseconds(32));
             m_context->ClearState();
         }
 
-        // 3. Teraz bezpiecznie zamknij lokalne uchwyty i zwolnij tekstury
-        for (int i = 0; i < 2; i++) {
-            if (m_sharedHandleInternal[i]) CloseHandle(m_sharedHandleInternal[i]);
-            m_sharedHandleInternal[i] = nullptr;
-            m_sharedTex[i] = nullptr;
-            m_query[i] = nullptr;
+        // 3. Zamiast zamykać od razu, przenieś do "poczekalni"
+        if (m_publicSharedTex || m_publicSharedHandle) {
+            std::lock_guard<std::mutex> lock(m_retiredMutex);
+            m_retiredResources.push_back({
+                m_publicSharedTex,
+                m_publicSharedHandle,
+                std::chrono::steady_clock::now()
+                });
+        }
+
+        m_publicSharedTex = nullptr;
+        m_publicSharedHandle = nullptr;
+
+        for (int i = 0; i < 3; i++) {
+            m_ringTex[i] = nullptr;
+            m_ringQuery[i] = nullptr;
         }
         m_duplication = nullptr;
         m_context = nullptr;
@@ -330,13 +375,13 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        // Skip mouse-only frames during initialization to prevent flashes of uninitialized textures.
-        // Chromium's GPU process can crash if we provide textures that aren't fully ready.
-       // DOBRZE:
+        // Ignoruj ramki typu mouse-only lub puste aktualizacje (dirty rects == 0)
         if (frameInfo.AccumulatedFrames == 0) {
             m_duplication->ReleaseFrame();
             return true;
         }
+
+        CleanupRetiredResources();
 
         Microsoft::WRL::ComPtr<ID3D11Texture2D> desktopTexture;
         if (SUCCEEDED(desktopResource.As(&desktopTexture))) {
@@ -349,19 +394,35 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                 return false;
             }
 
-            m_currentIndex = (m_currentIndex + 1) % 2;
-            m_context->CopyResource(m_sharedTex[m_currentIndex].Get(), desktopTexture.Get());
+            // 1. Kopiuj desktop do ring bufora (staging)
+            m_ringIndex = (m_ringIndex + 1) % 3;
+            m_context->CopyResource(m_ringTex[m_ringIndex].Get(), desktopTexture.Get());
 
-            if (m_query[m_currentIndex]) {
-                m_context->End(m_query[m_currentIndex].Get());
+            if (m_ringQuery[m_ringIndex]) {
+                m_context->End(m_ringQuery[m_ringIndex].Get());
                 m_context->Flush();
-                while (m_context->GetData(m_query[m_currentIndex].Get(), nullptr, 0, 0) != S_OK) {
-                    if (stopToken.stop_requested()) return false;
+                while (m_context->GetData(m_ringQuery[m_ringIndex].Get(), nullptr, 0, 0) != S_OK) {
+                    if (stopToken.stop_requested()) {
+                        m_duplication->ReleaseFrame();
+                        return false;
+                    }
                     Sleep(0);
                 }
             }
 
-            m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex], std::memory_order_release);
+            // 2. Kopiuj z ring do STAŁEJ tekstury publicznej
+            m_context->CopyResource(m_publicSharedTex.Get(), m_ringTex[m_ringIndex].Get());
+
+            if (m_publicQuery) {
+                m_context->End(m_publicQuery.Get());
+                m_context->Flush();
+                while (m_context->GetData(m_publicQuery.Get(), nullptr, 0, 0) != S_OK) {
+                    if (stopToken.stop_requested()) { m_duplication->ReleaseFrame(); return false; }
+                    Sleep(0);
+                }
+            }
+
+            m_sharedHandle.store(m_publicSharedHandle, std::memory_order_release);
             if (!m_firstFrameCaptured.load(std::memory_order_acquire)) {
                 m_width.store(m_targetWidth, std::memory_order_relaxed);
                 m_height.store(m_targetHeight, std::memory_order_relaxed);
