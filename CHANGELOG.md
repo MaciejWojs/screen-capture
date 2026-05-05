@@ -1,3 +1,21 @@
+## <small>0.5.1 (2026-05-05)</small>
+
+* feat: implement zombie capture management for improved resource handling
+* feat: log adapter information during device creation for improved diagnostics
+* feat: enhance pending capture handling for improved seamless transitions and resource management
+* feat: enhance multi-monitor support with improved resource management and seamless backend handoff
+* feat: simplify handle management in platform capture classes for improved stability
+* feat: add query support for improved synchronization in DXGI and GDI capture classes
+* feat: improve resource cleanup in WinPlatformCapture for better handle management
+* feat: enhance cleanup process in platform capture classes for better resource management
+* feat: implement WindowsPlatformCapture for multi-monitor support
+* feat: add support for multiple monitors in platform capture classes
+* feat: streamline PipeWire thread loop management in WaylandPlatformCapture
+* feat: improve cleanup process for shared handles in WaylandPlatformCapture
+* feat: enhance PipeWire stream management with thread-loop locking
+* feat: add monitor management methods for Wayland support
+
+
 ## 0.5.0 (2026-04-30)
 
 * feat: add build:cpp script for node-gyp configuration
