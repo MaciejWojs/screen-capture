@@ -84,6 +84,25 @@ export interface FrameUpdate {
     pixelData: Buffer | null;
 }
 
+export interface MonitorUpdate {
+    /** Backend name, e.g. 'winrt', 'dxgi', 'gdi', 'wayland', 'x11'. */
+    backend: Backend;
+    /** Stable monitor identifier for the active backend. */
+    id: string;
+    /** Human-readable monitor name when available. */
+    name: string;
+    /** Index of the active monitor in backend monitor list. */
+    index: number;
+    /** Monitor top-left X in virtual desktop coordinates. */
+    x: number;
+    /** Monitor top-left Y in virtual desktop coordinates. */
+    y: number;
+    /** Monitor width in pixels. */
+    width: number;
+    /** Monitor height in pixels. */
+    height: number;
+}
+
 export interface IScreenCapture {
     /** Starts the screen capture process. Resolves when the capture backend has completed initialization and the shared handle is ready. */
     start(): Promise<void>;
@@ -99,6 +118,14 @@ export interface IScreenCapture {
      * Unregisters the frame callback previously passed to `onFrame()`.
      */
     offFrame(): void;
+    /**
+     * Registers a callback invoked whenever active monitor selection changes.
+     */
+    onMonitorChanged(callback: (monitor: MonitorUpdate) => void): void;
+    /**
+     * Unregisters monitor-change callback previously passed to `onMonitorChanged()`.
+     */
+    offMonitorChanged(): void;
     /**
      * Retrieves the legacy shared handle information for the latest captured frame.
      * @returns The shared handle info if available, otherwise null.
@@ -239,6 +266,14 @@ class ScreenCaptureWrapper implements IScreenCapture {
 
     offFrame(): void {
         this.inner.offFrame();
+    }
+
+    onMonitorChanged(callback: (monitor: MonitorUpdate) => void): void {
+        this.inner.onMonitorChanged(callback);
+    }
+
+    offMonitorChanged(): void {
+        this.inner.offMonitorChanged();
     }
 
     getSharedHandle(): SharedHandleInfo | null {

@@ -29,6 +29,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             InstanceMethod("getPixelData", &ScreenCapture::GetPixelData),
             InstanceMethod("onFrame", &ScreenCapture::OnFrame),
             InstanceMethod("offFrame", &ScreenCapture::OffFrame),
+            InstanceMethod("onMonitorChanged", &ScreenCapture::OnMonitorChanged),
+            InstanceMethod("offMonitorChanged", &ScreenCapture::OffMonitorChanged),
             InstanceMethod("forceBackend", &ScreenCapture::ForceBackend),
             InstanceMethod("getBackend", &ScreenCapture::GetBackend),
             InstanceMethod("getWidth", &ScreenCapture::GetWidth),
@@ -71,7 +73,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
 
     ~ScreenCapture() override {
         if (m_backend) m_backend->Stop();
-        ResetFrameCallback();
+        ResetCallbacks();
     }
 
     private:
@@ -94,6 +96,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     std::mutex m_callbackMutex;
     Napi::ThreadSafeFunction m_frameCallback;
     bool m_frameCallbackActive = false;
+    Napi::ThreadSafeFunction m_monitorChangedCallback;
+    bool m_monitorChangedCallbackActive = false;
     bool m_frameDispatchScheduled = false;
     std::unique_ptr<FrameCallbackPayload> m_pendingFrame;
 
@@ -110,6 +114,22 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
 
         if (backend) {
             backend->SetFrameAvailableCallback(std::move(callback));
+        }
+    }
+
+    void AttachMonitorChangedCallbackToBackend() {
+        std::function<void()> callback;
+        IPlatformCapture* backend = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            if (m_monitorChangedCallbackActive) {
+                callback = [this]() { NotifyMonitorChanged(); };
+            }
+            backend = m_backend.get();
+        }
+
+        if (backend) {
+            backend->SetMonitorChangedCallback(std::move(callback));
         }
     }
 
@@ -254,16 +274,70 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         }
     }
 
-    void ResetFrameCallback() {
+    void NotifyMonitorChanged() {
+        Napi::ThreadSafeFunction tsfn;
+        std::optional<MonitorMetadata> monitorInfo;
+        std::string backendName = "unknown";
+
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            if (!m_monitorChangedCallbackActive || !m_backend) {
+                return;
+            }
+            tsfn = m_monitorChangedCallback;
+            monitorInfo = m_backend->GetCurrentMonitorInfo();
+            backendName = m_backend->GetBackendName();
+        }
+
+        if (!tsfn) {
+            return;
+        }
+
+        if (!monitorInfo.has_value()) {
+            return;
+        }
+
+        auto status = tsfn.NonBlockingCall([monitorInfo = std::move(monitorInfo), backendName = std::move(backendName)](Napi::Env env, Napi::Function jsCallback) {
+            Napi::Object monitor = Napi::Object::New(env);
+            monitor.Set("backend", Napi::String::New(env, backendName));
+            monitor.Set("id", Napi::String::New(env, monitorInfo->id));
+            monitor.Set("name", Napi::String::New(env, monitorInfo->name));
+            monitor.Set("index", monitorInfo->index);
+            monitor.Set("x", monitorInfo->x);
+            monitor.Set("y", monitorInfo->y);
+            monitor.Set("width", monitorInfo->width);
+            monitor.Set("height", monitorInfo->height);
+
+            try {
+                jsCallback.Call({ monitor });
+            } catch (const Napi::Error& e) {
+                sc_logger::Error("Monitor callback threw JS error: {}", e.Message());
+            } catch (...) {
+                sc_logger::Error("Monitor callback threw unknown JS error");
+            }
+        });
+
+        if (status != napi_ok) {
+            sc_logger::Warn("Failed to queue monitor callback to JS");
+        }
+    }
+
+    void ResetCallbacks() {
         std::lock_guard<std::mutex> lock(m_callbackMutex);
         if (m_backend) {
             m_backend->SetFrameAvailableCallback(nullptr);
+            m_backend->SetMonitorChangedCallback(nullptr);
         }
         if (m_frameCallbackActive) {
             m_frameCallback.Abort();
             m_frameCallback = {};
         }
+        if (m_monitorChangedCallbackActive) {
+            m_monitorChangedCallback.Abort();
+            m_monitorChangedCallback = {};
+        }
         m_frameCallbackActive = false;
+        m_monitorChangedCallbackActive = false;
     }
 
     Napi::Value OnFrame(const Napi::CallbackInfo& info) {
@@ -291,6 +365,47 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         AttachFrameCallbackToBackend();
         sc_logger::Info("ScreenCapture onFrame callback registered");
         return env.Undefined();
+    }
+
+    Napi::Value OnMonitorChanged(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (info.Length() == 0 || info[0].IsNull() || info[0].IsUndefined()) {
+            return OffMonitorChanged(info);
+        }
+        if (!info[0].IsFunction()) {
+            Napi::TypeError::New(env, "onMonitorChanged requires a function callback").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            if (m_monitorChangedCallbackActive) {
+                m_monitorChangedCallback.Abort();
+                m_monitorChangedCallback = {};
+            }
+
+            auto callback = info[0].As<Napi::Function>();
+            m_monitorChangedCallback = Napi::ThreadSafeFunction::New(env, callback, "ScreenCaptureMonitorChangedCallback", 0, 1);
+            m_monitorChangedCallbackActive = true;
+        }
+
+        AttachMonitorChangedCallbackToBackend();
+        NotifyMonitorChanged();
+        sc_logger::Info("ScreenCapture onMonitorChanged callback registered");
+        return env.Undefined();
+    }
+
+    Napi::Value OffMonitorChanged(const Napi::CallbackInfo& info) {
+        std::lock_guard<std::mutex> lock(m_callbackMutex);
+        if (m_monitorChangedCallbackActive) {
+            m_monitorChangedCallback.Abort();
+            m_monitorChangedCallback = {};
+        }
+        m_monitorChangedCallbackActive = false;
+        if (m_backend) {
+            m_backend->SetMonitorChangedCallback(nullptr);
+        }
+        return info.Env().Undefined();
     }
 
     Napi::Value OffFrame(const Napi::CallbackInfo& info) {
@@ -362,6 +477,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     Napi::Value Start(const Napi::CallbackInfo& info) {
         try {
             m_backend->Start(info.Env());
+            NotifyMonitorChanged();
         } catch (const std::exception& e) {
             Napi::Error::New(info.Env(), e.what()).ThrowAsJavaScriptException();
         }
@@ -418,6 +534,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         }
 
         AttachFrameCallbackToBackend();
+        AttachMonitorChangedCallbackToBackend();
+        NotifyMonitorChanged();
 
         return env.Undefined();
     }

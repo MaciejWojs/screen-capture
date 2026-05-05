@@ -22,6 +22,16 @@ struct SharedHandleInfo {
     uint32_t chunkSize = 0;
 };
 
+struct MonitorMetadata {
+    std::string id;
+    std::string name;
+    int index = 0;
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
 
 class IPlatformCapture {
     public:
@@ -41,6 +51,8 @@ class IPlatformCapture {
     virtual int GetCurrentMonitorIndex() const { return 0; }
     virtual void NextMonitor() {}
     virtual void SelectMonitor(int index) {}
+    virtual std::optional<MonitorMetadata> GetCurrentMonitorInfo() const { return std::nullopt; }
+    virtual void SetMonitorChangedCallback(std::function<void()> callback) {}
     // Returns FPS or -1 if not implemented
     virtual int GetFps() const { return -1; }
 };

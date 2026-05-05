@@ -447,6 +447,8 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
 
     std::function<void()> m_frameAvailableCallback;
     std::mutex m_frameCallbackMutex;
+    std::function<void()> m_monitorChangedCallback;
+    std::mutex m_monitorChangedCallbackMutex;
 
     std::mutex m_fpsMutex;
     std::atomic<int64_t> m_frameCount{ 0 };
@@ -477,11 +479,27 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
         m_frameAvailableCallback = std::move(callback);
     }
 
+    void SetMonitorChangedCallback(std::function<void()> callback) override {
+        std::lock_guard<std::mutex> lock(m_monitorChangedCallbackMutex);
+        m_monitorChangedCallback = std::move(callback);
+    }
+
     void InvokeFrameAvailableCallback() {
         std::function<void()> callback;
         {
             std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
             callback = m_frameAvailableCallback;
+        }
+        if (callback) {
+            callback();
+        }
+    }
+
+    void InvokeMonitorChangedCallback() {
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_monitorChangedCallbackMutex);
+            callback = m_monitorChangedCallback;
         }
         if (callback) {
             callback();
@@ -590,6 +608,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     int GetCurrentMonitorIndex() const override;
     void NextMonitor() override;
     void SelectMonitor(int index) override;
+    std::optional<MonitorMetadata> GetCurrentMonitorInfo() const override;
 
     private:
 
@@ -715,6 +734,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                         StopCurrentPipewireStream();
                         CleanupSharedHandleLocked();
                         CreatePipewireStream(m_streamNodeId.load());
+                        InvokeMonitorChangedCallback();
                     }
                 }
             }
@@ -1490,6 +1510,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                     self->m_streamNodeId = self->m_monitors[0].nodeId;
                 }
 
+                self->InvokeMonitorChangedCallback();
+
                 sc_logger::Info("Wayland capture selected {} monitor(s)", static_cast<int>(self->m_monitors.size()));
                 self->OpenPipeWireRemote();
                 return;
@@ -1545,6 +1567,25 @@ void WaylandPlatformCapture::SelectMonitor(int index) {
         m_requestedMonitorIndex.store(index);
         m_captureCv.notify_all();
     }
+}
+
+std::optional<MonitorMetadata> WaylandPlatformCapture::GetCurrentMonitorInfo() const {
+    std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+    const int idx = m_currentMonitorIndex.load();
+    if (idx < 0 || idx >= static_cast<int>(m_monitors.size())) {
+        return std::nullopt;
+    }
+
+    const auto& monitor = m_monitors[idx];
+    MonitorMetadata info;
+    info.id = std::to_string(monitor.nodeId);
+    info.name = !monitor.title.empty() ? monitor.title : monitor.connector;
+    info.index = idx;
+    info.x = monitor.x;
+    info.y = monitor.y;
+    info.width = static_cast<int>(monitor.width);
+    info.height = static_cast<int>(monitor.height);
+    return info;
 }
 
 const pw_stream_events WaylandPlatformCapture::kStreamEvents = [] {
@@ -1622,6 +1663,23 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
 
     std::string GetBackendName() const override {
         return "x11";
+    }
+
+    std::optional<MonitorMetadata> GetCurrentMonitorInfo() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        if (!m_sharedHandle) {
+            return std::nullopt;
+        }
+
+        MonitorMetadata info;
+        info.id = "0";
+        info.name = "x11-root";
+        info.index = 0;
+        info.x = 0;
+        info.y = 0;
+        info.width = static_cast<int>(m_sharedHandle->width);
+        info.height = static_cast<int>(m_sharedHandle->height);
+        return info;
     }
 
     private:
