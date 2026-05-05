@@ -591,6 +591,15 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     void NextMonitor() override;
     void SelectMonitor(int index) override;
 
+    std::optional<MonitorBounds> GetMonitorBounds() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        if (m_currentMonitorIndex >= 0 && m_currentMonitorIndex < static_cast<int>(m_monitors.size())) {
+            const auto& mon = m_monitors[m_currentMonitorIndex];
+            return MonitorBounds{ mon.x, mon.y, static_cast<int>(mon.width), static_cast<int>(mon.height) };
+        }
+        return std::nullopt;
+    }
+
     private:
 
     GMainLoopPtr m_glibLoop;
@@ -1622,6 +1631,14 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
 
     std::string GetBackendName() const override {
         return "x11";
+    }
+
+    std::optional<MonitorBounds> GetMonitorBounds() const override {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        if (m_sharedHandle) {
+            return MonitorBounds{ 0, 0, static_cast<int>(m_sharedHandle->width), static_cast<int>(m_sharedHandle->height) };
+        }
+        return std::nullopt;
     }
 
     private:

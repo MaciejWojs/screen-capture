@@ -89,6 +89,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
     std::string GetBackendName() const override { return "gdi"; }
     int GetFps() const override { return m_lastFps.load(); }
+    std::optional<MonitorBounds> GetMonitorBounds() const override { return m_bounds; }
 
     void SetFrameAvailableCallback(std::function<void()> callback) override {
         std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
@@ -125,6 +126,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    MonitorBounds m_bounds = { 0, 0, 0, 0 };
     std::vector<uint8_t> m_pixels;
 
     std::atomic<uint64_t> m_frameCount{ 0 };
@@ -146,11 +148,21 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             if (GetMonitorInfoW(m_targetMonitor, &info)) {
                 m_width = info.rcMonitor.right - info.rcMonitor.left;
                 m_height = info.rcMonitor.bottom - info.rcMonitor.top;
+                m_bounds.x = info.rcMonitor.left;
+                m_bounds.y = info.rcMonitor.top;
+                m_bounds.width = m_width;
+                m_bounds.height = m_height;
             }
         }
 
-        if (m_width == 0) m_width = GetSystemMetrics(SM_CXSCREEN);
-        if (m_height == 0) m_height = GetSystemMetrics(SM_CYSCREEN);
+        if (m_width == 0) {
+            m_width = GetSystemMetrics(SM_CXSCREEN);
+            m_bounds.width = m_width;
+        }
+        if (m_height == 0) {
+            m_height = GetSystemMetrics(SM_CYSCREEN);
+            m_bounds.height = m_height;
+        }
 
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = m_width;

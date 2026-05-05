@@ -82,6 +82,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         int stride = 0;
         uint32_t pixelFormat = 0;
         std::optional<SharedHandleInfo> sharedHandle;
+        std::optional<MonitorBounds> monitorBounds;
         int64_t timestamp = 0;
         std::optional<std::vector<uint8_t>> pixelData;
 
@@ -141,6 +142,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         payload->stride = backend->GetStride();
         payload->pixelFormat = backend->GetPixelFormat();
         payload->sharedHandle = backend->GetSharedHandle();
+        payload->monitorBounds = backend->GetMonitorBounds();
         payload->timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()
         ).count();
@@ -204,6 +206,16 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         frame.Set("stride", payload->stride);
         frame.Set("pixelFormat", payload->pixelFormat);
         frame.Set("timestamp", Napi::Number::New(env, static_cast<double>(payload->timestamp)));
+
+        if (payload->monitorBounds) {
+            Napi::Object bounds = Napi::Object::New(env);
+            bounds.Set("x", payload->monitorBounds->x);
+            bounds.Set("y", payload->monitorBounds->y);
+            bounds.Set("width", payload->monitorBounds->width);
+            bounds.Set("height", payload->monitorBounds->height);
+            frame.Set("bounds", bounds);
+        }
+
         frame.Set("sharedTextureInfo", SerializeSharedTextureInfo(env, payload->sharedHandle));
         frame.Set("sharedHandle", SerializeSharedHandleLegacy(env, payload->sharedHandle));
         frame.Set("pixelData", SerializePixelData(env, payload->pixelData));

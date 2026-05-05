@@ -107,6 +107,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
     std::string GetBackendName() const override { return "dxgi"; }
     int GetFps() const override { return m_lastFps.load(std::memory_order_relaxed); }
+    std::optional<MonitorBounds> GetMonitorBounds() const override { return m_bounds; }
 
     void SetFrameAvailableCallback(std::function<void()> callback) override {
         std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
@@ -185,6 +186,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     std::atomic<uint32_t> m_height{ 0 };
     uint32_t m_targetWidth = 0;
     uint32_t m_targetHeight = 0;
+    MonitorBounds m_bounds = { 0, 0, 0, 0 };
 
     std::atomic<bool> m_firstFrameCaptured{ false };
     std::atomic<uint64_t> m_frameCount{ 0 };
@@ -231,6 +233,13 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             sc_logger::Error("DXGI: Could not find target monitor output");
             return false;
         }
+
+        DXGI_OUTPUT_DESC outDesc;
+        targetOutput->GetDesc(&outDesc);
+        m_bounds.x = outDesc.DesktopCoordinates.left;
+        m_bounds.y = outDesc.DesktopCoordinates.top;
+        m_bounds.width = outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left;
+        m_bounds.height = outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top;
 
         DXGI_ADAPTER_DESC adesc;
         targetAdapter->GetDesc(&adesc);

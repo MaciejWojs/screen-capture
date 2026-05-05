@@ -74,6 +74,8 @@ export interface FrameUpdate {
     stride: number;
     /** Pixel format code for the captured frame. */
     pixelFormat: number;
+    /** Bounds of the monitor / captured region. */
+    bounds?: { x: number; y: number; width: number; height: number };
     /** Capture timestamp in microseconds since steady clock epoch. */
     timestamp: number;
     /** Shared texture information for Electron import, when available. */

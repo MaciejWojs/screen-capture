@@ -23,6 +23,13 @@ struct SharedHandleInfo {
 };
 
 
+struct MonitorBounds {
+    int x;
+    int y;
+    int width;
+    int height;
+};
+
 class IPlatformCapture {
     public:
     virtual ~IPlatformCapture() = default;
@@ -41,6 +48,7 @@ class IPlatformCapture {
     virtual int GetCurrentMonitorIndex() const { return 0; }
     virtual void NextMonitor() {}
     virtual void SelectMonitor(int index) {}
+    virtual std::optional<MonitorBounds> GetMonitorBounds() const { return std::nullopt; }
     // Returns FPS or -1 if not implemented
     virtual int GetFps() const { return -1; }
 };

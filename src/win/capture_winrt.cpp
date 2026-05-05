@@ -93,6 +93,17 @@ class WinPlatformCapture final : public IPlatformCapture {
                     m_targetMonitor = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
                 }
 
+                MONITORINFOEXW mi = { sizeof(mi) };
+                if (GetMonitorInfoW(m_targetMonitor, &mi)) {
+                    m_bounds.x = mi.rcMonitor.left;
+                    m_bounds.y = mi.rcMonitor.top;
+                    m_bounds.width = mi.rcMonitor.right - mi.rcMonitor.left;
+                    m_bounds.height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                } else {
+                    m_bounds.width = GetSystemMetrics(SM_CXSCREEN);
+                    m_bounds.height = GetSystemMetrics(SM_CYSCREEN);
+                }
+
                 auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
                 check_hresult(
                     interop->CreateForMonitor(
@@ -221,6 +232,9 @@ class WinPlatformCapture final : public IPlatformCapture {
     int GetFps() const override {
         return m_lastFps.load(std::memory_order_relaxed);
     }
+    std::optional<MonitorBounds> GetMonitorBounds() const override {
+        return m_bounds;
+    }
 
     void SetFrameAvailableCallback(std::function<void()> callback) override {
         std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
@@ -247,6 +261,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     std::atomic<bool> m_running{ false };
     std::atomic<bool> m_poolRecreationRequested{ false };
     HMONITOR m_targetMonitor = nullptr;
+    MonitorBounds m_bounds = { 0, 0, 0, 0 };
     std::atomic<bool> m_cleaned{ false };
     std::atomic<bool> m_deviceReady{ false };
     std::atomic<bool> m_textureReady{ false };
