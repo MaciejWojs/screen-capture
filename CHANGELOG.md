@@ -1,19 +1,19 @@
 ## <small>0.5.1 (2026-05-05)</small>
 
-* feat: implement zombie capture management for improved resource handling
-* feat: log adapter information during device creation for improved diagnostics
-* feat: enhance pending capture handling for improved seamless transitions and resource management
-* feat: enhance multi-monitor support with improved resource management and seamless backend handoff
-* feat: simplify handle management in platform capture classes for improved stability
-* feat: add query support for improved synchronization in DXGI and GDI capture classes
-* feat: improve resource cleanup in WinPlatformCapture for better handle management
-* feat: enhance cleanup process in platform capture classes for better resource management
-* feat: implement WindowsPlatformCapture for multi-monitor support
-* feat: add support for multiple monitors in platform capture classes
-* feat: streamline PipeWire thread loop management in WaylandPlatformCapture
-* feat: improve cleanup process for shared handles in WaylandPlatformCapture
-* feat: enhance PipeWire stream management with thread-loop locking
-* feat: add monitor management methods for Wayland support
+* feat: implement zombie capture management for improved resource handling ([bb04ca4](https://github.com/MaciejWojs/screen-capture/commit/bb04ca4))
+* feat: log adapter information during device creation for improved diagnostics ([5ea17ea](https://github.com/MaciejWojs/screen-capture/commit/5ea17ea))
+* feat: enhance pending capture handling for improved seamless transitions and resource management ([ac2aa40](https://github.com/MaciejWojs/screen-capture/commit/ac2aa40))
+* feat: enhance multi-monitor support with improved resource management and seamless backend handoff ([e1abb2d](https://github.com/MaciejWojs/screen-capture/commit/e1abb2d))
+* feat: simplify handle management in platform capture classes for improved stability ([ad475c9](https://github.com/MaciejWojs/screen-capture/commit/ad475c9))
+* feat: add query support for improved synchronization in DXGI and GDI capture classes ([7713ae8](https://github.com/MaciejWojs/screen-capture/commit/7713ae8))
+* feat: improve resource cleanup in WinPlatformCapture for better handle management ([6db8f0e](https://github.com/MaciejWojs/screen-capture/commit/6db8f0e))
+* feat: enhance cleanup process in platform capture classes for better resource management ([802b8f0](https://github.com/MaciejWojs/screen-capture/commit/802b8f0))
+* feat: implement WindowsPlatformCapture for multi-monitor support ([c4c25f4](https://github.com/MaciejWojs/screen-capture/commit/c4c25f4))
+* feat: add support for multiple monitors in platform capture classes ([33e1698](https://github.com/MaciejWojs/screen-capture/commit/33e1698))
+* feat: streamline PipeWire thread loop management in WaylandPlatformCapture ([3d2676b](https://github.com/MaciejWojs/screen-capture/commit/3d2676b))
+* feat: improve cleanup process for shared handles in WaylandPlatformCapture ([ac0e0d6](https://github.com/MaciejWojs/screen-capture/commit/ac0e0d6))
+* feat: enhance PipeWire stream management with thread-loop locking ([e159570](https://github.com/MaciejWojs/screen-capture/commit/e159570))
+* feat: add monitor management methods for Wayland support ([b2eee3c](https://github.com/MaciejWojs/screen-capture/commit/b2eee3c))
 
 
 ## 0.5.0 (2026-04-30)
