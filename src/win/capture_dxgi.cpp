@@ -19,7 +19,7 @@
 
 class DXGIPlatformCapture final : public IPlatformCapture {
     public:
-    DXGIPlatformCapture() = default;
+    DXGIPlatformCapture(HMONITOR monitor) : m_targetMonitor(monitor) {}
     ~DXGIPlatformCapture() override { Stop(); }
 
     static void CleanupHook(void* arg) {
@@ -31,7 +31,9 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         m_env = env;
         sc_logger::Info("Screen capture started via DXGI Desktop Duplication API with jthread");
 
-        napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        if (m_env) {
+            napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        }
 
         m_thread = std::jthread([this](std::stop_token stopToken) {
             sc_logger::Info("DXGI capture thread started");
@@ -40,10 +42,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                 return;
             }
 
-            // Main capture loop
             while (!stopToken.stop_requested()) {
                 if (!CaptureFrame(stopToken)) {
-                    sc_logger::Info("DXGI: Session lost, reinitializing...");
+                    if (stopToken.stop_requested()) break;
+                    sc_logger::Warn("DXGI: Capture session interrupted, reinitializing...");
                     CleanupDirect3D();
 
                     while (!stopToken.stop_requested()) {
@@ -52,7 +54,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                             break;
                         }
                         std::unique_lock lock(m_reinitMutex);
-                        m_reinitCv.wait_for(lock, std::chrono::milliseconds(100),
+                        m_reinitCv.wait_for(lock, std::chrono::milliseconds(250),
                             [&stopToken] { return stopToken.stop_requested(); });
                     }
                 }
@@ -64,7 +66,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     void Stop() override {
-        if (m_env) {
+        if (m_env && m_thread.joinable()) {
             napi_remove_env_cleanup_hook(m_env, CleanupHook, this);
             m_env = nullptr;
         }
@@ -77,34 +79,34 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        // HANDLE handle = m_sharedHandle.load();
-        HANDLE handle = m_sharedHandle.load(std::memory_order_acquire);
-        if (!handle) return std::nullopt;
-
-        HANDLE duplicate = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            sc_logger::Error("DXGI GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
+        // Nie zwracaj uchwytu, jeśli nie mamy jeszcze ani jednej rzeczywistej klatki
+        if (!m_firstFrameCaptured.load(std::memory_order_acquire)) {
             return std::nullopt;
         }
 
+        HANDLE handle = m_sharedHandle.load(std::memory_order_acquire);
+        uint32_t w = m_width.load(std::memory_order_relaxed);
+        uint32_t h = m_height.load(std::memory_order_relaxed);
+
+        if (!handle || w == 0 || h == 0) return std::nullopt;
+
         SharedHandleInfo info;
-        // info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
-        info.width = m_width;
-        info.height = m_height;
-        info.stride = m_width * 4;
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
+        info.width = w;
+        info.height = h;
+        info.stride = w * 4;
         info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
 
-        sc_logger::Debug("DXGI GetSharedHandle: duplicated handle={}", reinterpret_cast<void*>(duplicate));
+        sc_logger::Debug("DXGI GetSharedHandle: handle={}", reinterpret_cast<void*>(handle));
         return info;
     }
 
-    int GetWidth() const override { return static_cast<int>(m_width); }
-    int GetHeight() const override { return static_cast<int>(m_height); }
-    int GetStride() const override { return static_cast<int>(m_width * 4); }
+    int GetWidth() const override { return static_cast<int>(m_width.load(std::memory_order_relaxed)); }
+    int GetHeight() const override { return static_cast<int>(m_height.load(std::memory_order_relaxed)); }
+    int GetStride() const override { return static_cast<int>(m_width.load(std::memory_order_relaxed) * 4); }
     uint32_t GetPixelFormat() const override { return static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM); }
     std::string GetBackendName() const override { return "dxgi"; }
-    int GetFps() const override { return m_lastFps.load(); }
+    int GetFps() const override { return m_lastFps.load(std::memory_order_relaxed); }
 
     void SetFrameAvailableCallback(std::function<void()> callback) override {
         std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
@@ -126,66 +128,135 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     napi_env m_env{ nullptr };
     std::jthread m_thread;                      // automatyczne zarządzanie wątkiem
     mutable std::mutex m_reinitMutex;           // dla condition_variable przy ponownej inicjalizacji
+    HMONITOR m_targetMonitor = nullptr;
     std::condition_variable_any m_reinitCv;     // może czekać na stop_token
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> m_duplication;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex[2];
-    HANDLE m_sharedHandleInternal[2]{ nullptr, nullptr };
+
+    struct RetiredSharedResource {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+        HANDLE handle = nullptr;
+        std::chrono::steady_clock::time_point retireTime;
+
+        RetiredSharedResource(Microsoft::WRL::ComPtr<ID3D11Texture2D> t, HANDLE h, std::chrono::steady_clock::time_point rt)
+            : tex(std::move(t)), handle(h), retireTime(rt) {
+        }
+
+        ~RetiredSharedResource() {
+            if (handle) CloseHandle(handle);
+        }
+
+        RetiredSharedResource(RetiredSharedResource&& other) noexcept
+            : tex(std::move(other.tex)), handle(std::exchange(other.handle, nullptr)), retireTime(other.retireTime) {
+        }
+
+        RetiredSharedResource& operator=(RetiredSharedResource&& other) noexcept {
+            if (this != &other) {
+                if (handle) CloseHandle(handle);
+                tex = std::move(other.tex);
+                handle = std::exchange(other.handle, nullptr);
+                retireTime = other.retireTime;
+            }
+            return *this;
+        }
+
+        RetiredSharedResource(const RetiredSharedResource&) = delete;
+        RetiredSharedResource& operator=(const RetiredSharedResource&) = delete;
+    };
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_ringTex[3];
+    Microsoft::WRL::ComPtr<ID3D11Query> m_ringQuery[3];
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_publicSharedTex;
+    Microsoft::WRL::ComPtr<ID3D11Query> m_publicQuery;
+    HANDLE m_publicSharedHandle = nullptr;
+
+    std::vector<RetiredSharedResource> m_retiredResources;
+    mutable std::mutex m_retiredMutex;
+
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
-    int m_currentIndex = 0;
+    int m_ringIndex = 0;
 
     std::function<void()> m_frameAvailableCallback;
     std::mutex m_frameCallbackMutex;
 
-    uint32_t m_width = 0;
-    uint32_t m_height = 0;
+    std::atomic<uint32_t> m_width{ 0 };
+    std::atomic<uint32_t> m_height{ 0 };
+    uint32_t m_targetWidth = 0;
+    uint32_t m_targetHeight = 0;
 
+    std::atomic<bool> m_firstFrameCaptured{ false };
     std::atomic<uint64_t> m_frameCount{ 0 };
     std::atomic<int> m_lastFps{ 0 };
     std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
 
+    Microsoft::WRL::ComPtr<IDXGIOutput1> FindTargetOutput(IDXGIAdapter* adapter) {
+        for (UINT i = 0; ; ++i) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> output;
+            if (adapter->EnumOutputs(i, &output) == DXGI_ERROR_NOT_FOUND) break;
+
+            DXGI_OUTPUT_DESC desc;
+            output->GetDesc(&desc);
+
+            if (!m_targetMonitor || desc.Monitor == m_targetMonitor) {
+                Microsoft::WRL::ComPtr<IDXGIOutput1> output1;
+                if (SUCCEEDED(output.As(&output1))) return output1;
+            }
+        }
+        return nullptr;
+    }
+
     bool InitializeDirect3D() {
-        D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
+        CleanupDirect3D();
+
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+
+        Microsoft::WRL::ComPtr<IDXGIAdapter> targetAdapter;
+        Microsoft::WRL::ComPtr<IDXGIOutput1> targetOutput;
+
+        for (UINT i = 0; ; ++i) {
+            Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+            if (factory->EnumAdapters(i, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+
+            targetOutput = FindTargetOutput(adapter.Get());
+            if (targetOutput) {
+                targetAdapter = adapter;
+                break;
+            }
+        }
+
+        if (!targetAdapter || !targetOutput) {
+            sc_logger::Error("DXGI: Could not find target monitor output");
+            return false;
+        }
+
+        DXGI_ADAPTER_DESC adesc;
+        targetAdapter->GetDesc(&adesc);
+        char adapterName[128];
+        WideCharToMultiByte(CP_UTF8, 0, adesc.Description, -1, adapterName, sizeof(adapterName), nullptr, nullptr);
+        sc_logger::Info("DXGI: Creating device on adapter: {}", adapterName);
+
+        D3D_FEATURE_LEVEL levels[] = {
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1
+        };
+
         HRESULT hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            targetAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             levels, ARRAYSIZE(levels),
             D3D11_SDK_VERSION, &m_device, nullptr, &m_context
         );
+
         if (FAILED(hr)) {
             sc_logger::Error("DXGI: D3D11CreateDevice failed with 0x{:08X}", hr);
             return false;
         }
 
-        sc_logger::Info("DXGI: D3D11 device created");
-
-        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
-        if (FAILED(m_device.As(&dxgiDevice))) {
-            sc_logger::Error("DXGI: failed to query IDXGIDevice");
-            return false;
-        }
-
-        Microsoft::WRL::ComPtr<IDXGIAdapter> dxgiAdapter;
-        if (FAILED(dxgiDevice->GetAdapter(&dxgiAdapter))) {
-            sc_logger::Error("DXGI: failed to get DXGI adapter");
-            return false;
-        }
-
-        Microsoft::WRL::ComPtr<IDXGIOutput> dxgiOutput;
-        if (FAILED(dxgiAdapter->EnumOutputs(0, &dxgiOutput))) {
-            sc_logger::Error("DXGI: failed to enumerate output");
-            return false;
-        }
-
-        Microsoft::WRL::ComPtr<IDXGIOutput1> dxgiOutput1;
-        if (FAILED(dxgiOutput.As(&dxgiOutput1))) {
-            sc_logger::Error("DXGI: failed to cast output to IDXGIOutput1");
-            return false;
-        }
-
-        hr = dxgiOutput1->DuplicateOutput(m_device.Get(), &m_duplication);
+        hr = targetOutput->DuplicateOutput(m_device.Get(), m_duplication.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             sc_logger::Error("DXGI: DuplicateOutput failed with 0x{:08X}", hr);
             return false;
@@ -198,42 +269,102 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        m_width = desc.ModeDesc.Width;
-        m_height = desc.ModeDesc.Height;
-        sc_logger::Info("DXGI: capture size {}x{}", m_width, m_height);
+        m_targetWidth = desc.ModeDesc.Width;
+        m_targetHeight = desc.ModeDesc.Height;
+        sc_logger::Info("DXGI: target capture size {}x{}", m_targetWidth, m_targetHeight);
+        m_firstFrameCaptured.store(false, std::memory_order_release);
+        m_ringIndex = 0;
 
-        D3D11_TEXTURE2D_DESC texDesc = {};
-        texDesc.Width = m_width;
-        texDesc.Height = m_height;
-        texDesc.MipLevels = 1;
-        texDesc.ArraySize = 1;
-        texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        texDesc.SampleDesc.Count = 1;
-        texDesc.Usage = D3D11_USAGE_DEFAULT;
-        texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        texDesc.CPUAccessFlags = 0;
-        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+        D3D11_TEXTURE2D_DESC descRing = {};
+        descRing.Width = m_targetWidth;
+        descRing.Height = m_targetHeight;
+        descRing.MipLevels = 1;
+        descRing.ArraySize = 1;
+        descRing.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        descRing.SampleDesc.Count = 1;
+        descRing.Usage = D3D11_USAGE_DEFAULT;
+        descRing.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
-        for (int i = 0; i < 2; i++) {
-            hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_sharedTex[i]);
-            if (FAILED(hr)) return false;
+        D3D11_QUERY_DESC qDesc = { D3D11_QUERY_EVENT, 0 };
 
-            Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
-            m_sharedTex[i].As(&dxgiRes);
-            hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &m_sharedHandleInternal[i]);
-            if (FAILED(hr)) return false;
+        for (int i = 0; i < 3; i++) {
+            if (FAILED(m_device->CreateTexture2D(&descRing, nullptr, &m_ringTex[i]))) return false;
+            if (FAILED(m_device->CreateQuery(&qDesc, &m_ringQuery[i]))) return false;
         }
 
-        m_sharedHandle.store(m_sharedHandleInternal[0]);
+        // Tekstura publiczna (stabilny HANDLE dla Electrona)
+        D3D11_TEXTURE2D_DESC descPublic = descRing;
+        descPublic.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+
+        hr = m_device->CreateTexture2D(&descPublic, nullptr, &m_publicSharedTex);
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: Failed to create public shared texture");
+            return false;
+        }
+
+        if (FAILED(m_device->CreateQuery(&qDesc, &m_publicQuery))) return false;
+
+        // Czyszczenie na czarno tekstury publicznej
+        float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
+        if (SUCCEEDED(m_device->CreateRenderTargetView(m_publicSharedTex.Get(), nullptr, &rtv))) {
+            m_context->ClearRenderTargetView(rtv.Get(), black);
+        }
+
+        Microsoft::WRL::ComPtr<IDXGIResource1> dxgiRes;
+        m_publicSharedTex.As(&dxgiRes);
+        hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &m_publicSharedHandle);
+        if (FAILED(hr)) {
+            sc_logger::Error("DXGI: Failed to create stable public shared handle");
+            return false;
+        }
+
+        m_context->Flush();
+
         return true;
     }
 
+    void CleanupRetiredResources(bool force = false) {
+        std::lock_guard<std::mutex> lock(m_retiredMutex);
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto it = m_retiredResources.begin(); it != m_retiredResources.end();) {
+            if (force || std::chrono::duration_cast<std::chrono::milliseconds>(now - it->retireTime).count() > 2000) {
+                it = m_retiredResources.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     void CleanupDirect3D() {
-        m_sharedHandle.store(nullptr);
-        for (int i = 0; i < 2; i++) {
-            if (m_sharedHandleInternal[i]) CloseHandle(m_sharedHandleInternal[i]);
-            m_sharedHandleInternal[i] = nullptr;
-            m_sharedTex[i] = nullptr;
+        // 1. Od razu unieważnij publiczny uchwyt i stan gotowości
+        m_sharedHandle.store(nullptr, std::memory_order_release);
+        m_firstFrameCaptured.store(false, std::memory_order_release);
+        m_width.store(0, std::memory_order_relaxed);
+        m_height.store(0, std::memory_order_relaxed);
+        m_targetWidth = 0;
+        m_targetHeight = 0;
+        m_ringIndex = 0;
+
+        // 2. Poczekaj na zakończenie poleceń GPU (np. CopyResource)
+        if (m_context) {
+            m_context->Flush();
+            m_context->ClearState();
+        }
+
+        // 3. Zamiast zamykać od razu, przenieś do "poczekalni"
+        if (m_publicSharedTex || m_publicSharedHandle) {
+            std::lock_guard<std::mutex> lock(m_retiredMutex);
+            m_retiredResources.emplace_back(m_publicSharedTex, m_publicSharedHandle, std::chrono::steady_clock::now());
+        }
+
+        m_publicSharedTex = nullptr;
+        m_publicSharedHandle = nullptr;
+
+        for (int i = 0; i < 3; i++) {
+            m_ringTex[i] = nullptr;
+            m_ringQuery[i] = nullptr;
         }
         m_duplication = nullptr;
         m_context = nullptr;
@@ -253,6 +384,11 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             return true;
         }
+        if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_SESSION_DISCONNECTED) {
+            sc_logger::Info("DXGI: Access lost or session disconnected (0x{:08X})", hr);
+            return false;
+        }
+
         if (FAILED(hr)) {
             sc_logger::Warn("DXGI: AcquireNextFrame failed with 0x{:08X}", hr);
             return false;
@@ -263,22 +399,62 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        // We only care about AccumulatedFrames. LastPresentTime can be 0 even for valid 
-        // frames on some systems/drivers, leading to rhythmic stuttering if discarded.
-        // Mouse-only updates (AccumulatedFrames == 0) are handled by ReleaseFrame without copy.
-        if (frameInfo.AccumulatedFrames == 0) {
+        // Ignoruj ramki typu mouse-only lub puste aktualizacje (dirty rects == 0)
+        if (frameInfo.AccumulatedFrames == 0 && m_firstFrameCaptured.load(std::memory_order_acquire)) {
             m_duplication->ReleaseFrame();
             return true;
         }
 
-        m_frameCount++;
+        CleanupRetiredResources();
 
-        m_currentIndex = (m_currentIndex + 1) % 2;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> desktopTexture;
         if (SUCCEEDED(desktopResource.As(&desktopTexture))) {
-            m_context->CopyResource(m_sharedTex[m_currentIndex].Get(), desktopTexture.Get());
-            m_context->Flush();
-            m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex]);
+            D3D11_TEXTURE2D_DESC texDesc;
+            desktopTexture->GetDesc(&texDesc);
+
+            if (texDesc.Width != m_targetWidth || texDesc.Height != m_targetHeight) {
+                sc_logger::Info("DXGI: Surface size mismatch (prawdopodobnie zmiana rozdzielczości), reinit.");
+                m_duplication->ReleaseFrame();
+                return false;
+            }
+
+            // 1. Kopiuj desktop do ring bufora (staging)
+            m_ringIndex = (m_ringIndex + 1) % 3;
+            m_context->CopyResource(m_ringTex[m_ringIndex].Get(), desktopTexture.Get());
+
+            if (m_ringQuery[m_ringIndex]) {
+                m_context->End(m_ringQuery[m_ringIndex].Get());
+                m_context->Flush();
+                while (m_context->GetData(m_ringQuery[m_ringIndex].Get(), nullptr, 0, 0) != S_OK) {
+                    if (stopToken.stop_requested()) {
+                        m_duplication->ReleaseFrame();
+                        return false;
+                    }
+                    Sleep(0);
+                }
+            }
+
+            // 2. Kopiuj z ring do STAŁEJ tekstury publicznej
+            m_context->CopyResource(m_publicSharedTex.Get(), m_ringTex[m_ringIndex].Get());
+
+            if (m_publicQuery) {
+                m_context->End(m_publicQuery.Get());
+                m_context->Flush();
+                while (m_context->GetData(m_publicQuery.Get(), nullptr, 0, 0) != S_OK) {
+                    if (stopToken.stop_requested()) { m_duplication->ReleaseFrame(); return false; }
+                    Sleep(0);
+                }
+            }
+
+            m_sharedHandle.store(m_publicSharedHandle, std::memory_order_release);
+            if (!m_firstFrameCaptured.load(std::memory_order_acquire)) {
+                m_width.store(m_targetWidth, std::memory_order_relaxed);
+                m_height.store(m_targetHeight, std::memory_order_relaxed);
+                m_firstFrameCaptured.store(true, std::memory_order_release);
+                sc_logger::Info("DXGI: First frame captured, backend ready");
+            }
+
+            m_frameCount++;
             InvokeFrameAvailableCallback();
         }
 
@@ -315,9 +491,9 @@ bool IsWin8OrGreaterForDXGI() {
     return false;
 }
 
-std::unique_ptr<IPlatformCapture> CreateDXGICapture() {
+std::unique_ptr<IPlatformCapture> CreateDXGICapture(HMONITOR monitor) {
     if (IsWin8OrGreaterForDXGI()) {
-        return std::make_unique<DXGIPlatformCapture>();
+        return std::make_unique<DXGIPlatformCapture>(monitor);
     }
     return nullptr;
 }

@@ -462,13 +462,8 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
             return std::nullopt;
         }
 
-        int duplicatedFd = dup(*m_sharedFd);
-        if (duplicatedFd < 0) {
-            return std::nullopt;
-        }
-
         SharedHandleInfo info = *m_sharedHandle;
-        info.handle = static_cast<uint64_t>(duplicatedFd);
+        info.handle = static_cast<uint64_t>(*m_sharedFd);
         m_frameConsumed = true;
         return info;
     }
@@ -581,13 +576,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             return std::nullopt;
         }
 
-        int duplicatedFd = dup(*m_sharedFd);
-        if (duplicatedFd < 0) {
-            return std::nullopt;
-        }
-
         SharedHandleInfo info = *m_sharedHandle;
-        info.handle = static_cast<uint64_t>(duplicatedFd);
+        info.handle = static_cast<uint64_t>(*m_sharedFd);
         m_frameConsumed = true;
         return info;
     }
@@ -799,7 +789,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             explicit LoopLockGuard(pw_thread_loop* l) : loop(l) { if (loop) pw_thread_loop_lock(loop); }
             ~LoopLockGuard() { if (loop) pw_thread_loop_unlock(loop); }
         };
-        
+
         LoopLockGuard pwLock(m_streamState.pw_loop.get());
 
         m_streamState.stream.reset(pw_stream_new(
@@ -1000,9 +990,9 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         }
 
         pw_loop* loop = pw_thread_loop_get_loop(m_streamState.pw_loop.get());
-        
+
         pw_thread_loop_lock(m_streamState.pw_loop.get());
-        
+
         m_streamState.context.reset(pw_context_new(loop, nullptr, 0));
         if (!m_streamState.context) {
             pw_thread_loop_unlock(m_streamState.pw_loop.get());
@@ -1014,7 +1004,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             pw_thread_loop_unlock(m_streamState.pw_loop.get());
             throw std::runtime_error("Unable to connect to the PipeWire core through the portal FD");
         }
-        
+
         pw_thread_loop_unlock(m_streamState.pw_loop.get());
 
         CreatePipewireStream(m_streamNodeId.load());

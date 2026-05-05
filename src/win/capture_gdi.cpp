@@ -19,7 +19,7 @@
 
 class LegacyWinPlatformCapture final : public IPlatformCapture {
     public:
-    LegacyWinPlatformCapture() = default;
+    LegacyWinPlatformCapture(HMONITOR monitor) : m_targetMonitor(monitor) {}
     ~LegacyWinPlatformCapture() override { Stop(); }
 
     static void CleanupHook(void* arg) {
@@ -32,7 +32,9 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         m_env = env;
         sc_logger::Info("Screen capture started via GDI BitBlt fallback (C++20 jthread)");
 
-        napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        if (m_env) {
+            napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        }
 
         // Uruchom wątek z obsługą stop_token
         m_thread = std::jthread([this](std::stop_token stopToken) {
@@ -52,7 +54,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     }
 
     void Stop() override {
-        if (m_env) {
+        if (m_env && m_thread.joinable()) {
             napi_remove_env_cleanup_hook(m_env, CleanupHook, this);
             m_env = nullptr;
         }
@@ -69,21 +71,15 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         HANDLE handle = m_sharedHandle.load(std::memory_order_acquire);
         if (!handle) return std::nullopt;
 
-        HANDLE duplicate = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            sc_logger::Error("GDI GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
-            return std::nullopt;
-        }
-
         SharedHandleInfo info;
         // info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
         info.width = m_width;
         info.height = m_height;
         info.stride = m_width * 4;
         info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
 
-        sc_logger::Debug("GDI GetSharedHandle: duplicated handle={}", reinterpret_cast<void*>(duplicate));
+        sc_logger::Debug("GDI GetSharedHandle: handle={}", reinterpret_cast<void*>(handle));
         return info;
     }
 
@@ -114,12 +110,14 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     napi_env m_env{ nullptr };
     std::jthread m_thread;                       // automatyczne zarządzanie wątkiem
     mutable std::mutex m_cvMutex;                // dla condition_variable
+    HMONITOR m_targetMonitor = nullptr;
     std::condition_variable_any m_cv;            // może czekać na stop_token
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_sharedTex;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingTex;
+    Microsoft::WRL::ComPtr<ID3D11Query> m_query;
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
 
     std::function<void()> m_frameAvailableCallback;
@@ -143,8 +141,16 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         );
         if (FAILED(hr)) return;
 
-        m_width = GetSystemMetrics(SM_CXSCREEN);
-        m_height = GetSystemMetrics(SM_CYSCREEN);
+        if (m_targetMonitor) {
+            MONITORINFO info = { sizeof(info) };
+            if (GetMonitorInfoW(m_targetMonitor, &info)) {
+                m_width = info.rcMonitor.right - info.rcMonitor.left;
+                m_height = info.rcMonitor.bottom - info.rcMonitor.top;
+            }
+        }
+
+        if (m_width == 0) m_width = GetSystemMetrics(SM_CXSCREEN);
+        if (m_height == 0) m_height = GetSystemMetrics(SM_CYSCREEN);
 
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = m_width;
@@ -175,22 +181,38 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
                 }
             }
         }
+
+        D3D11_QUERY_DESC qDesc = { D3D11_QUERY_EVENT, 0 };
+        m_device->CreateQuery(&qDesc, &m_query);
     }
 
     void CleanupDirect3D() {
         HANDLE handle = m_sharedHandle.exchange(nullptr);
         if (handle) CloseHandle(handle);
+        m_width = 0;
+        m_height = 0;
         m_sharedTex = nullptr;
         m_stagingTex = nullptr;
         m_context = nullptr;
         m_device = nullptr;
+        m_query = nullptr;
     }
 
     void CaptureScreenGDI() {
         m_frameCount++;
         if (!m_stagingTex || !m_sharedTex) return;
 
-        HDC hScreenDC = GetDC(nullptr);
+        HDC hScreenDC = nullptr;
+        if (m_targetMonitor) {
+            MONITORINFOEXW mi = { sizeof(mi) };
+            if (GetMonitorInfoW(m_targetMonitor, &mi)) {
+                hScreenDC = CreateDCW(nullptr, mi.szDevice, nullptr, nullptr);
+            }
+        }
+
+        bool cleanupDC = (hScreenDC != nullptr);
+        if (!hScreenDC) hScreenDC = GetDC(nullptr);
+
         HDC hMemoryDC = CreateCompatibleDC(hScreenDC);
         HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, m_width, m_height);
         HGDIOBJ hOldBitmap = SelectObject(hMemoryDC, hBitmap);
@@ -219,7 +241,15 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             }
             m_context->Unmap(m_stagingTex.Get(), 0);
             m_context->CopyResource(m_sharedTex.Get(), m_stagingTex.Get());
-            m_context->Flush();
+
+            if (m_query) {
+                m_context->End(m_query.Get());
+                m_context->Flush();
+                while (m_context->GetData(m_query.Get(), nullptr, 0, 0) != S_OK) {
+                    Sleep(0);
+                }
+            }
+
             InvokeFrameAvailableCallback();
         }
 
@@ -227,7 +257,11 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         SelectObject(hMemoryDC, hOldBitmap);
         DeleteObject(hBitmap);
         DeleteDC(hMemoryDC);
-        ReleaseDC(nullptr, hScreenDC);
+        if (cleanupDC) {
+            DeleteDC(hScreenDC);
+        } else {
+            ReleaseDC(nullptr, hScreenDC);
+        }
 
         // FPS
         auto now = std::chrono::steady_clock::now();
@@ -240,8 +274,8 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     }
 };
 
-std::unique_ptr<IPlatformCapture> CreateGDICapture() {
-    return std::make_unique<LegacyWinPlatformCapture>();
+std::unique_ptr<IPlatformCapture> CreateGDICapture(HMONITOR monitor) {
+    return std::make_unique<LegacyWinPlatformCapture>(monitor);
 }
 
 #endif // _WIN32

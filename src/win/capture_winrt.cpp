@@ -45,7 +45,7 @@ inline IDirect3DDevice CreateDirect3DDevice(IDXGIDevice* dxgiDevice) {
 
 class WinPlatformCapture final : public IPlatformCapture {
     public:
-    WinPlatformCapture() {
+    WinPlatformCapture(HMONITOR monitor) : m_targetMonitor(monitor) {
         sc_logger::Info("WinPlatformCapture constructor called");
     }
 
@@ -72,7 +72,9 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_env = env;
         sc_logger::Info("Screen capture started via WinRT Graphics Capture (jthread)");
 
-        napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        if (m_env) {
+            napi_add_env_cleanup_hook(m_env, CleanupHook, this);
+        }
 
         m_jthread = std::jthread([this](std::stop_token stopToken) {
             sc_logger::Info("Capture thread started");
@@ -87,13 +89,14 @@ class WinPlatformCapture final : public IPlatformCapture {
 
                 InitializeD3D();
 
-                HMONITOR monitor = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
-                sc_logger::Info("Using primary monitor handle: {}", reinterpret_cast<void*>(monitor));
+                if (!m_targetMonitor) {
+                    m_targetMonitor = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
+                }
 
                 auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
                 check_hresult(
                     interop->CreateForMonitor(
-                        monitor,
+                        m_targetMonitor,
                         guid_of<GraphicsCaptureItem>(),
                         put_abi(m_item)
                     )
@@ -191,19 +194,13 @@ class WinPlatformCapture final : public IPlatformCapture {
             return std::nullopt;
         }
 
-        HANDLE duplicate = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            sc_logger::Error("GetSharedHandle: DuplicateHandle failed, error = {}", GetLastError());
-            return std::nullopt;
-        }
-
         SharedHandleInfo info;
-        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(duplicate));
+        info.handle = static_cast<uint64_t>(std::bit_cast<std::uintptr_t>(handle));
         info.width = m_width;
         info.height = m_height;
         info.stride = static_cast<uint32_t>(m_width * 4);
         info.pixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
-        sc_logger::Info("GetSharedHandle succeeded: handle={}, size={}x{}", reinterpret_cast<void*>(duplicate), m_width, m_height);
+        sc_logger::Info("GetSharedHandle succeeded: handle={}, size={}x{}", reinterpret_cast<void*>(handle), m_width, m_height);
         return info;
     }
 
@@ -249,6 +246,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     mutable std::mutex m_stateMutex;
     std::atomic<bool> m_running{ false };
     std::atomic<bool> m_poolRecreationRequested{ false };
+    HMONITOR m_targetMonitor = nullptr;
     std::atomic<bool> m_cleaned{ false };
     std::atomic<bool> m_deviceReady{ false };
     std::atomic<bool> m_textureReady{ false };
@@ -259,6 +257,7 @@ class WinPlatformCapture final : public IPlatformCapture {
     IDirect3DDevice m_winrtDevice{ nullptr };
     com_ptr<ID3D11Texture2D> m_sharedTex[2];
     HANDLE m_sharedHandleInternal[2]{ nullptr, nullptr };
+    com_ptr<ID3D11Query> m_query[2];
     std::atomic<HANDLE> m_sharedHandle{ nullptr };
     int m_currentIndex = 0;
 
@@ -328,7 +327,7 @@ class WinPlatformCapture final : public IPlatformCapture {
         sc_logger::Info("StopInternal called");
         m_running.store(false, std::memory_order_release);
 
-        if (m_env) {
+        if (m_env && m_jthread.joinable()) {
             napi_remove_env_cleanup_hook(m_env, CleanupHook, this);
             sc_logger::Info("Removed cleanup hook");
             m_env = nullptr;
@@ -384,18 +383,22 @@ class WinPlatformCapture final : public IPlatformCapture {
         m_winrtDevice = nullptr;
         for (int i = 0; i < 2; i++) {
             m_sharedTex[i] = nullptr;
+            if (m_sharedHandleInternal[i]) {
+                CloseHandle(m_sharedHandleInternal[i]);
+                m_sharedHandleInternal[i] = nullptr;
+            }
+            m_query[i] = nullptr;
         }
         m_device = nullptr;
         m_context = nullptr;
         m_deviceReady.store(false, std::memory_order_release);
         m_textureReady.store(false, std::memory_order_release);
         m_captureStarted.store(false, std::memory_order_release);
+        m_width = 0;
+        m_height = 0;
 
-        HANDLE handle = m_sharedHandle.exchange(nullptr);
-        if (handle) {
-            sc_logger::Info("Closing shared handle");
-            CloseHandle(handle);
-        }
+        m_sharedHandle.store(nullptr);
+
         sc_logger::Info("CleanupCapture finished");
     }
 
@@ -480,6 +483,11 @@ class WinPlatformCapture final : public IPlatformCapture {
 
         sc_logger::Info("Creating shared texture before frame pool {}x{}", size.Width, size.Height);
         CreateOrRecreateSharedTexture();
+
+        D3D11_QUERY_DESC qDesc = { D3D11_QUERY_EVENT, 0 };
+        for (int i = 0; i < 2; i++) {
+            check_hresult(m_device->CreateQuery(&qDesc, m_query[i].put()));
+        }
 
         sc_logger::Info("Creating frame pool {}x{}", size.Width, size.Height);
         m_framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -627,7 +635,16 @@ class WinPlatformCapture final : public IPlatformCapture {
             }
 
             localContext->CopyResource(localSharedTex.get(), srcTex.get());
-            localContext->Flush();
+
+            if (m_query[m_currentIndex]) {
+                localContext->End(m_query[m_currentIndex].get());
+                localContext->Flush();
+                while (localContext->GetData(m_query[m_currentIndex].get(), nullptr, 0, 0) != S_OK) {
+                    if (!m_running.load(std::memory_order_acquire)) break;
+                    Sleep(0);
+                }
+            }
+
             m_sharedHandle.store(m_sharedHandleInternal[m_currentIndex]);
 
             InvokeFrameAvailableCallback();
@@ -649,6 +666,8 @@ class WinPlatformCapture final : public IPlatformCapture {
                 m_lastFpsTimeNs.store(nowNs, std::memory_order_relaxed);
                 sc_logger::Debug("OnFrame: FPS updated to {}", frames);
             }
+
+            frame.Close();
         } catch (const winrt::hresult_error& e) {
             sc_logger::Error("WinRT error in OnFrame: {}", winrt::to_string(e.message()));
         } catch (const std::exception& e) {
@@ -661,9 +680,9 @@ class WinPlatformCapture final : public IPlatformCapture {
     }
 };
 
-std::unique_ptr<IPlatformCapture> CreateWinRTCapture() {
+std::unique_ptr<IPlatformCapture> CreateWinRTCapture(HMONITOR monitor) {
     sc_logger::Info("CreateWinRTCapture called");
-    return std::make_unique<WinPlatformCapture>();
+    return std::make_unique<WinPlatformCapture>(monitor);
 }
 
 #else // !HAS_WINRT_CAPTURE
