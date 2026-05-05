@@ -232,6 +232,12 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
+        DXGI_ADAPTER_DESC adesc;
+        targetAdapter->GetDesc(&adesc);
+        char adapterName[128];
+        WideCharToMultiByte(CP_UTF8, 0, adesc.Description, -1, adapterName, sizeof(adapterName), nullptr, nullptr);
+        sc_logger::Info("DXGI: Creating device on adapter: {}", adapterName);
+
         D3D_FEATURE_LEVEL levels[] = {
             D3D_FEATURE_LEVEL_11_1,
             D3D_FEATURE_LEVEL_11_0,
