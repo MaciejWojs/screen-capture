@@ -315,7 +315,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             } catch (...) {
                 sc_logger::Error("Monitor callback threw unknown JS error");
             }
-        });
+            });
 
         if (status != napi_ok) {
             sc_logger::Warn("Failed to queue monitor callback to JS");
