@@ -321,12 +321,6 @@ class DXGIPlatformCapture final : public IPlatformCapture {
 
         m_context->Flush();
 
-        // Wymuszenie gotowości dla wrappera - pierwsza czarna klatka zapobiega zawieszeniu przy statycznym pulpicie
-        m_width.store(m_targetWidth, std::memory_order_relaxed);
-        m_height.store(m_targetHeight, std::memory_order_relaxed);
-        m_sharedHandle.store(m_publicSharedHandle, std::memory_order_release);
-        m_firstFrameCaptured.store(true, std::memory_order_release);
-
         return true;
     }
 

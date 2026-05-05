@@ -180,7 +180,13 @@ class WindowsPlatformCapture final : public IPlatformCapture {
     mutable std::mutex m_activeMutex;
     std::unique_ptr<IPlatformCapture> m_activeCapture;
     std::unique_ptr<IPlatformCapture> m_pendingCapture;
-    std::unique_ptr<IPlatformCapture> m_zombieCapture;
+
+    struct ZombieCapture {
+        std::unique_ptr<IPlatformCapture> capture;
+        std::chrono::steady_clock::time_point retiredAt;
+    };
+    std::vector<ZombieCapture> m_zombieCaptures;
+    std::mutex m_zombieMutex;
 
     std::jthread m_thread;
     std::condition_variable_any m_cv;
@@ -199,29 +205,38 @@ class WindowsPlatformCapture final : public IPlatformCapture {
             }, reinterpret_cast<LPARAM>(&m_monitors));
     }
 
+    void CleanupZombieCaptures() {
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(m_zombieMutex);
+        m_zombieCaptures.erase(
+            std::remove_if(m_zombieCaptures.begin(), m_zombieCaptures.end(),
+                [now](const ZombieCapture& z) {
+                    return std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - z.retiredAt).count() > 2000;
+                }),
+            m_zombieCaptures.end());
+    }
+
     void RunCaptureLoop(std::stop_token st) {
         while (!st.stop_requested() && m_running) {
+            CleanupZombieCaptures();
             int target = m_requestedIdx.exchange(-1);
 
-            // Wait if we already have an active capture and no new request
             if (target == -1 && m_activeCapture) {
                 std::unique_lock lock(m_activeMutex);
-                m_cv.wait(lock, st, [this] { return m_requestedIdx.load() != -1; });
+                m_cv.wait_for(lock, std::chrono::milliseconds(500),
+                    [this] { return m_requestedIdx.load() != -1; });
                 continue;
             }
 
-            // Initial capture or manual switch
             if (target == -1) target = m_currentIdx.load();
             if (target >= (int)m_monitors.size()) continue;
 
-            // 1. Zwiększamy generację przed stworzeniem nowego backendu
-            uint64_t newGeneration = m_captureGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
+            uint64_t newGeneration = m_captureGeneration.fetch_add(1) + 1;
 
-            // 2. Tworzymy i uruchamiamy NOWY backend bez zabijania starego
-            auto next = CreateInternalCapture(m_monitors[target].handle);
-            if (next) {
-                next->SetFrameAvailableCallback([this, newGeneration]() {
-                    // Odrzucamy callbacki z poprzednich generacji (starych backendów)
+            auto nextCapture = CreateInternalCapture(m_monitors[target].handle);
+            if (nextCapture) {
+                nextCapture->SetFrameAvailableCallback([this, newGeneration]() {
                     if (m_captureGeneration.load(std::memory_order_acquire) != newGeneration) {
                         return;
                     }
@@ -232,20 +247,24 @@ class WindowsPlatformCapture final : public IPlatformCapture {
 
                 {
                     std::lock_guard lock(m_activeMutex);
-                    m_pendingCapture = std::move(next);
+                    m_pendingCapture = std::move(nextCapture);
                 }
                 m_pendingCapture->Start(nullptr);
 
-                // 3. SEAMLESS HANDOFF: Czekamy, aż nowy backend faktycznie ma klatkę (do 3 sekund)
-                for (int i = 0; i < 300; ++i) {
+                bool realFrameReceived = false;
+                for (int i = 0; i < 300 && !st.stop_requested(); ++i) {
+                    // Note: DXGI now returns nullopt handle until first real frame
                     if (m_pendingCapture->GetWidth() > 0 && m_pendingCapture->GetSharedHandle().has_value()) {
+                        realFrameReceived = true;
                         break;
                     }
-                    if (st.stop_requested()) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
 
-                // 4. Atomowa podmiana - w tym momencie JS zacznie dostawać nowe uchwyty
+                if (!realFrameReceived && !st.stop_requested()) {
+                    sc_logger::Warn("WindowsPlatformCapture: no real frame within 3s – forcing swap with current texture");
+                }
+
                 std::unique_ptr<IPlatformCapture> oldCapture;
                 {
                     std::lock_guard lock(m_activeMutex);
@@ -254,11 +273,10 @@ class WindowsPlatformCapture final : public IPlatformCapture {
                     m_currentIdx.store(target);
                 }
 
-                // 5. Dopiero teraz bezpiecznie zamykamy stary backend
                 if (oldCapture) {
                     oldCapture->Stop();
-                    // Przenosimy do zombie - zostanie trwale zniszczony DOPIERO przy kolejnej zmianie monitora
-                    m_zombieCapture = std::move(oldCapture);
+                    std::lock_guard lock(m_zombieMutex);
+                    m_zombieCaptures.push_back({ std::move(oldCapture), std::chrono::steady_clock::now() });
                 }
             }
         }
