@@ -727,20 +727,19 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 }
 
                 if (requestedIndex >= 0) {
-                    bool changed = false;
                     {
                         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
                         if (requestedIndex >= 0 && requestedIndex < static_cast<int>(m_monitors.size())) {
-                            m_currentMonitorIndex = requestedIndex;
-                            m_streamNodeId = m_monitors[requestedIndex].nodeId;
+                            sc_logger::Info("Wayland: Switching monitor to index {}", requestedIndex);
+                            m_currentMonitorIndex.store(requestedIndex);
+                            m_streamNodeId.store(m_monitors[requestedIndex].nodeId);
                             StopCurrentPipewireStream();
                             CleanupSharedHandleLocked();
                             CreatePipewireStream(m_streamNodeId.load());
-                            changed = true;
+                            
+                            lock.unlock();
+                            InvokeMonitorChangedCallback();
                         }
-                    }
-                    if (changed) {
-                        InvokeMonitorChangedCallback();
                     }
                 }
             }
@@ -1553,17 +1552,20 @@ int WaylandPlatformCapture::GetCurrentMonitorIndex() const {
 }
 
 void WaylandPlatformCapture::NextMonitor() {
-    std::shared_lock<std::shared_mutex> lock(m_stateMutex);
-    if (m_monitors.empty()) {
+    size_t count = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        count = m_monitors.size();
+    }
+
+    if (count <= 1) {
         return;
     }
-    // Calculate the next monitor index in a round-robin fashion
+
     int currentIdx = m_currentMonitorIndex.load();
-    int nextIndex = (currentIdx + 1) % static_cast<int>(m_monitors.size());
-    if (nextIndex != currentIdx) { // Only request a change if the index actually differs (e.g., for size > 1)
-        m_requestedMonitorIndex.store(nextIndex);
-        m_captureCv.notify_all();
-    }
+    int nextIndex = (currentIdx + 1) % static_cast<int>(count);
+    m_requestedMonitorIndex.store(nextIndex);
+    m_captureCv.notify_all();
 }
 
 void WaylandPlatformCapture::SelectMonitor(int index) {
