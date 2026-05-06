@@ -727,13 +727,19 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 }
 
                 if (requestedIndex >= 0) {
-                    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-                    if (requestedIndex >= 0 && requestedIndex < static_cast<int>(m_monitors.size())) {
-                        m_currentMonitorIndex = requestedIndex;
-                        m_streamNodeId = m_monitors[requestedIndex].nodeId;
-                        StopCurrentPipewireStream();
-                        CleanupSharedHandleLocked();
-                        CreatePipewireStream(m_streamNodeId.load());
+                    bool changed = false;
+                    {
+                        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                        if (requestedIndex >= 0 && requestedIndex < static_cast<int>(m_monitors.size())) {
+                            m_currentMonitorIndex = requestedIndex;
+                            m_streamNodeId = m_monitors[requestedIndex].nodeId;
+                            StopCurrentPipewireStream();
+                            CleanupSharedHandleLocked();
+                            CreatePipewireStream(m_streamNodeId.load());
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
                         InvokeMonitorChangedCallback();
                     }
                 }
@@ -1551,8 +1557,10 @@ void WaylandPlatformCapture::NextMonitor() {
     if (m_monitors.empty()) {
         return;
     }
-    int nextIndex = (m_currentMonitorIndex.load() + 1) % static_cast<int>(m_monitors.size());
-    if (nextIndex != m_currentMonitorIndex.load()) {
+    // Calculate the next monitor index in a round-robin fashion
+    int currentIdx = m_currentMonitorIndex.load();
+    int nextIndex = (currentIdx + 1) % static_cast<int>(m_monitors.size());
+    if (nextIndex != currentIdx) { // Only request a change if the index actually differs (e.g., for size > 1)
         m_requestedMonitorIndex.store(nextIndex);
         m_captureCv.notify_all();
     }
