@@ -52,6 +52,7 @@ class IPlatformCapture {
     virtual void NextMonitor() {}
     virtual void SelectMonitor(int index) {}
     virtual std::optional<MonitorMetadata> GetCurrentMonitorInfo() const { return std::nullopt; }
+    virtual std::vector<MonitorMetadata> GetMonitors() const { return {}; }
     virtual void SetMonitorChangedCallback(std::function<void()> callback) {}
     // Returns FPS or -1 if not implemented
     virtual int GetFps() const { return -1; }

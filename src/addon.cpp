@@ -41,7 +41,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             InstanceMethod("getMonitorCount", &ScreenCapture::GetMonitorCount),
             InstanceMethod("getCurrentMonitorIndex", &ScreenCapture::GetCurrentMonitorIndex),
             InstanceMethod("nextMonitor", &ScreenCapture::NextMonitor),
-            InstanceMethod("selectMonitor", &ScreenCapture::SelectMonitor)
+            InstanceMethod("selectMonitor", &ScreenCapture::SelectMonitor),
+            InstanceMethod("getMonitors", &ScreenCapture::GetMonitors),
             });
 
         auto* constructor = new Napi::FunctionReference();
@@ -591,6 +592,28 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             pixelFormat = m_backend->GetPixelFormat();
         }
         return Napi::Number::New(info.Env(), pixelFormat);
+    }
+
+    Napi::Value GetMonitors(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (!m_backend) return env.Null();
+    
+        auto monitors = m_backend->GetMonitors();
+        Napi::Array result = Napi::Array::New(env, monitors.size());
+    
+        for (uint32_t i = 0; i < monitors.size(); ++i) {
+            Napi::Object obj = Napi::Object::New(env);
+            obj.Set("id", monitors[i].id);
+            obj.Set("name", monitors[i].name);
+            obj.Set("index", monitors[i].index);
+            obj.Set("x", monitors[i].x);
+            obj.Set("y", monitors[i].y);
+            obj.Set("width", monitors[i].width);
+            obj.Set("height", monitors[i].height);
+            result.Set(i, obj);
+        }
+    
+        return result;
     }
 };
 

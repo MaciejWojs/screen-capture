@@ -605,6 +605,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     int GetMonitorCount() const override;
+        std::vector<MonitorMetadata> GetMonitors() const override;
     int GetCurrentMonitorIndex() const override;
     void NextMonitor() override;
     void SelectMonitor(int index) override;
@@ -1547,6 +1548,27 @@ int WaylandPlatformCapture::GetMonitorCount() const {
     return static_cast<int>(m_monitors.size());
 }
 
+std::vector<MonitorMetadata> WaylandPlatformCapture::GetMonitors() const {
+    std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+    std::vector<MonitorMetadata> monitors;
+    monitors.reserve(m_monitors.size());
+    
+    for (size_t i = 0; i < m_monitors.size(); ++i) {
+        const auto& m = m_monitors[i];
+        MonitorMetadata info;
+        info.id = std::to_string(m.nodeId);
+        info.name = !m.title.empty() ? m.title : m.connector;
+        info.index = static_cast<int>(i);
+        info.x = m.x;
+        info.y = m.y;
+        info.width = static_cast<int>(m.width);
+        info.height = static_cast<int>(m.height);
+        monitors.push_back(std::move(info));
+    }
+    
+    return monitors;
+}
+
 int WaylandPlatformCapture::GetCurrentMonitorIndex() const {
     return m_currentMonitorIndex.load();
 }
@@ -1670,6 +1692,12 @@ class X11PlatformCapture final : public BaseLinuxPlatformCapture {
     }
 
     std::optional<std::vector<uint8_t>> GetPixelData(std::string_view desiredFormat = "rgba") const override;
+
+        std::vector<MonitorMetadata> GetMonitors() const override {
+            auto info = GetCurrentMonitorInfo();
+            if (info) return { *info };
+            return {};
+        }
 
     std::string GetBackendName() const override {
         return "x11";

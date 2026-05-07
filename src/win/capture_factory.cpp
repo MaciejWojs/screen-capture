@@ -190,6 +190,24 @@ class WindowsPlatformCapture final : public IPlatformCapture {
         return info;
     }
 
+    std::vector<MonitorMetadata> GetMonitors() const override {
+        std::vector<MonitorMetadata> result;
+        result.reserve(m_monitors.size());
+        for (size_t i = 0; i < m_monitors.size(); ++i) {
+            const auto& mon = m_monitors[i];
+            MonitorMetadata info;
+            info.id = std::to_string(reinterpret_cast<std::uintptr_t>(mon.handle));
+            info.name = WideToUtf8(mon.deviceName);
+            info.index = static_cast<int>(i);
+            info.x = mon.area.left;
+            info.y = mon.area.top;
+            info.width = mon.area.right - mon.area.left;
+            info.height = mon.area.bottom - mon.area.top;
+            result.push_back(std::move(info));
+        }
+        return result;
+    }
+
     void NextMonitor() override {
         int count = GetMonitorCount();
         if (count <= 1) return;

@@ -90,6 +90,29 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     std::string GetBackendName() const override { return "gdi"; }
     int GetFps() const override { return m_lastFps.load(); }
 
+    std::vector<MonitorMetadata> GetMonitors() const override {
+        std::vector<MonitorMetadata> monitors;
+        if (m_targetMonitor) {
+            MONITORINFOEXW mi = { sizeof(mi) };
+            if (GetMonitorInfoW(m_targetMonitor, &mi)) {
+                MonitorMetadata info;
+                info.id = std::to_string(reinterpret_cast<uintptr_t>(m_targetMonitor));
+                
+                char name[CCHDEVICENAME];
+                WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, sizeof(name), nullptr, nullptr);
+                info.name = name;
+                
+                info.index = 0;
+                info.x = mi.rcMonitor.left;
+                info.y = mi.rcMonitor.top;
+                info.width = mi.rcMonitor.right - mi.rcMonitor.left;
+                info.height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                monitors.push_back(std::move(info));
+            }
+        }
+        return monitors;
+    }
+
     void SetFrameAvailableCallback(std::function<void()> callback) override {
         std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
         m_frameAvailableCallback = std::move(callback);

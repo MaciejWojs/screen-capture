@@ -31,6 +31,16 @@ export interface SharedHandleInfo {
     chunkSize: number;
 }
 
+export interface MonitorMetadata {
+    id: string;
+    name: string;
+    index: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+}
+
 /**
  * Windows-only capture backends:
  * - `winrt`: modern Graphics Capture API with best performance and support for protected content when available,
@@ -191,6 +201,11 @@ export interface IScreenCapture {
      * Returns the current frames per second (FPS) or -1 if not implemented.
      */
     getFps(): number;
+
+    /**
+     *  Retrieves metadata for all monitors available in the current capture backend.
+     */
+    getMonitors(): MonitorMetadata[]
 }
 
 /**
@@ -330,6 +345,10 @@ class ScreenCaptureWrapper implements IScreenCapture {
 
     getFps(): number {
         return this.inner.getFps();
+    }
+
+    getMonitors(): MonitorMetadata[] {
+        return this.inner.getMonitors();
     }
 }
 
