@@ -604,6 +604,12 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         return "wayland";
     }
 
+    void SetExternalPortalSession(const std::optional<std::string>& sessionHandle, std::optional<int> pipewireRemoteFd) override {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        m_externalSessionHandle = sessionHandle;
+        m_externalPipewireFd = pipewireRemoteFd;
+    }
+
     int GetMonitorCount() const override;
         std::vector<MonitorMetadata> GetMonitors() const override;
     int GetCurrentMonitorIndex() const override;
@@ -620,6 +626,8 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     std::atomic<PortalStage> m_stage{ PortalStage::Idle };
 
     std::string m_sessionHandle;
+    std::optional<std::string> m_externalSessionHandle;
+    std::optional<int> m_externalPipewireFd;
     std::optional<StreamConfig> m_streamConfig;
     std::atomic<uint32_t> m_streamNodeId{ PW_ID_ANY };
     std::vector<MonitorInfo> m_monitors;
@@ -693,20 +701,43 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 this,
                 nullptr);
 
-            GVariantBuilderWrapper builder;
-            g_variant_builder_add(builder, "{sv}", "session_handle_token", g_variant_new_string(("s" + gen_token()).c_str()));
-            g_variant_builder_add(builder, "{sv}", "handle_token", g_variant_new_string(("t" + gen_token()).c_str()));
+            bool shouldRunPortalFlow = true;
+            {
+                std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                if (m_externalPipewireFd && *m_externalPipewireFd >= 0) {
+                    pipewireFd = *m_externalPipewireFd;
+                    shouldRunPortalFlow = false;
+                    sc_logger::Info("Wayland: using external PipeWire FD from another addon");
+                } else if (m_externalSessionHandle && !m_externalSessionHandle->empty()) {
+                    m_sessionHandle = *m_externalSessionHandle;
+                    try {
+                        sc_logger::Info("Wayland: reusing external portal session handle");
+                        OpenPipeWireRemote();
+                        shouldRunPortalFlow = false;
+                    } catch (const std::exception& e) {
+                        sc_logger::Warn("Wayland: external portal session failed ({}), creating own session", e.what());
+                        m_sessionHandle.clear();
+                    }
+                }
+            }
 
-            m_stage = PortalStage::CreatingSession;
-            CallPortalMethod("CreateSession", g_variant_new("(a{sv})", static_cast<GVariantBuilder*>(builder)));
+            if (shouldRunPortalFlow) {
+                GVariantBuilderWrapper builder;
+                g_variant_builder_add(builder, "{sv}", "session_handle_token", g_variant_new_string(("s" + gen_token()).c_str()));
+                g_variant_builder_add(builder, "{sv}", "handle_token", g_variant_new_string(("t" + gen_token()).c_str()));
 
-            g_main_loop_run(m_glibLoop.get());
+                m_stage = PortalStage::CreatingSession;
+                CallPortalMethod("CreateSession", g_variant_new("(a{sv})", static_cast<GVariantBuilder*>(builder)));
+                g_main_loop_run(m_glibLoop.get());
+            }
 
             if (stopToken.stop_requested()) {
                 throw std::runtime_error("Capture stopped before PipeWire remote was opened");
             }
 
-            pipewireFd = m_pendingPipewireFd.exchange(-1);
+            if (pipewireFd < 0) {
+                pipewireFd = m_pendingPipewireFd.exchange(-1);
+            }
 
             if (pipewireFd < 0) {
                 throw std::runtime_error("PipeWire file descriptor was not received from the portal");

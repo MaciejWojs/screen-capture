@@ -73,6 +73,10 @@ export interface ScreenCaptureOptions {
     disableLogging?: boolean;
     /** Set explicit log level. Defaults to `info`. */
     logLevel?: "none" | "error" | "warn" | "info" | "debug";
+    /** Reuse an existing xdg-desktop-portal session handle (Linux/Wayland). */
+    portalSessionHandle?: string;
+    /** Reuse an already opened PipeWire remote FD (Linux/Wayland). */
+    pipewireRemoteFd?: number;
 }
 
 export interface FrameUpdate {

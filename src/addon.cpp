@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #ifdef __linux__
@@ -60,6 +61,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         if (info.Length() > 0 && info[0].IsObject()) {
             auto options = info[0].As<Napi::Object>();
             bool disableLogging = false;
+            std::optional<std::string> externalSessionHandle;
+            std::optional<int> externalPipewireFd;
             if (options.Has("disableLogging") && options.Get("disableLogging").IsBoolean()) {
                 disableLogging = options.Get("disableLogging").As<Napi::Boolean>().Value();
             }
@@ -69,6 +72,16 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             } else if (options.Has("logLevel") && options.Get("logLevel").IsString()) {
                 const std::string levelName = options.Get("logLevel").As<Napi::String>().Utf8Value();
                 sc_logger::SetLogLevel(sc_logger::ParseLogLevel(levelName));
+            }
+
+            if (options.Has("portalSessionHandle") && options.Get("portalSessionHandle").IsString()) {
+                externalSessionHandle = options.Get("portalSessionHandle").As<Napi::String>().Utf8Value();
+            }
+            if (options.Has("pipewireRemoteFd") && options.Get("pipewireRemoteFd").IsNumber()) {
+                externalPipewireFd = options.Get("pipewireRemoteFd").As<Napi::Number>().Int32Value();
+            }
+            if (m_backend) {
+                m_backend->SetExternalPortalSession(externalSessionHandle, externalPipewireFd);
             }
         }
     }

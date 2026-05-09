@@ -44,6 +44,20 @@ const rgbaData = capture.getPixelData('rgba'); // only on wayland
 capture.stop();
 ```
 
+### Reuse portal session from another addon (Wayland)
+
+If another addon already created and authorized an `xdg-desktop-portal` session,
+you can reuse it and avoid a second permission flow:
+
+```javascript
+const capture = new ScreenCapture({
+    portalSessionHandle: sessionHandleFromInputBridge
+    // optional: pipewireRemoteFd: fdFromOtherAddon
+});
+```
+
+When provided external session cannot be used, capture falls back to creating its own session.
+
 ## Install
 
 ```bash
