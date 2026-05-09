@@ -30,6 +30,7 @@ struct MonitorMetadata {
     int y = 0;
     int width = 0;
     int height = 0;
+    std::optional<uint32_t> pipewireStream;
 };
 
 

@@ -1563,6 +1563,9 @@ std::vector<MonitorMetadata> WaylandPlatformCapture::GetMonitors() const {
         info.y = m.y;
         info.width = static_cast<int>(m.width);
         info.height = static_cast<int>(m.height);
+        if (m.nodeId != PW_ID_ANY) {
+            info.pipewireStream = m.nodeId;
+        }
         monitors.push_back(std::move(info));
     }
     
@@ -1617,6 +1620,9 @@ std::optional<MonitorMetadata> WaylandPlatformCapture::GetCurrentMonitorInfo() c
     info.y = monitor.y;
     info.width = static_cast<int>(monitor.width);
     info.height = static_cast<int>(monitor.height);
+    if (monitor.nodeId != PW_ID_ANY) {
+        info.pipewireStream = monitor.nodeId;
+    }
     return info;
 }
 

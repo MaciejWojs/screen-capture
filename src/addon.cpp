@@ -40,6 +40,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             InstanceMethod("getFps", &ScreenCapture::GetFps),
             InstanceMethod("getMonitorCount", &ScreenCapture::GetMonitorCount),
             InstanceMethod("getCurrentMonitorIndex", &ScreenCapture::GetCurrentMonitorIndex),
+            InstanceMethod("getCurrentMonitor", &ScreenCapture::GetCurrentMonitor),
             InstanceMethod("nextMonitor", &ScreenCapture::NextMonitor),
             InstanceMethod("selectMonitor", &ScreenCapture::SelectMonitor),
             InstanceMethod("getMonitors", &ScreenCapture::GetMonitors),
@@ -308,6 +309,9 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             monitor.Set("y", monitorInfo->y);
             monitor.Set("width", monitorInfo->width);
             monitor.Set("height", monitorInfo->height);
+            if (monitorInfo->pipewireStream.has_value()) {
+                monitor.Set("pipewireStream", monitorInfo->pipewireStream.value());
+            }
 
             try {
                 jsCallback.Call({ monitor });
@@ -444,6 +448,28 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             index = m_backend->GetCurrentMonitorIndex();
         }
         return Napi::Number::New(info.Env(), index);
+    }
+
+    Napi::Value GetCurrentMonitor(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (!m_backend) return env.Null();
+
+        auto monitorInfo = m_backend->GetCurrentMonitorInfo();
+        if (!monitorInfo.has_value()) return env.Null();
+
+        Napi::Object obj = Napi::Object::New(env);
+        obj.Set("id", monitorInfo->id);
+        obj.Set("name", monitorInfo->name);
+        obj.Set("index", monitorInfo->index);
+        obj.Set("x", monitorInfo->x);
+        obj.Set("y", monitorInfo->y);
+        obj.Set("width", monitorInfo->width);
+        obj.Set("height", monitorInfo->height);
+        if (monitorInfo->pipewireStream.has_value()) {
+            obj.Set("pipewireStream", monitorInfo->pipewireStream.value());
+        }
+
+        return obj;
     }
 
     Napi::Value NextMonitor(const Napi::CallbackInfo& info) {
@@ -610,6 +636,9 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             obj.Set("y", monitors[i].y);
             obj.Set("width", monitors[i].width);
             obj.Set("height", monitors[i].height);
+            if (monitors[i].pipewireStream.has_value()) {
+                obj.Set("pipewireStream", monitors[i].pipewireStream.value());
+            }
             result.Set(i, obj);
         }
     

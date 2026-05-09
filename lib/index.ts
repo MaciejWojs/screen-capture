@@ -39,6 +39,8 @@ export interface MonitorMetadata {
     y: number;
     width: number;
     height: number;
+    /** PipeWire stream ID, available on Wayland backend. */
+    pipewireStream?: number;
 }
 
 /**
@@ -111,6 +113,8 @@ export interface MonitorUpdate {
     width: number;
     /** Monitor height in pixels. */
     height: number;
+    /** PipeWire stream ID, available on Wayland backend. */
+    pipewireStream?: number;
 }
 
 export interface IScreenCapture {
@@ -184,6 +188,10 @@ export interface IScreenCapture {
      * This is only useful on Wayland.
      */
     getCurrentMonitorIndex(): number;
+    /**
+     * Retrieves metadata for the currently active monitor capture.
+     */
+    getCurrentMonitor(): MonitorMetadata | null;
     /**
      * Switches capture to the next selected Wayland monitor.
      */
@@ -329,6 +337,10 @@ class ScreenCaptureWrapper implements IScreenCapture {
 
     getCurrentMonitorIndex(): number {
         return this.inner.getCurrentMonitorIndex();
+    }
+
+    getCurrentMonitor(): MonitorMetadata | null {
+        return this.inner.getCurrentMonitor();
     }
 
     nextMonitor(): void {

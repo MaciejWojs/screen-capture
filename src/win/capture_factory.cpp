@@ -178,32 +178,14 @@ class WindowsPlatformCapture final : public IPlatformCapture {
         if (index < 0 || index >= static_cast<int>(m_monitors.size())) {
             return std::nullopt;
         }
-        const auto& mon = m_monitors[static_cast<size_t>(index)];
-        MonitorMetadata info;
-        info.id = std::to_string(reinterpret_cast<std::uintptr_t>(mon.handle));
-        info.name = WideToUtf8(mon.deviceName);
-        info.index = index;
-        info.x = mon.area.left;
-        info.y = mon.area.top;
-        info.width = mon.area.right - mon.area.left;
-        info.height = mon.area.bottom - mon.area.top;
-        return info;
+        return WinMonitorToMetadata(m_monitors[static_cast<size_t>(index)], index);
     }
 
     std::vector<MonitorMetadata> GetMonitors() const override {
         std::vector<MonitorMetadata> result;
         result.reserve(m_monitors.size());
         for (size_t i = 0; i < m_monitors.size(); ++i) {
-            const auto& mon = m_monitors[i];
-            MonitorMetadata info;
-            info.id = std::to_string(reinterpret_cast<std::uintptr_t>(mon.handle));
-            info.name = WideToUtf8(mon.deviceName);
-            info.index = static_cast<int>(i);
-            info.x = mon.area.left;
-            info.y = mon.area.top;
-            info.width = mon.area.right - mon.area.left;
-            info.height = mon.area.bottom - mon.area.top;
-            result.push_back(std::move(info));
+            result.push_back(WinMonitorToMetadata(m_monitors[i], static_cast<int>(i)));
         }
         return result;
     }
@@ -249,6 +231,19 @@ class WindowsPlatformCapture final : public IPlatformCapture {
     std::mutex m_callbackMutex;
     std::function<void()> m_monitorChangedCallback;
     std::mutex m_monitorCallbackMutex;
+
+    MonitorMetadata WinMonitorToMetadata(const WindowsMonitor& mon, int index) const {
+        MonitorMetadata info;
+        info.id = std::to_string(reinterpret_cast<std::uintptr_t>(mon.handle));
+        info.name = WideToUtf8(mon.deviceName);
+        info.index = index;
+        info.x = mon.area.left;
+        info.y = mon.area.top;
+        info.width = mon.area.right - mon.area.left;
+        info.height = mon.area.bottom - mon.area.top;
+        // pipewireStream is std::nullopt by default, which is correct for Windows.
+        return info;
+    }
 
     void InvokeMonitorChangedCallback() {
         std::function<void()> cb;
