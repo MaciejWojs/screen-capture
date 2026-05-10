@@ -1,3 +1,17 @@
+## <small>0.5.2 (2026-05-10)</small>
+
+* feat: remove deprecated handling for external PipeWire FD in Wayland capture ([2c80537](https://github.com/MaciejWojs/screen-capture/commit/2c80537c3131522344b7c30461242183436d43ef))
+* feat: update README and code to improve PipeWire negotiation handling and monitor management ([0f43c20](https://github.com/MaciejWojs/screen-capture/commit/0f43c206cc7abc9cc67327b6488d7be043c805e2))
+* feat: enhance Wayland capture logic to check for external PipeWire FD before opening remote session ([f329238](https://github.com/MaciejWojs/screen-capture/commit/f329238b834b7d2d9101b744ad444767b4663097))
+* feat: add support for external monitor metadata in screen capture options ([58a8617](https://github.com/MaciejWojs/screen-capture/commit/58a861703c2cb19b93917c6a74d20659898103d3))
+* feat: add support for reusing external xdg-desktop-portal session and PipeWire remote FD in screen capture ([9cc40be](https://github.com/MaciejWojs/screen-capture/commit/9cc40bef19a9d6e61b52735c68ad6ecfc029c495))
+* feat: add PipeWire stream ID support and enhance monitor metadata retrieval in screen capture ([9562365](https://github.com/MaciejWojs/screen-capture/commit/9562365b03e6c570f344567b5067f2618e84d8a6))
+* feat: implement monitor metadata retrieval and expose getMonitors method in capture interfaces ([8656923](https://github.com/MaciejWojs/screen-capture/commit/865692303afc0cc7c52e1abe948d7335ab58db0c))
+* feat: optimize monitor switching logic and ensure callback is invoked on index change ([45d768d](https://github.com/MaciejWojs/screen-capture/commit/45d768df2014c1c4f3394c8424f4c33dc7fa066b))
+* feat: enhance monitor change handling to invoke callback only on actual index change ([02530f9](https://github.com/MaciejWojs/screen-capture/commit/02530f95c0a3df8544cab987b13da954a28e94cb))
+* fix: correct monitor callback error handling in ScreenCapture class ([9595b50](https://github.com/MaciejWojs/screen-capture/commit/9595b50dbd18dbbfee39f975295a26b5f159a6d3))
+* feat: add monitor change handling and metadata support for improved screen capture functionality ([c3667b6](https://github.com/MaciejWojs/screen-capture/commit/c3667b6de9b46d3dcd9267da533209aff2b661cc))
+
 ## <small>0.5.1 (2026-05-05)</small>
 
 * feat: implement zombie capture management for improved resource handling ([bb04ca4](https://github.com/MaciejWojs/screen-capture/commit/bb04ca4))
