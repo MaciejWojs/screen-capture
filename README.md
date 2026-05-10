@@ -51,12 +51,16 @@ you can reuse it and avoid a second permission flow:
 
 ```javascript
 const capture = new ScreenCapture({
-    portalSessionHandle: sessionHandleFromInputBridge
-    // optional: pipewireRemoteFd: fdFromOtherAddon
+    portalSessionHandle: sessionHandleFromInputBridge,
+    // optional fast-path: skip extra OpenPipeWireRemote call
+    pipewireRemoteFd: fdFromInputBridge,
+    // recommended with external fd so monitor list/stream IDs are known immediately
+    portalMonitors: monitorsFromInputBridge
 });
 ```
 
 When provided external session cannot be used, capture falls back to creating its own session.
+When `pipewireRemoteFd` is set, capture skips portal main-loop flow and starts PipeWire directly.
 
 ## Install
 

@@ -77,6 +77,8 @@ export interface ScreenCaptureOptions {
     portalSessionHandle?: string;
     /** Reuse an already opened PipeWire remote FD (Linux/Wayland). */
     pipewireRemoteFd?: number;
+    /** Optional monitor metadata from a shared portal Start response (Linux/Wayland). */
+    portalMonitors?: MonitorMetadata[];
 }
 
 export interface FrameUpdate {

@@ -55,9 +55,13 @@ class IPlatformCapture {
     virtual std::optional<MonitorMetadata> GetCurrentMonitorInfo() const { return std::nullopt; }
     virtual std::vector<MonitorMetadata> GetMonitors() const { return {}; }
     // Optional integration hook for reusing an external portal session.
-    virtual void SetExternalPortalSession(const std::optional<std::string>& sessionHandle, std::optional<int> pipewireRemoteFd) {
+    virtual void SetExternalPortalSession(
+        const std::optional<std::string>& sessionHandle,
+        std::optional<int> pipewireRemoteFd,
+        std::optional<std::vector<MonitorMetadata>> portalMonitors = std::nullopt) {
         (void)sessionHandle;
         (void)pipewireRemoteFd;
+        (void)portalMonitors;
     }
     virtual void SetMonitorChangedCallback(std::function<void()> callback) {}
     // Returns FPS or -1 if not implemented

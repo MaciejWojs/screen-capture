@@ -63,6 +63,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             bool disableLogging = false;
             std::optional<std::string> externalSessionHandle;
             std::optional<int> externalPipewireFd;
+            std::optional<std::vector<MonitorMetadata>> portalMonitors;
             if (options.Has("disableLogging") && options.Get("disableLogging").IsBoolean()) {
                 disableLogging = options.Get("disableLogging").As<Napi::Boolean>().Value();
             }
@@ -80,8 +81,57 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             if (options.Has("pipewireRemoteFd") && options.Get("pipewireRemoteFd").IsNumber()) {
                 externalPipewireFd = options.Get("pipewireRemoteFd").As<Napi::Number>().Int32Value();
             }
+            if (options.Has("portalMonitors") && options.Get("portalMonitors").IsArray()) {
+                Napi::Array monitorsArray = options.Get("portalMonitors").As<Napi::Array>();
+                std::vector<MonitorMetadata> parsed;
+                parsed.reserve(monitorsArray.Length());
+
+                for (uint32_t i = 0; i < monitorsArray.Length(); ++i) {
+                    Napi::Value item = monitorsArray.Get(i);
+                    if (!item.IsObject()) {
+                        continue;
+                    }
+
+                    Napi::Object monitorObj = item.As<Napi::Object>();
+                    MonitorMetadata monitor;
+
+                    if (monitorObj.Has("id") && monitorObj.Get("id").IsString()) {
+                        monitor.id = monitorObj.Get("id").As<Napi::String>().Utf8Value();
+                    }
+                    if (monitorObj.Has("name") && monitorObj.Get("name").IsString()) {
+                        monitor.name = monitorObj.Get("name").As<Napi::String>().Utf8Value();
+                    }
+                    if (monitorObj.Has("index") && monitorObj.Get("index").IsNumber()) {
+                        monitor.index = monitorObj.Get("index").As<Napi::Number>().Int32Value();
+                    }
+                    if (monitorObj.Has("x") && monitorObj.Get("x").IsNumber()) {
+                        monitor.x = monitorObj.Get("x").As<Napi::Number>().Int32Value();
+                    }
+                    if (monitorObj.Has("y") && monitorObj.Get("y").IsNumber()) {
+                        monitor.y = monitorObj.Get("y").As<Napi::Number>().Int32Value();
+                    }
+                    if (monitorObj.Has("width") && monitorObj.Get("width").IsNumber()) {
+                        monitor.width = monitorObj.Get("width").As<Napi::Number>().Int32Value();
+                    }
+                    if (monitorObj.Has("height") && monitorObj.Get("height").IsNumber()) {
+                        monitor.height = monitorObj.Get("height").As<Napi::Number>().Int32Value();
+                    }
+                    if (monitorObj.Has("pipewireStream") && monitorObj.Get("pipewireStream").IsNumber()) {
+                        const int32_t pipewireStream = monitorObj.Get("pipewireStream").As<Napi::Number>().Int32Value();
+                        if (pipewireStream >= 0) {
+                            monitor.pipewireStream = static_cast<uint32_t>(pipewireStream);
+                        }
+                    }
+
+                    parsed.push_back(std::move(monitor));
+                }
+
+                if (!parsed.empty()) {
+                    portalMonitors = std::move(parsed);
+                }
+            }
             if (m_backend) {
-                m_backend->SetExternalPortalSession(externalSessionHandle, externalPipewireFd);
+                m_backend->SetExternalPortalSession(externalSessionHandle, externalPipewireFd, portalMonitors);
             }
         }
     }

@@ -604,10 +604,38 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         return "wayland";
     }
 
-    void SetExternalPortalSession(const std::optional<std::string>& sessionHandle, std::optional<int> pipewireRemoteFd) override {
+    void SetExternalPortalSession(
+        const std::optional<std::string>& sessionHandle,
+        std::optional<int> pipewireRemoteFd,
+        std::optional<std::vector<MonitorMetadata>> portalMonitors = std::nullopt) override {
         std::unique_lock<std::shared_mutex> lock(m_stateMutex);
         m_externalSessionHandle = sessionHandle;
         m_externalPipewireFd = pipewireRemoteFd;
+        if (portalMonitors && !portalMonitors->empty()) {
+            std::vector<MonitorInfo> monitors;
+            monitors.reserve(portalMonitors->size());
+            for (const auto& monitor : *portalMonitors) {
+                MonitorInfo nativeMonitor;
+                nativeMonitor.x = monitor.x;
+                nativeMonitor.y = monitor.y;
+                nativeMonitor.width = monitor.width > 0 ? static_cast<uint32_t>(monitor.width) : 0;
+                nativeMonitor.height = monitor.height > 0 ? static_cast<uint32_t>(monitor.height) : 0;
+                nativeMonitor.title = monitor.name;
+                if (monitor.pipewireStream.has_value()) {
+                    nativeMonitor.nodeId = *monitor.pipewireStream;
+                } else if (!monitor.id.empty()) {
+                    try {
+                        nativeMonitor.nodeId = static_cast<uint32_t>(std::stoul(monitor.id));
+                    } catch (...) {
+                        nativeMonitor.nodeId = PW_ID_ANY;
+                    }
+                }
+                monitors.push_back(std::move(nativeMonitor));
+            }
+            m_externalMonitors = std::move(monitors);
+        } else {
+            m_externalMonitors.reset();
+        }
     }
 
     int GetMonitorCount() const override;
@@ -628,6 +656,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     std::string m_sessionHandle;
     std::optional<std::string> m_externalSessionHandle;
     std::optional<int> m_externalPipewireFd;
+    std::optional<std::vector<MonitorInfo>> m_externalMonitors;
     std::optional<StreamConfig> m_streamConfig;
     std::atomic<uint32_t> m_streamNodeId{ PW_ID_ANY };
     std::vector<MonitorInfo> m_monitors;
@@ -704,35 +733,63 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             bool shouldRunPortalFlow = true;
             {
                 std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-                if (m_externalPipewireFd && *m_externalPipewireFd >= 0) {
-                    pipewireFd = *m_externalPipewireFd;
-                    shouldRunPortalFlow = false;
-                    sc_logger::Info("Wayland: using external PipeWire FD from another addon");
-                } else if (m_externalSessionHandle && !m_externalSessionHandle->empty()) {
+                if (m_externalSessionHandle && !m_externalSessionHandle->empty()) {
                     m_sessionHandle = *m_externalSessionHandle;
-                    try {
-                        sc_logger::Info("Wayland: reusing external portal session handle");
-                        OpenPipeWireRemote();
-                        shouldRunPortalFlow = false;
-                    } catch (const std::exception& e) {
-                        sc_logger::Warn("Wayland: external portal session failed ({}), creating own session", e.what());
-                        m_sessionHandle.clear();
-                    }
                 }
             }
 
-            if (shouldRunPortalFlow) {
-                GVariantBuilderWrapper builder;
-                g_variant_builder_add(builder, "{sv}", "session_handle_token", g_variant_new_string(("s" + gen_token()).c_str()));
-                g_variant_builder_add(builder, "{sv}", "handle_token", g_variant_new_string(("t" + gen_token()).c_str()));
-
-                m_stage = PortalStage::CreatingSession;
-                CallPortalMethod("CreateSession", g_variant_new("(a{sv})", static_cast<GVariantBuilder*>(builder)));
-                g_main_loop_run(m_glibLoop.get());
+            if (!m_sessionHandle.empty() && m_externalSessionHandle) {
+                try {
+                    sc_logger::Info("Wayland capture: Reusing external portal session handle: {}", m_sessionHandle);
+                    // Call StartSession outside the lock to avoid deadlock.
+                    const bool waitingForStartResponse = StartSession();
+                    m_stage = PortalStage::StartingSession;
+                    shouldRunPortalFlow = waitingForStartResponse;
+                    if (!waitingForStartResponse) {
+                        sc_logger::Info("Wayland capture: Start already active on reused session, opening PipeWire remote directly");
+                        OpenPipeWireRemote();
+                    }
+                } catch (const std::exception& e) {
+                    sc_logger::Warn("Wayland: external portal session failed ({}), creating own session", e.what());
+                    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                    m_sessionHandle.clear();
+                }
             }
 
-            if (stopToken.stop_requested()) {
-                throw std::runtime_error("Capture stopped before PipeWire remote was opened");
+            bool monitorSeededFromExternal = false;
+            size_t seededMonitorCount = 0;
+            {
+                std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                if (m_externalPipewireFd && *m_externalPipewireFd >= 0) {
+                    pipewireFd = dup(*m_externalPipewireFd);
+                    m_pendingPipewireFd.store(pipewireFd);
+                    sc_logger::Info("Wayland capture: Using external PipeWire FD: {}", pipewireFd);
+                    shouldRunPortalFlow = false;
+
+                    if (m_externalMonitors && !m_externalMonitors->empty()) {
+                        m_monitors = *m_externalMonitors;
+                        m_currentMonitorIndex.store(0);
+                        m_streamNodeId.store(m_monitors[0].nodeId);
+                        monitorSeededFromExternal = true;
+                        seededMonitorCount = m_monitors.size();
+                    }
+                }
+            }
+            if (monitorSeededFromExternal) {
+                sc_logger::Info("Wayland capture: Seeded {} monitor(s) from external metadata", static_cast<int>(seededMonitorCount));
+                InvokeMonitorChangedCallback();
+            }
+
+            if (shouldRunPortalFlow) {
+                if (m_sessionHandle.empty()) {
+                    GVariantBuilderWrapper builder;
+                    g_variant_builder_add(builder, "{sv}", "session_handle_token", g_variant_new_string("sc_session"));
+                    g_variant_builder_add(builder, "{sv}", "handle_token", g_variant_new_string("sc_create"));
+
+                    m_stage = PortalStage::CreatingSession;
+                    CallPortalMethod("CreateSession", g_variant_new("(a{sv})", static_cast<GVariantBuilder*>(builder)));
+                }
+                g_main_loop_run(m_glibLoop.get());
             }
 
             if (pipewireFd < 0) {
@@ -794,13 +851,13 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         m_running.store(false);
     }
 
-    void CallPortalMethod(const char* method, GVariant* params) {
+    bool CallPortalMethod(const char* method, GVariant* params, const char* interfaceName = "org.freedesktop.portal.ScreenCast") {
         GError* rawError = nullptr;
         GVariantPtr result(g_dbus_connection_call_sync(
             m_connection.get(),
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.ScreenCast",
+            interfaceName,
             method,
             params,
             G_VARIANT_TYPE("(o)"),
@@ -812,9 +869,16 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         GErrorPtr error(rawError);
 
         if (!result) {
+            // Ignore "Invalid session" which means the session was already started by input-bridge.
+            if (std::string(method) == "Start" && error && 
+                (g_error_matches(error.get(), G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED) || 
+                 std::string(error->message).find("Invalid session") != std::string::npos)) {
+                return false;
+            }
             std::string message = error ? error->message : "Unknown portal error";
             throw std::runtime_error(message);
         }
+        return true;
     }
 
     void StopCurrentPipewireStream() {
@@ -960,22 +1024,27 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         }
     }
 
-    void StartSession() {
+    bool StartSession() {
         GVariantBuilderWrapper builder;
         m_stage = PortalStage::StartingSession;
+        g_variant_builder_add(builder, "{sv}", "handle_token", g_variant_new_string("sc_start"));
         std::string handle;
         {
             std::shared_lock<std::shared_mutex> lock(m_stateMutex);
             handle = m_sessionHandle;
         }
-        CallPortalMethod("Start", g_variant_new("(osa{sv})", handle.c_str(), "", static_cast<GVariantBuilder*>(builder)));
+        // Use RemoteDesktop interface if we have an external session (likely from input-bridge)
+        const char* iface = m_externalSessionHandle ? "org.freedesktop.portal.RemoteDesktop" 
+                                                   : "org.freedesktop.portal.ScreenCast";
+        return CallPortalMethod("Start", g_variant_new("(osa{sv})", handle.c_str(), "", static_cast<GVariantBuilder*>(builder)), iface);
     }
 
     void SelectSources() {
         GVariantBuilderWrapper builder;
         g_variant_builder_add(builder, "{sv}", "types", g_variant_new_uint32(1));
         g_variant_builder_add(builder, "{sv}", "multiple", g_variant_new_boolean(TRUE));
-        g_variant_builder_add(builder, "{sv}", "cursor_mode", g_variant_new_uint32(1));
+        g_variant_builder_add(builder, "{sv}", "cursor_mode", g_variant_new_uint32(2)); // 2 = Metadata
+        g_variant_builder_add(builder, "{sv}", "handle_token", g_variant_new_string("sc_sources"));
 
         m_stage = PortalStage::SelectingSources;
         std::string handle;
@@ -988,6 +1057,15 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
     void OpenPipeWireRemote() {
         GVariantBuilderWrapper builder;
+
+        // Jeśli już mamy zewnętrzny FD (np. z input-bridge), nie prosimy Portalu o nowy
+        if (m_pendingPipewireFd.load() >= 0) {
+            sc_logger::Info("Wayland capture: Skipping OpenPipeWireRemote, using external FD");
+            m_stage = PortalStage::OpeningRemote;
+            g_main_loop_quit(m_glibLoop.get());
+            return;
+        }
+
         GError* rawResultError = nullptr;
         GUnixFDList* rawOutFdList = nullptr;
 
@@ -1422,10 +1500,10 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
 
     static void OnPortalResponse(
         GDBusConnection*,
-        const gchar*,
-        const gchar*,
-        const gchar*,
-        const gchar*,
+        const gchar* senderName,
+        const gchar* objectPath,
+        const gchar* interfaceName,
+        const gchar* signalName,
         GVariant* parameters,
         gpointer userData) {
         auto* self = static_cast<WaylandPlatformCapture*>(userData);
@@ -1434,6 +1512,18 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         GVariantIter* results = nullptr;
         g_variant_get(parameters, "(ua{sv})", &responseCode, &results);
 
+        const bool isCreateResp = g_str_has_suffix(objectPath, "sc_create");
+        const bool isSourcesResp = g_str_has_suffix(objectPath, "sc_sources");
+        const bool isStartResp = g_str_has_suffix(objectPath, "sc_start") || g_str_has_suffix(objectPath, "ib_start");
+        const bool isClipboardResp = g_str_has_suffix(objectPath, "sc_clipboard") || g_str_has_suffix(objectPath, "ib_clipboard");
+        
+        // Check if this response belongs to this connection (by checking for our specific tokens)
+        if (!isCreateResp && !isSourcesResp && !isStartResp && !isClipboardResp) {
+            // Ignore signals intended for other callers (e.g. input-bridge)
+            if (results) g_variant_iter_free(results);
+            return;
+        }
+
         auto freeResults = [&results]() {
             if (results) {
                 g_variant_iter_free(results);
@@ -1441,7 +1531,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
             }
             };
 
-        if (responseCode != 0) {
+        if (responseCode != 0 && (isCreateResp || isSourcesResp || isStartResp)) {
             freeResults();
             if (self->m_glibLoop) {
                 g_main_loop_quit(self->m_glibLoop.get());
@@ -1452,7 +1542,7 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         }
 
         try {
-            if (self->m_stage == PortalStage::CreatingSession) {
+            if (isCreateResp) {
                 const gchar* key = nullptr;
                 GVariant* value = nullptr;
                 bool foundSession = false;
@@ -1474,13 +1564,13 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 return;
             }
 
-            if (self->m_stage == PortalStage::SelectingSources) {
+            if (isSourcesResp) {
                 freeResults();
                 self->StartSession();
                 return;
             }
 
-            if (self->m_stage == PortalStage::StartingSession) {
+            if (isStartResp) {
                 const gchar* key = nullptr;
                 GVariant* value = nullptr;
                 std::vector<MonitorInfo> monitors;
