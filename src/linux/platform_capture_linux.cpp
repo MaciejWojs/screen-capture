@@ -789,6 +789,19 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                 InvokeMonitorChangedCallback();
             }
 
+            // One monitor from JS often means placeholders from input-bridge *before*
+            // RemoteDesktop.Start fills real PipeWire node IDs — connecting to that
+            // node can hang negotiation until start() times out. PW_ID_ANY lets the
+            // portal pipe pick any stream quickly.
+            if (m_externalPipewireFd && *m_externalPipewireFd >= 0 && seededMonitorCount == 1u) {
+                sc_logger::Warn(
+                    "Wayland capture: External portal monitors list length is 1; using PW_ID_ANY for stream bind (caller should pass monitors after PipeWire FD / Start)");
+                {
+                    std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                    m_streamNodeId.store(static_cast<uint32_t>(PW_ID_ANY));
+                }
+            }
+
             if (shouldRunPortalFlow) {
                 if (m_sessionHandle.empty()) {
                     GVariantBuilderWrapper builder;

@@ -270,7 +270,8 @@ class ScreenCaptureWrapper implements IScreenCapture {
     async start(): Promise<void> {
         this.inner.start();
 
-        const timeoutMs = 5000;
+        // PipeWire negotiation (Wayland portal, especially MemFd/NVIDIA path) often needs > 5 s.
+        const timeoutMs = 15000;
         const pollIntervalMs = 30;
         const deadline = Date.now() + timeoutMs;
 

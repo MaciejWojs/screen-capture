@@ -47,7 +47,11 @@ capture.stop();
 ### Reuse portal session from another addon (Wayland)
 
 If another addon already created and authorized an `xdg-desktop-portal` session,
-you can reuse it and avoid a second permission flow:
+you can reuse it and avoid a second permission flow.
+
+From JavaScript always obtain `pipewireRemoteFd` **before** `portalMonitors` (e.g.
+do not evaluate `inputBridge.getMonitors()` before `openPipeWireRemoteFd()` —
+otherwise PipeWire nodes can be placeholders and capture `start()` may time out):
 
 ```javascript
 const capture = new ScreenCapture({
