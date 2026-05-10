@@ -746,8 +746,17 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
                     m_stage = PortalStage::StartingSession;
                     shouldRunPortalFlow = waitingForStartResponse;
                     if (!waitingForStartResponse) {
-                        sc_logger::Info("Wayland capture: Start already active on reused session, opening PipeWire remote directly");
-                        OpenPipeWireRemote();
+                        bool hasExternalFd = false;
+                        {
+                            std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+                            hasExternalFd = m_externalPipewireFd.has_value() && *m_externalPipewireFd >= 0;
+                        }
+                        if (!hasExternalFd) {
+                            sc_logger::Info("Wayland capture: Start already active on reused session, opening PipeWire remote directly");
+                            OpenPipeWireRemote();
+                        } else {
+                            sc_logger::Info("Wayland capture: Start already active; skipping OpenPipeWireRemote because external FD is provided");
+                        }
                     }
                 } catch (const std::exception& e) {
                     sc_logger::Warn("Wayland: external portal session failed ({}), creating own session", e.what());
