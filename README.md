@@ -44,6 +44,28 @@ const rgbaData = capture.getPixelData('rgba'); // only on wayland
 capture.stop();
 ```
 
+### Reuse portal session from another addon (Wayland)
+
+If another addon already created and authorized an `xdg-desktop-portal` session,
+you can reuse it and avoid a second permission flow.
+
+From JavaScript always obtain `pipewireRemoteFd` **before** `portalMonitors` (e.g.
+do not evaluate `inputBridge.getMonitors()` before `openPipeWireRemoteFd()` —
+otherwise PipeWire nodes can be placeholders and capture `start()` may time out):
+
+```javascript
+const capture = new ScreenCapture({
+    portalSessionHandle: sessionHandleFromInputBridge,
+    // optional fast-path: skip extra OpenPipeWireRemote call
+    pipewireRemoteFd: fdFromInputBridge,
+    // recommended with external fd so monitor list/stream IDs are known immediately
+    portalMonitors: monitorsFromInputBridge
+});
+```
+
+When provided external session cannot be used, capture falls back to creating its own session.
+When `pipewireRemoteFd` is set, capture skips portal main-loop flow and starts PipeWire directly.
+
 ## Install
 
 ```bash

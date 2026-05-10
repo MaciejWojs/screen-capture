@@ -31,6 +31,18 @@ export interface SharedHandleInfo {
     chunkSize: number;
 }
 
+export interface MonitorMetadata {
+    id: string;
+    name: string;
+    index: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    /** PipeWire stream ID, available on Wayland backend. */
+    pipewireStream?: number;
+}
+
 /**
  * Windows-only capture backends:
  * - `winrt`: modern Graphics Capture API with best performance and support for protected content when available,
@@ -61,6 +73,12 @@ export interface ScreenCaptureOptions {
     disableLogging?: boolean;
     /** Set explicit log level. Defaults to `info`. */
     logLevel?: "none" | "error" | "warn" | "info" | "debug";
+    /** Reuse an existing xdg-desktop-portal session handle (Linux/Wayland). */
+    portalSessionHandle?: string;
+    /** Reuse an already opened PipeWire remote FD (Linux/Wayland). */
+    pipewireRemoteFd?: number;
+    /** Optional monitor metadata from a shared portal Start response (Linux/Wayland). */
+    portalMonitors?: MonitorMetadata[];
 }
 
 export interface FrameUpdate {
@@ -84,6 +102,27 @@ export interface FrameUpdate {
     pixelData: Buffer | null;
 }
 
+export interface MonitorUpdate {
+    /** Backend name, e.g. 'winrt', 'dxgi', 'gdi', 'wayland', 'x11'. */
+    backend: Backend;
+    /** Stable monitor identifier for the active backend. */
+    id: string;
+    /** Human-readable monitor name when available. */
+    name: string;
+    /** Index of the active monitor in backend monitor list. */
+    index: number;
+    /** Monitor top-left X in virtual desktop coordinates. */
+    x: number;
+    /** Monitor top-left Y in virtual desktop coordinates. */
+    y: number;
+    /** Monitor width in pixels. */
+    width: number;
+    /** Monitor height in pixels. */
+    height: number;
+    /** PipeWire stream ID, available on Wayland backend. */
+    pipewireStream?: number;
+}
+
 export interface IScreenCapture {
     /** Starts the screen capture process. Resolves when the capture backend has completed initialization and the shared handle is ready. */
     start(): Promise<void>;
@@ -99,6 +138,14 @@ export interface IScreenCapture {
      * Unregisters the frame callback previously passed to `onFrame()`.
      */
     offFrame(): void;
+    /**
+     * Registers a callback invoked whenever active monitor selection changes.
+     */
+    onMonitorChanged(callback: (monitor: MonitorUpdate) => void): void;
+    /**
+     * Unregisters monitor-change callback previously passed to `onMonitorChanged()`.
+     */
+    offMonitorChanged(): void;
     /**
      * Retrieves the legacy shared handle information for the latest captured frame.
      * @returns The shared handle info if available, otherwise null.
@@ -148,6 +195,10 @@ export interface IScreenCapture {
      */
     getCurrentMonitorIndex(): number;
     /**
+     * Retrieves metadata for the currently active monitor capture.
+     */
+    getCurrentMonitor(): MonitorMetadata | null;
+    /**
      * Switches capture to the next selected Wayland monitor.
      */
     nextMonitor(): void;
@@ -164,6 +215,11 @@ export interface IScreenCapture {
      * Returns the current frames per second (FPS) or -1 if not implemented.
      */
     getFps(): number;
+
+    /**
+     *  Retrieves metadata for all monitors available in the current capture backend.
+     */
+    getMonitors(): MonitorMetadata[]
 }
 
 /**
@@ -214,7 +270,8 @@ class ScreenCaptureWrapper implements IScreenCapture {
     async start(): Promise<void> {
         this.inner.start();
 
-        const timeoutMs = 5000;
+        // PipeWire negotiation (Wayland portal, especially MemFd/NVIDIA path) often needs > 5 s.
+        const timeoutMs = 15000;
         const pollIntervalMs = 30;
         const deadline = Date.now() + timeoutMs;
 
@@ -239,6 +296,14 @@ class ScreenCaptureWrapper implements IScreenCapture {
 
     offFrame(): void {
         this.inner.offFrame();
+    }
+
+    onMonitorChanged(callback: (monitor: MonitorUpdate) => void): void {
+        this.inner.onMonitorChanged(callback);
+    }
+
+    offMonitorChanged(): void {
+        this.inner.offMonitorChanged();
     }
 
     getSharedHandle(): SharedHandleInfo | null {
@@ -281,6 +346,10 @@ class ScreenCaptureWrapper implements IScreenCapture {
         return this.inner.getCurrentMonitorIndex();
     }
 
+    getCurrentMonitor(): MonitorMetadata | null {
+        return this.inner.getCurrentMonitor();
+    }
+
     nextMonitor(): void {
         this.inner.nextMonitor();
     }
@@ -295,6 +364,10 @@ class ScreenCaptureWrapper implements IScreenCapture {
 
     getFps(): number {
         return this.inner.getFps();
+    }
+
+    getMonitors(): MonitorMetadata[] {
+        return this.inner.getMonitors();
     }
 }
 

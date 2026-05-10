@@ -72,6 +72,20 @@ struct WindowsMonitor {
     std::wstring deviceName;
 };
 
+static std::string WideToUtf8(const std::wstring& value) {
+    if (value.empty()) {
+        return std::string();
+    }
+    const int len = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) {
+        return std::string();
+    }
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, out.data(), len, nullptr, nullptr);
+    out.pop_back();
+    return out;
+}
+
 class WindowsPlatformCapture final : public IPlatformCapture {
     public:
     WindowsPlatformCapture(const std::string& forceBackend) : m_forcedBackend(forceBackend) {
@@ -152,8 +166,29 @@ class WindowsPlatformCapture final : public IPlatformCapture {
         m_userCallback = std::move(callback);
     }
 
+    void SetMonitorChangedCallback(std::function<void()> callback) override {
+        std::lock_guard lock(m_monitorCallbackMutex);
+        m_monitorChangedCallback = std::move(callback);
+    }
+
     int GetMonitorCount() const override { return static_cast<int>(m_monitors.size()); }
     int GetCurrentMonitorIndex() const override { return m_currentIdx.load(); }
+    std::optional<MonitorMetadata> GetCurrentMonitorInfo() const override {
+        const int index = m_currentIdx.load();
+        if (index < 0 || index >= static_cast<int>(m_monitors.size())) {
+            return std::nullopt;
+        }
+        return WinMonitorToMetadata(m_monitors[static_cast<size_t>(index)], index);
+    }
+
+    std::vector<MonitorMetadata> GetMonitors() const override {
+        std::vector<MonitorMetadata> result;
+        result.reserve(m_monitors.size());
+        for (size_t i = 0; i < m_monitors.size(); ++i) {
+            result.push_back(WinMonitorToMetadata(m_monitors[i], static_cast<int>(i)));
+        }
+        return result;
+    }
 
     void NextMonitor() override {
         int count = GetMonitorCount();
@@ -194,6 +229,32 @@ class WindowsPlatformCapture final : public IPlatformCapture {
     Napi::Env m_env{ nullptr };
     std::function<void()> m_userCallback;
     std::mutex m_callbackMutex;
+    std::function<void()> m_monitorChangedCallback;
+    std::mutex m_monitorCallbackMutex;
+
+    MonitorMetadata WinMonitorToMetadata(const WindowsMonitor& mon, int index) const {
+        MonitorMetadata info;
+        info.id = std::to_string(reinterpret_cast<std::uintptr_t>(mon.handle));
+        info.name = WideToUtf8(mon.deviceName);
+        info.index = index;
+        info.x = mon.area.left;
+        info.y = mon.area.top;
+        info.width = mon.area.right - mon.area.left;
+        info.height = mon.area.bottom - mon.area.top;
+        // pipewireStream is std::nullopt by default, which is correct for Windows.
+        return info;
+    }
+
+    void InvokeMonitorChangedCallback() {
+        std::function<void()> cb;
+        {
+            std::lock_guard lock(m_monitorCallbackMutex);
+            cb = m_monitorChangedCallback;
+        }
+        if (cb) {
+            cb();
+        }
+    }
 
     void EnumerateMonitors() {
         m_monitors.clear();
@@ -272,6 +333,8 @@ class WindowsPlatformCapture final : public IPlatformCapture {
                     m_activeCapture = std::move(m_pendingCapture);
                     m_currentIdx.store(target);
                 }
+
+                InvokeMonitorChangedCallback();
 
                 if (oldCapture) {
                     oldCapture->Stop();
