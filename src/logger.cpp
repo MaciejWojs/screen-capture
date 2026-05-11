@@ -16,7 +16,7 @@ namespace sc_logger {
 
     LogLevel ParseLogLevel(std::string_view levelName) noexcept {
         if (levelName == "none") {
-            return LogLevel::None;
+            return LogLevel::Off;
         }
         if (levelName == "error") {
             return LogLevel::Error;
