@@ -3,6 +3,8 @@
 #include "../platform_capture.hpp"
 #include "../pixel_conversion.hpp"
 #include "../logger.hpp"
+#include "linux_raii.hpp"
+#include "platform_capture_base.hpp"
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
@@ -100,18 +102,6 @@ namespace {
             return "unknown";
         }
     }
-
-    struct MmapDeleter {
-        size_t length = 0;
-        void operator()(void* ptr) const {
-            if (ptr && ptr != MAP_FAILED && length > 0) {
-                munmap(ptr, length);
-            }
-        }
-    };
-
-    using MmapPtr = std::shared_ptr<void>;
-    using SharedFd = std::shared_ptr<int>;
 
     struct IntRect {
         uint32_t x, y, w, h;
@@ -293,75 +283,6 @@ namespace {
             desiredFormat);
     }
 
-    template <typename T, auto FreeFunc>
-    struct GenericDeleter {
-        void operator()(T* ptr) const { if (ptr) FreeFunc(ptr); }
-    };
-
-    struct GObjectDeleter {
-        void operator()(void* ptr) const { if (ptr) g_object_unref(ptr); }
-    };
-
-    struct FdDeleter {
-        void operator()(int* fd) const { if (fd && *fd >= 0) { close(*fd); delete fd; } }
-    };
-
-    struct DisplayDeleter {
-        void operator()(Display* display) const {
-            if (display) {
-                XCloseDisplay(display);
-            }
-        }
-    };
-
-    using DisplayPtr = std::unique_ptr<Display, DisplayDeleter>;
-
-    struct XImageDeleter {
-        void operator()(XImage* image) const {
-            if (image) {
-                XDestroyImage(image);
-            }
-        }
-    };
-
-    using XImagePtr = std::unique_ptr<XImage, XImageDeleter>;
-
-    struct XShmSegmentInfoWrapper {
-        XShmSegmentInfo info{};
-        Display* display = nullptr;
-        bool attached = false;
-
-        bool Attach(Display* display_) {
-            display = display_;
-            attached = XShmAttach(display, &info);
-            return attached;
-        }
-
-        ~XShmSegmentInfoWrapper() {
-            if (attached && display) {
-                XShmDetach(display, &info);
-            }
-            if (info.shmaddr) {
-                shmdt(info.shmaddr);
-            }
-            if (info.shmid >= 0) {
-                shmctl(info.shmid, IPC_RMID, 0);
-            }
-        }
-    };
-
-    using GMainLoopPtr = std::unique_ptr<GMainLoop, GenericDeleter<GMainLoop, g_main_loop_unref>>;
-    using GMainContextPtr = std::unique_ptr<GMainContext, GenericDeleter<GMainContext, g_main_context_unref>>;
-    using GDBusConnectionPtr = std::unique_ptr<GDBusConnection, GObjectDeleter>;
-    using PwThreadLoopPtr = std::unique_ptr<pw_thread_loop, GenericDeleter<pw_thread_loop, pw_thread_loop_destroy>>;
-    using PwContextPtr = std::unique_ptr<pw_context, GenericDeleter<pw_context, pw_context_destroy>>;
-    using PwCorePtr = std::unique_ptr<pw_core, GenericDeleter<pw_core, pw_core_disconnect>>;
-    using PwStreamPtr = std::unique_ptr<pw_stream, GenericDeleter<pw_stream, pw_stream_destroy>>;
-    using GVariantPtr = std::unique_ptr<GVariant, GenericDeleter<GVariant, g_variant_unref>>;
-    using GErrorPtr = std::unique_ptr<GError, GenericDeleter<GError, g_error_free>>;
-    using GUnixFDListPtr = std::unique_ptr<GUnixFDList, GObjectDeleter>;
-    using UniqueFd = std::unique_ptr<int, FdDeleter>;
-
     struct PipeWireInitializer {
         bool initialized = false;
 
@@ -432,93 +353,6 @@ namespace Config {
     constexpr size_t POD_BUFFER_SIZE_CONNECT = 8192;
     constexpr size_t POD_BUFFER_SIZE_UPDATE = 4096;
 }
-
-class BaseLinuxPlatformCapture : public IPlatformCapture {
-    protected:
-    mutable std::shared_mutex m_stateMutex;
-    std::jthread m_worker;
-    std::atomic<bool> m_running{ false };
-    std::mutex m_captureMutex;
-    std::condition_variable m_captureCv;
-
-    std::optional<SharedHandleInfo> m_sharedHandle;
-    SharedFd m_sharedFd;
-    mutable std::atomic<bool> m_frameConsumed{ false };
-
-    std::function<void()> m_frameAvailableCallback;
-    std::mutex m_frameCallbackMutex;
-    std::function<void()> m_monitorChangedCallback;
-    std::mutex m_monitorChangedCallbackMutex;
-
-    std::mutex m_fpsMutex;
-    std::atomic<int64_t> m_frameCount{ 0 };
-    std::atomic<int> m_lastFps{ 0 };
-    std::chrono::steady_clock::time_point m_lastFpsTime = std::chrono::steady_clock::now();
-
-    public:
-    virtual ~BaseLinuxPlatformCapture() = default;
-
-    std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
-        if (!m_sharedHandle.has_value() || m_frameConsumed || !m_sharedFd || *m_sharedFd < 0) {
-            return std::nullopt;
-        }
-
-        SharedHandleInfo info = *m_sharedHandle;
-        info.handle = static_cast<uint64_t>(*m_sharedFd);
-        m_frameConsumed = true;
-        return info;
-    }
-
-    int GetFps() const override {
-        return m_lastFps.load();
-    }
-
-    void SetFrameAvailableCallback(std::function<void()> callback) override {
-        std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
-        m_frameAvailableCallback = std::move(callback);
-    }
-
-    void SetMonitorChangedCallback(std::function<void()> callback) override {
-        std::lock_guard<std::mutex> lock(m_monitorChangedCallbackMutex);
-        m_monitorChangedCallback = std::move(callback);
-    }
-
-    void InvokeFrameAvailableCallback() {
-        std::function<void()> callback;
-        {
-            std::lock_guard<std::mutex> lock(m_frameCallbackMutex);
-            callback = m_frameAvailableCallback;
-        }
-        if (callback) {
-            callback();
-        }
-    }
-
-    void InvokeMonitorChangedCallback() {
-        std::function<void()> callback;
-        {
-            std::lock_guard<std::mutex> lock(m_monitorChangedCallbackMutex);
-            callback = m_monitorChangedCallback;
-        }
-        if (callback) {
-            callback();
-        }
-    }
-
-    void RecordFrame() {
-        auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(m_fpsMutex);
-        m_frameCount.fetch_add(1, std::memory_order_relaxed);
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastFpsTime).count();
-        if (elapsed >= 1) {
-            m_lastFps.store(static_cast<int>(m_frameCount.load(std::memory_order_relaxed)), std::memory_order_relaxed);
-            m_frameCount.store(0, std::memory_order_relaxed);
-            m_lastFpsTime = now;
-        }
-        InvokeFrameAvailableCallback();
-    }
-};
 
 class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
     public:
