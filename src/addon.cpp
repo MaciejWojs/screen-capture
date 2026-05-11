@@ -69,7 +69,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             }
 
             if (disableLogging) {
-                sc_logger::SetLogLevel(sc_logger::LogLevel::None);
+                sc_logger::SetLogLevel(sc_logger::LogLevel::Off);
             } else if (options.Has("logLevel") && options.Get("logLevel").IsString()) {
                 const std::string levelName = options.Get("logLevel").As<Napi::String>().Utf8Value();
                 sc_logger::SetLogLevel(sc_logger::ParseLogLevel(levelName));

@@ -59,6 +59,8 @@
         }],
         ["OS=='linux'", {
           "sources": [
+            "src/linux/x11_capture.cpp",
+            "src/linux/wayland_capture.cpp",
             "src/linux/platform_capture_linux.cpp",
             "src/pixel_conversion.cpp"
           ],

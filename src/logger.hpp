@@ -13,7 +13,7 @@
 namespace sc_logger {
 
     enum class LogLevel : int {
-        None = 0,
+        Off = 0,
         Error = 1,
         Warn = 2,
         Info = 3,
