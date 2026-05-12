@@ -101,6 +101,8 @@ class WindowsPlatformCapture final : public IPlatformCapture {
         if (m_running) return;
         m_env = env;
         m_running = true;
+        // Initialize previous monitors list for delta detection
+        m_previousMonitors = GetMonitors();
         m_thread = std::jthread([this](std::stop_token st) { RunCaptureLoop(st); });
     }
 
@@ -171,6 +173,11 @@ class WindowsPlatformCapture final : public IPlatformCapture {
         m_monitorChangedCallback = std::move(callback);
     }
 
+    void SetConfigurationChangedCallback(std::function<void(const std::vector<ConfigurationChange>&)> callback) override {
+        std::lock_guard lock(m_configCallbackMutex);
+        m_configurationChangedCallback = std::move(callback);
+    }
+
     int GetMonitorCount() const override { return static_cast<int>(m_monitors.size()); }
     int GetCurrentMonitorIndex() const override { return m_currentIdx.load(); }
     std::optional<MonitorMetadata> GetCurrentMonitorInfo() const override {
@@ -231,6 +238,9 @@ class WindowsPlatformCapture final : public IPlatformCapture {
     std::mutex m_callbackMutex;
     std::function<void()> m_monitorChangedCallback;
     std::mutex m_monitorCallbackMutex;
+    std::function<void(const std::vector<ConfigurationChange>&)> m_configurationChangedCallback;
+    std::mutex m_configCallbackMutex;
+    std::vector<MonitorMetadata> m_previousMonitors;
 
     MonitorMetadata WinMonitorToMetadata(const WindowsMonitor& mon, int index) const {
         MonitorMetadata info;
@@ -253,6 +263,58 @@ class WindowsPlatformCapture final : public IPlatformCapture {
         }
         if (cb) {
             cb();
+        }
+    }
+
+    void CheckAndInvokeConfigurationChanged() {
+        auto currentMonitors = GetMonitors();
+        std::vector<ConfigurationChange> changes;
+
+        // Check for added/removed monitors
+        for (const auto& current : currentMonitors) {
+            auto it = std::find_if(m_previousMonitors.begin(), m_previousMonitors.end(),
+                [&current](const MonitorMetadata& prev) {
+                    return prev.id == current.id;
+                });
+
+            if (it == m_previousMonitors.end()) {
+                // Monitor added
+                changes.emplace_back(ConfigurationChange{
+                    ConfigurationChangeType::Added,
+                    current.id,
+                    std::nullopt,
+                    current.index
+                });
+            }
+        }
+
+        for (const auto& prev : m_previousMonitors) {
+            auto it = std::find_if(currentMonitors.begin(), currentMonitors.end(),
+                [&prev](const MonitorMetadata& current) {
+                    return current.id == prev.id;
+                });
+
+            if (it == currentMonitors.end()) {
+                // Monitor removed
+                changes.emplace_back(ConfigurationChange{
+                    ConfigurationChangeType::Removed,
+                    prev.id,
+                    prev.index,
+                    std::nullopt
+                });
+            }
+        }
+
+        if (!changes.empty()) {
+            std::function<void(const std::vector<ConfigurationChange>&)> cb;
+            {
+                std::lock_guard lock(m_configCallbackMutex);
+                cb = m_configurationChangedCallback;
+            }
+            if (cb) {
+                cb(changes);
+            }
+            m_previousMonitors = currentMonitors;
         }
     }
 

@@ -31,6 +31,9 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
     std::mutex m_frameCallbackMutex;
     std::function<void()> m_monitorChangedCallback;
     std::mutex m_monitorChangedCallbackMutex;
+    std::function<void(const std::vector<ConfigurationChange>&)> m_configurationChangedCallback;
+    std::mutex m_configurationChangedCallbackMutex;
+    std::vector<MonitorMetadata> m_previousMonitors;
 
     std::mutex m_fpsMutex;
     std::atomic<int64_t> m_frameCount{ 0 };
@@ -66,6 +69,11 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
         m_monitorChangedCallback = std::move(callback);
     }
 
+    void SetConfigurationChangedCallback(std::function<void(const std::vector<ConfigurationChange>&)> callback) override {
+        std::lock_guard<std::mutex> lock(m_configurationChangedCallbackMutex);
+        m_configurationChangedCallback = std::move(callback);
+    }
+
     void InvokeFrameAvailableCallback() {
         std::function<void()> callback;
         {
@@ -85,6 +93,17 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
         }
         if (callback) {
             callback();
+        }
+    }
+
+    void InvokeConfigurationChangedCallback(const std::vector<ConfigurationChange>& changes) {
+        std::function<void(const std::vector<ConfigurationChange>&)> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_configurationChangedCallbackMutex);
+            callback = m_configurationChangedCallback;
+        }
+        if (callback && !changes.empty()) {
+            callback(changes);
         }
     }
 

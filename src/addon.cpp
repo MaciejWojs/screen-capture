@@ -32,6 +32,8 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             InstanceMethod("offFrame", &ScreenCapture::OffFrame),
             InstanceMethod("onMonitorChanged", &ScreenCapture::OnMonitorChanged),
             InstanceMethod("offMonitorChanged", &ScreenCapture::OffMonitorChanged),
+            InstanceMethod("onConfigurationChanged", &ScreenCapture::OnConfigurationChanged),
+            InstanceMethod("offConfigurationChanged", &ScreenCapture::OffConfigurationChanged),
             InstanceMethod("forceBackend", &ScreenCapture::ForceBackend),
             InstanceMethod("getBackend", &ScreenCapture::GetBackend),
             InstanceMethod("getWidth", &ScreenCapture::GetWidth),
@@ -163,6 +165,9 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
     bool m_frameCallbackActive = false;
     Napi::ThreadSafeFunction m_monitorChangedCallback;
     bool m_monitorChangedCallbackActive = false;
+    Napi::ThreadSafeFunction m_configurationChangedCallback;
+    bool m_configurationChangedCallbackActive = false;
+    std::vector<MonitorMetadata> m_previousMonitors;
     bool m_frameDispatchScheduled = false;
     std::unique_ptr<FrameCallbackPayload> m_pendingFrame;
 
@@ -195,6 +200,22 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
 
         if (backend) {
             backend->SetMonitorChangedCallback(std::move(callback));
+        }
+    }
+
+    void AttachConfigurationChangedCallbackToBackend() {
+        std::function<void(const std::vector<ConfigurationChange>&)> callback;
+        IPlatformCapture* backend = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            if (m_configurationChangedCallbackActive) {
+                callback = [this](const std::vector<ConfigurationChange>& changes) { NotifyConfigurationChanged(changes); };
+            }
+            backend = m_backend.get();
+        }
+
+        if (backend) {
+            backend->SetConfigurationChangedCallback(std::move(callback));
         }
     }
 
@@ -390,11 +411,110 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         }
     }
 
+    void NotifyConfigurationChanged(const std::vector<ConfigurationChange>& changes) {
+        Napi::ThreadSafeFunction tsfn;
+        std::vector<MonitorMetadata> currentMonitors;
+        std::string backendName = "unknown";
+
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            if (!m_configurationChangedCallbackActive || !m_backend) {
+                return;
+            }
+            tsfn = m_configurationChangedCallback;
+            currentMonitors = m_backend->GetMonitors();
+            backendName = m_backend->GetBackendName();
+        }
+
+        if (!tsfn || changes.empty()) {
+            return;
+        }
+
+        auto status = tsfn.NonBlockingCall([changes, currentMonitors = std::move(currentMonitors), backendName = std::move(backendName)](Napi::Env env, Napi::Function jsCallback) {
+            Napi::Object update = Napi::Object::New(env);
+            update.Set("backend", Napi::String::New(env, backendName));
+
+            // Marshal configuration changes
+            Napi::Array changesArray = Napi::Array::New(env, changes.size());
+            for (size_t i = 0; i < changes.size(); ++i) {
+                const auto& change = changes[i];
+                Napi::Object changeObj = Napi::Object::New(env);
+
+                const char* typeStr = "unknown";
+                switch (change.type) {
+                    case ConfigurationChangeType::Added:
+                        typeStr = "added";
+                        break;
+                    case ConfigurationChangeType::Removed:
+                        typeStr = "removed";
+                        break;
+                    case ConfigurationChangeType::Enabled:
+                        typeStr = "enabled";
+                        break;
+                    case ConfigurationChangeType::Disabled:
+                        typeStr = "disabled";
+                        break;
+                }
+
+                changeObj.Set("type", Napi::String::New(env, typeStr));
+                changeObj.Set("monitorId", Napi::String::New(env, change.monitorId));
+
+                if (change.previousIndex.has_value()) {
+                    changeObj.Set("previousIndex", change.previousIndex.value());
+                }
+                if (change.currentIndex.has_value()) {
+                    changeObj.Set("currentIndex", change.currentIndex.value());
+                }
+
+                changesArray.Set(i, changeObj);
+            }
+
+            update.Set("changes", changesArray);
+
+            // Marshal monitor list
+            Napi::Array monitorsArray = Napi::Array::New(env, currentMonitors.size());
+            for (size_t i = 0; i < currentMonitors.size(); ++i) {
+                const auto& monitor = currentMonitors[i];
+                Napi::Object monitorObj = Napi::Object::New(env);
+
+                monitorObj.Set("id", Napi::String::New(env, monitor.id));
+                monitorObj.Set("name", Napi::String::New(env, monitor.name));
+                monitorObj.Set("index", monitor.index);
+                monitorObj.Set("x", monitor.x);
+                monitorObj.Set("y", monitor.y);
+                monitorObj.Set("width", monitor.width);
+                monitorObj.Set("height", monitor.height);
+                monitorObj.Set("enabled", monitor.enabled);
+
+                if (monitor.pipewireStream.has_value()) {
+                    monitorObj.Set("pipewireStream", monitor.pipewireStream.value());
+                }
+
+                monitorsArray.Set(i, monitorObj);
+            }
+
+            update.Set("monitors", monitorsArray);
+
+            try {
+                jsCallback.Call({ update });
+            } catch (const Napi::Error& e) {
+                sc_logger::Error("Configuration changed callback threw JS error: {}", e.Message());
+            } catch (...) {
+                sc_logger::Error("Configuration changed callback threw unknown JS error");
+            }
+            });
+
+        if (status != napi_ok) {
+            sc_logger::Warn("Failed to queue configuration changed callback to JS");
+        }
+    }
+
     void ResetCallbacks() {
         std::lock_guard<std::mutex> lock(m_callbackMutex);
         if (m_backend) {
             m_backend->SetFrameAvailableCallback(nullptr);
             m_backend->SetMonitorChangedCallback(nullptr);
+            m_backend->SetConfigurationChangedCallback(nullptr);
         }
         if (m_frameCallbackActive) {
             m_frameCallback.Abort();
@@ -404,8 +524,14 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             m_monitorChangedCallback.Abort();
             m_monitorChangedCallback = {};
         }
+        if (m_configurationChangedCallbackActive) {
+            m_configurationChangedCallback.Abort();
+            m_configurationChangedCallback = {};
+        }
         m_frameCallbackActive = false;
         m_monitorChangedCallbackActive = false;
+        m_configurationChangedCallbackActive = false;
+        m_previousMonitors.clear();
     }
 
     Napi::Value OnFrame(const Napi::CallbackInfo& info) {
@@ -476,6 +602,51 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         return info.Env().Undefined();
     }
 
+    Napi::Value OnConfigurationChanged(const Napi::CallbackInfo& info) {
+        Napi::Env env = info.Env();
+        if (info.Length() == 0 || info[0].IsNull() || info[0].IsUndefined()) {
+            return OffConfigurationChanged(info);
+        }
+        if (!info[0].IsFunction()) {
+            Napi::TypeError::New(env, "onConfigurationChanged requires a function callback").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            if (m_configurationChangedCallbackActive) {
+                m_configurationChangedCallback.Abort();
+                m_configurationChangedCallback = {};
+            }
+
+            auto callback = info[0].As<Napi::Function>();
+            m_configurationChangedCallback = Napi::ThreadSafeFunction::New(env, callback, "ScreenCaptureConfigurationChangedCallback", 0, 1);
+            m_configurationChangedCallbackActive = true;
+            // Store current monitor state for delta computation
+            if (m_backend) {
+                m_previousMonitors = m_backend->GetMonitors();
+            }
+        }
+
+        AttachConfigurationChangedCallbackToBackend();
+        sc_logger::Info("ScreenCapture onConfigurationChanged callback registered");
+        return env.Undefined();
+    }
+
+    Napi::Value OffConfigurationChanged(const Napi::CallbackInfo& info) {
+        std::lock_guard<std::mutex> lock(m_callbackMutex);
+        if (m_configurationChangedCallbackActive) {
+            m_configurationChangedCallback.Abort();
+            m_configurationChangedCallback = {};
+        }
+        m_configurationChangedCallbackActive = false;
+        m_previousMonitors.clear();
+        if (m_backend) {
+            m_backend->SetConfigurationChangedCallback(nullptr);
+        }
+        return info.Env().Undefined();
+    }
+
     Napi::Value OffFrame(const Napi::CallbackInfo& info) {
         std::lock_guard<std::mutex> lock(m_callbackMutex);
         if (m_frameCallbackActive) {
@@ -528,6 +699,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
         obj.Set("y", monitorInfo->y);
         obj.Set("width", monitorInfo->width);
         obj.Set("height", monitorInfo->height);
+        obj.Set("enabled", monitorInfo->enabled);
         if (monitorInfo->pipewireStream.has_value()) {
             obj.Set("pipewireStream", monitorInfo->pipewireStream.value());
         }
@@ -699,6 +871,7 @@ class ScreenCapture : public Napi::ObjectWrap<ScreenCapture> {
             obj.Set("y", monitors[i].y);
             obj.Set("width", monitors[i].width);
             obj.Set("height", monitors[i].height);
+            obj.Set("enabled", monitors[i].enabled);
             if (monitors[i].pipewireStream.has_value()) {
                 obj.Set("pipewireStream", monitors[i].pipewireStream.value());
             }

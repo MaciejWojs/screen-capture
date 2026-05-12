@@ -39,6 +39,8 @@ export interface MonitorMetadata {
     y: number;
     width: number;
     height: number;
+    /** Whether the monitor is enabled/connected. */
+    enabled: boolean;
     /** PipeWire stream ID, available on Wayland backend. */
     pipewireStream?: number;
 }
@@ -123,6 +125,32 @@ export interface MonitorUpdate {
     pipewireStream?: number;
 }
 
+/**
+ * Describes a monitor configuration change event.
+ */
+export interface ConfigurationChange {
+    /** Type of configuration change: monitor added, removed, enabled, or disabled. */
+    type: 'added' | 'removed' | 'enabled' | 'disabled';
+    /** Stable monitor identifier. */
+    monitorId: string;
+    /** Previous monitor index if applicable. */
+    previousIndex?: number;
+    /** Current monitor index if applicable. */
+    currentIndex?: number;
+}
+
+/**
+ * Configuration update event containing changes and the full current monitor list.
+ */
+export interface ConfigurationUpdate {
+    /** Backend name, e.g. 'winrt', 'dxgi', 'gdi', 'wayland', 'x11'. */
+    backend: Backend;
+    /** Array of configuration changes that triggered this event. */
+    changes: ConfigurationChange[];
+    /** Current full list of all monitors. */
+    monitors: MonitorMetadata[];
+}
+
 export interface IScreenCapture {
     /** Starts the screen capture process. Resolves when the capture backend has completed initialization and the shared handle is ready. */
     start(): Promise<void>;
@@ -146,6 +174,14 @@ export interface IScreenCapture {
      * Unregisters monitor-change callback previously passed to `onMonitorChanged()`.
      */
     offMonitorChanged(): void;
+    /**
+     * Registers a callback invoked when monitor configuration changes (add, remove, enable, disable).
+     */
+    onConfigurationChanged(callback: (update: ConfigurationUpdate) => void): void;
+    /**
+     * Unregisters configuration-change callback previously passed to `onConfigurationChanged()`.
+     */
+    offConfigurationChanged(): void;
     /**
      * Retrieves the legacy shared handle information for the latest captured frame.
      * @returns The shared handle info if available, otherwise null.
@@ -304,6 +340,14 @@ class ScreenCaptureWrapper implements IScreenCapture {
 
     offMonitorChanged(): void {
         this.inner.offMonitorChanged();
+    }
+
+    onConfigurationChanged(callback: (update: ConfigurationUpdate) => void): void {
+        this.inner.onConfigurationChanged(callback);
+    }
+
+    offConfigurationChanged(): void {
+        this.inner.offConfigurationChanged();
     }
 
     getSharedHandle(): SharedHandleInfo | null {
