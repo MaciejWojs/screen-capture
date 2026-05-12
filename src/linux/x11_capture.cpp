@@ -8,9 +8,64 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <memory>
+#include <regex>
+#include <sstream>
 #include <vector>
+
+namespace {
+
+std::vector<MonitorMetadata> QueryXrandrMonitors(Display* display, Window root) {
+    std::vector<MonitorMetadata> monitors;
+
+    (void)display;
+    (void)root;
+
+    FILE* pipe = popen("xrandr --query", "r");
+    if (!pipe) {
+        return monitors;
+    }
+
+    std::array<char, 4096> buffer{};
+    std::string output;
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) {
+        output.append(buffer.data());
+    }
+    pclose(pipe);
+
+    std::istringstream stream(output);
+    std::string line;
+    std::regex geometryPattern(R"(([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+))");
+
+    while (std::getline(stream, line)) {
+        auto connectedPos = line.find(" connected");
+        if (connectedPos == std::string::npos) {
+            continue;
+        }
+
+        std::string name = line.substr(0, connectedPos);
+        std::smatch match;
+        MonitorMetadata monitor;
+        monitor.id = name;
+        monitor.name = name;
+        monitor.index = static_cast<int>(monitors.size());
+        monitor.enabled = std::regex_search(line, match, geometryPattern);
+        if (monitor.enabled && match.size() == 5) {
+            monitor.width = std::stoi(match[1].str());
+            monitor.height = std::stoi(match[2].str());
+            monitor.x = std::stoi(match[3].str());
+            monitor.y = std::stoi(match[4].str());
+        }
+
+        monitors.push_back(std::move(monitor));
+    }
+
+    return monitors;
+}
+
+} // namespace
 
 X11PlatformCapture::~X11PlatformCapture() {
     Stop();
@@ -70,9 +125,29 @@ uint32_t X11PlatformCapture::GetPixelFormat() const {
 }
 
 std::vector<MonitorMetadata> X11PlatformCapture::GetMonitors() const {
-    auto info = GetCurrentMonitorInfo();
-    if (info) return { *info };
-    return {};
+    DisplayPtr display(XOpenDisplay(nullptr));
+    if (!display) {
+        return {};
+    }
+
+    int screen = DefaultScreen(display.get());
+    Window root = RootWindow(display.get(), screen);
+    auto monitors = QueryXrandrMonitors(display.get(), root);
+    if (!monitors.empty()) {
+        return monitors;
+    }
+
+    XWindowAttributes attr;
+    XGetWindowAttributes(display.get(), root, &attr);
+
+    MonitorMetadata fallback;
+    fallback.id = "x11-root";
+    fallback.name = "x11-root";
+    fallback.index = 0;
+    fallback.width = attr.width;
+    fallback.height = attr.height;
+    fallback.enabled = true;
+    return { fallback };
 }
 
 std::string X11PlatformCapture::GetBackendName() const {
@@ -80,19 +155,25 @@ std::string X11PlatformCapture::GetBackendName() const {
 }
 
 std::optional<MonitorMetadata> X11PlatformCapture::GetCurrentMonitorInfo() const {
+    auto monitors = GetMonitors();
+    if (!monitors.empty()) {
+        return monitors.front();
+    }
+
     std::shared_lock<std::shared_mutex> lock(m_stateMutex);
     if (!m_sharedHandle) {
         return std::nullopt;
     }
 
     MonitorMetadata info;
-    info.id = "0";
+    info.id = "x11-root";
     info.name = "x11-root";
     info.index = 0;
     info.x = 0;
     info.y = 0;
     info.width = static_cast<int>(m_sharedHandle->width);
     info.height = static_cast<int>(m_sharedHandle->height);
+    info.enabled = true;
     return info;
 }
 
