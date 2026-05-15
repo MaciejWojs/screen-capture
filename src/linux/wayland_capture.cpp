@@ -19,6 +19,81 @@ void WaylandPlatformCapture::Start(Napi::Env) {
         });
 }
 
+void WaylandPlatformCapture::SubscribeToSessionClosed() {
+    std::string sessionHandle;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_stateMutex);
+        sessionHandle = m_sessionHandle;
+    }
+
+    if (sessionHandle.empty() || !m_connection) {
+        return;
+    }
+
+    g_dbus_connection_signal_subscribe(
+        m_connection.get(),
+        "org.freedesktop.portal.Desktop",
+        "org.freedesktop.portal.Session",
+        "Closed",
+        sessionHandle.c_str(),
+        nullptr,
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        &WaylandPlatformCapture::OnSessionClosed,
+        this,
+        nullptr);
+}
+
+void WaylandPlatformCapture::HandleSessionClosed() {
+    auto toMetadata = [](const MonitorInfo& monitor, int index) {
+        MonitorMetadata info;
+        info.id = std::to_string(monitor.nodeId);
+        info.name = !monitor.title.empty() ? monitor.title : monitor.connector;
+        info.index = index;
+        info.x = monitor.x;
+        info.y = monitor.y;
+        info.width = static_cast<int>(monitor.width);
+        info.height = static_cast<int>(monitor.height);
+        if (monitor.nodeId != PW_ID_ANY) {
+            info.pipewireStream = monitor.nodeId;
+        }
+        return info;
+    };
+
+    std::vector<MonitorMetadata> previousMonitors;
+    {
+        std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+        previousMonitors.reserve(m_monitors.size());
+        for (size_t i = 0; i < m_monitors.size(); ++i) {
+            previousMonitors.push_back(toMetadata(m_monitors[i], static_cast<int>(i)));
+        }
+        m_monitors.clear();
+        m_currentMonitorIndex = 0;
+        m_requestedMonitorIndex = -1;
+        m_streamNodeId = PW_ID_ANY;
+    }
+
+    {
+        std::lock_guard<std::mutex> stateLock(m_configurationStateMutex);
+        m_previousMonitors.clear();
+    }
+
+    std::vector<ConfigurationChange> changes;
+    changes.reserve(previousMonitors.size());
+    for (const auto& monitor : previousMonitors) {
+        changes.push_back(ConfigurationChange{
+            ConfigurationChangeType::Removed,
+            monitor.id,
+            monitor.index,
+            std::nullopt,
+        });
+    }
+
+    if (!changes.empty()) {
+        InvokeConfigurationChangedCallback(changes);
+        InvokeMonitorChangedCallback();
+    }
+}
+
 void WaylandPlatformCapture::Stop() {
     if (m_worker.joinable()) {
         m_worker.request_stop();
@@ -365,6 +440,8 @@ void WaylandPlatformCapture::RunCaptureFlow(std::stop_token stopToken) {
             &WaylandPlatformCapture::OnPortalResponse,
             this,
             nullptr);
+
+        SubscribeToSessionClosed();
 
         bool shouldRunPortalFlow = true;
         {
@@ -1271,6 +1348,27 @@ void WaylandPlatformCapture::OnPortalResponse(
                 self->m_streamNodeId = self->m_monitors[0].nodeId;
             }
 
+            {
+                std::lock_guard<std::mutex> stateLock(self->m_configurationStateMutex);
+                self->m_previousMonitors.clear();
+                self->m_previousMonitors.reserve(self->m_monitors.size());
+                for (size_t i = 0; i < self->m_monitors.size(); ++i) {
+                    const auto& monitor = self->m_monitors[i];
+                    MonitorMetadata info;
+                    info.id = std::to_string(monitor.nodeId);
+                    info.name = !monitor.title.empty() ? monitor.title : monitor.connector;
+                    info.index = static_cast<int>(i);
+                    info.x = monitor.x;
+                    info.y = monitor.y;
+                    info.width = static_cast<int>(monitor.width);
+                    info.height = static_cast<int>(monitor.height);
+                    if (monitor.nodeId != PW_ID_ANY) {
+                        info.pipewireStream = monitor.nodeId;
+                    }
+                    self->m_previousMonitors.push_back(std::move(info));
+                }
+            }
+
             self->InvokeMonitorChangedCallback();
 
             sc_logger::Info("Wayland capture selected {} monitor(s)", static_cast<int>(self->m_monitors.size()));
@@ -1303,4 +1401,21 @@ const pw_stream_events WaylandPlatformCapture::kStreamEvents = [] {
     events.process = WaylandPlatformCapture::OnStreamProcess;
     return events;
 }();
+
+void WaylandPlatformCapture::OnSessionClosed(
+    GDBusConnection*,
+    const gchar*,
+    const gchar*,
+    const gchar*,
+    const gchar*,
+    GVariant*,
+    gpointer userData) {
+    auto* self = static_cast<WaylandPlatformCapture*>(userData);
+    if (!self) {
+        return;
+    }
+
+    sc_logger::Warn("Wayland portal session closed; clearing monitor state");
+    self->HandleSessionClosed();
+}
 
