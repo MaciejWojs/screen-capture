@@ -3,6 +3,7 @@
 #include "../platform_capture.hpp"
 #include "linux_raii.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -31,6 +32,12 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
     std::mutex m_frameCallbackMutex;
     std::function<void()> m_monitorChangedCallback;
     std::mutex m_monitorChangedCallbackMutex;
+    std::function<void(const std::vector<ConfigurationChange>&)> m_configurationChangedCallback;
+    std::mutex m_configurationChangedCallbackMutex;
+    std::vector<MonitorMetadata> m_previousMonitors;
+    std::mutex m_configurationStateMutex;
+    std::jthread m_configurationWatcher;
+    std::mutex m_configurationWatcherMutex;
 
     std::mutex m_fpsMutex;
     std::atomic<int64_t> m_frameCount{ 0 };
@@ -66,6 +73,109 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
         m_monitorChangedCallback = std::move(callback);
     }
 
+    void SetConfigurationChangedCallback(std::function<void(const std::vector<ConfigurationChange>&)> callback) override {
+        {
+            std::lock_guard<std::mutex> lock(m_configurationChangedCallbackMutex);
+            m_configurationChangedCallback = std::move(callback);
+        }
+
+        if (!m_configurationChangedCallback) {
+            {
+                std::lock_guard<std::mutex> stateLock(m_configurationStateMutex);
+                m_previousMonitors.clear();
+            }
+            std::lock_guard<std::mutex> watcherLock(m_configurationWatcherMutex);
+            if (m_configurationWatcher.joinable()) {
+                m_configurationWatcher.request_stop();
+                m_configurationWatcher = {};
+            }
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> stateLock(m_configurationStateMutex);
+            if (m_previousMonitors.empty()) {
+                m_previousMonitors = GetMonitors();
+            }
+        }
+
+        std::lock_guard<std::mutex> watcherLock(m_configurationWatcherMutex);
+        if (m_configurationWatcher.joinable()) {
+            return;
+        }
+
+        m_configurationWatcher = std::jthread([this](std::stop_token stopToken) {
+            while (!stopToken.stop_requested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+                {
+                    std::lock_guard<std::mutex> configLock(m_configurationChangedCallbackMutex);
+                    if (!m_configurationChangedCallback) {
+                        continue;
+                    }
+                }
+
+                std::vector<MonitorMetadata> currentMonitors = GetMonitors();
+                std::vector<ConfigurationChange> changes;
+
+                {
+                    std::lock_guard<std::mutex> stateLock(m_configurationStateMutex);
+                    if (m_previousMonitors.empty()) {
+                        m_previousMonitors = std::move(currentMonitors);
+                        continue;
+                    }
+
+                    auto findById = [](const std::vector<MonitorMetadata>& monitors, const std::string& id) {
+                        return std::find_if(monitors.begin(), monitors.end(), [&id](const MonitorMetadata& monitor) {
+                            return monitor.id == id;
+                        });
+                    };
+
+                    for (const auto& monitor : currentMonitors) {
+                        auto previousIt = findById(m_previousMonitors, monitor.id);
+                        if (previousIt == m_previousMonitors.end()) {
+                            changes.push_back(ConfigurationChange{
+                                ConfigurationChangeType::Added,
+                                monitor.id,
+                                std::nullopt,
+                                monitor.index,
+                            });
+                            continue;
+                        }
+
+                        if (previousIt->enabled != monitor.enabled) {
+                            changes.push_back(ConfigurationChange{
+                                monitor.enabled ? ConfigurationChangeType::Enabled : ConfigurationChangeType::Disabled,
+                                monitor.id,
+                                previousIt->index,
+                                monitor.index,
+                            });
+                        }
+                    }
+
+                    for (const auto& previous : m_previousMonitors) {
+                        auto currentIt = findById(currentMonitors, previous.id);
+                        if (currentIt == currentMonitors.end()) {
+                            changes.push_back(ConfigurationChange{
+                                ConfigurationChangeType::Removed,
+                                previous.id,
+                                previous.index,
+                                std::nullopt,
+                            });
+                        }
+                    }
+
+                    m_previousMonitors = std::move(currentMonitors);
+                }
+
+                if (!changes.empty()) {
+                    InvokeConfigurationChangedCallback(changes);
+                    InvokeMonitorChangedCallback();
+                }
+            }
+        });
+    }
+
     void InvokeFrameAvailableCallback() {
         std::function<void()> callback;
         {
@@ -85,6 +195,17 @@ class BaseLinuxPlatformCapture : public IPlatformCapture {
         }
         if (callback) {
             callback();
+        }
+    }
+
+    void InvokeConfigurationChangedCallback(const std::vector<ConfigurationChange>& changes) {
+        std::function<void(const std::vector<ConfigurationChange>&)> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_configurationChangedCallbackMutex);
+            callback = m_configurationChangedCallback;
+        }
+        if (callback && !changes.empty()) {
+            callback(changes);
         }
     }
 

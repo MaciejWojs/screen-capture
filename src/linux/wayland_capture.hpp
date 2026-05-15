@@ -98,6 +98,17 @@ class WaylandPlatformCapture final : public BaseLinuxPlatformCapture {
         const gchar* signalName,
         GVariant* parameters,
         gpointer userData);
+    static void OnSessionClosed(
+        GDBusConnection*,
+        const gchar* senderName,
+        const gchar* objectPath,
+        const gchar* interfaceName,
+        const gchar* signalName,
+        GVariant* parameters,
+        gpointer userData);
+
+    void SubscribeToSessionClosed();
+    void HandleSessionClosed();
 
     static const pw_stream_events kStreamEvents;
 };

@@ -30,7 +30,22 @@ struct MonitorMetadata {
     int y = 0;
     int width = 0;
     int height = 0;
+    bool enabled = true;
     std::optional<uint32_t> pipewireStream;
+};
+
+enum class ConfigurationChangeType {
+    Added,
+    Removed,
+    Enabled,
+    Disabled
+};
+
+struct ConfigurationChange {
+    ConfigurationChangeType type;
+    std::string monitorId;
+    std::optional<int> previousIndex;
+    std::optional<int> currentIndex;
 };
 
 
@@ -64,6 +79,9 @@ class IPlatformCapture {
         (void)portalMonitors;
     }
     virtual void SetMonitorChangedCallback(std::function<void()> callback) {}
+    virtual void SetConfigurationChangedCallback(std::function<void(const std::vector<ConfigurationChange>&)> callback) {
+        (void)callback;
+    }
     // Returns FPS or -1 if not implemented
     virtual int GetFps() const { return -1; }
 };
