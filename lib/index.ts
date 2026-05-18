@@ -12,6 +12,12 @@ import {
     parseSharedTextureInfo,
     BackendSchema,
 } from './schemas.js';
+import type {
+    PixelDataFormat as ZPixelDataFormat,
+    WindowsBackend as ZWindowsBackend,
+    LinuxBackend as ZLinuxBackend,
+    Backend as ZBackend,
+} from './schemas.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -60,21 +66,21 @@ export interface MonitorMetadata {
  * - `dxgi`: desktop duplication API good for most desktops but may fail with exclusive fullscreen or older drivers,
  * - `gdi`: legacy BitBlt fallback compatible with older Windows versions but slower and less efficient.
  */
-export type WindowsBackend = "winrt" | "dxgi" | "gdi";
+export type WindowsBackend = ZWindowsBackend;
 
 /**
  * Linux-only capture backends: `wayland` for Wayland compositors and `x11` for X11.
  */
-export type LinuxBackend = "wayland" | "x11";
+export type LinuxBackend = ZLinuxBackend;
 
 /**
  * All supported capture backends across platforms.
  */
-export type Backend = WindowsBackend | LinuxBackend | "stub" | "unknown";
+export type Backend = ZBackend;
 
 
 /** The format of the pixel data to retrieve. */
-export type PixelDataFormat = "rgba" | "bgra" | "rgbx" | "bgrx" | "xrgb" | "xbgr";
+export type PixelDataFormat = ZPixelDataFormat;
 
 /**
  * Configuration options for creating a `ScreenCapture` instance.

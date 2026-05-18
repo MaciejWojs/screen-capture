@@ -9,46 +9,48 @@ export const BackendSchema = z.union([WindowsBackendSchema, LinuxBackendSchema, 
 export const MonitorMetadataSchema = z.object({
     id: z.string(),
     name: z.string(),
-    index: z.number().int().nonnegative(),
+    index: z.number().int().min(0),
     x: z.number().int(),
     y: z.number().int(),
-    width: z.number().int().nonnegative(),
-    height: z.number().int().nonnegative(),
+    width: z.number().int().min(0),
+    height: z.number().int().min(0),
     pipewireStream: z.number().int().optional(),
 });
 
 export const SharedHandleInfoSchema = z.object({
     handle: z.bigint(),
-    width: z.number().int().nonnegative(),
-    height: z.number().int().nonnegative(),
-    stride: z.number().int().nonnegative(),
-    offset: z.number().int().nonnegative(),
+    width: z.number().int().min(0),
+    height: z.number().int().min(0),
+    stride: z.number().int().min(0),
+    offset: z.number().int().min(0),
     planeSize: z.bigint(),
-    pixelFormat: z.number().int().nonnegative(),
+    pixelFormat: z.number().int().min(0),
     modifier: z.bigint(),
-    bufferType: z.number().int().nonnegative(),
-    chunkSize: z.number().int().nonnegative(),
+    bufferType: z.number().int().min(0),
+    chunkSize: z.number().int().min(0),
 });
 
 export const SharedTextureHandleSchema = z.object({
     ntHandle: z.instanceof(Buffer).optional(),
     nativePixmap: z.any().optional(),
     ioSurface: z.instanceof(Buffer).optional(),
-}).passthrough();
+}).loose();
+
+export type SharedTextureHandle = z.infer<typeof SharedTextureHandleSchema>;
 
 export const SharedTextureImportTextureInfoSchema = z.object({
     pixelFormat: z.string(),
-    codedSize: z.object({ width: z.number().int().nonnegative(), height: z.number().int().nonnegative() }),
+    codedSize: z.object({ width: z.number().int().min(0), height: z.number().int().min(0) }),
     handle: SharedTextureHandleSchema,
 }).strict();
 
 export const FrameUpdateSchema = z.object({
     backend: BackendSchema,
-    width: z.number().int().nonnegative(),
-    height: z.number().int().nonnegative(),
-    stride: z.number().int().nonnegative(),
-    pixelFormat: z.number().int().nonnegative(),
-    timestamp: z.number().int().nonnegative(),
+    width: z.number().int().min(0),
+    height: z.number().int().min(0),
+    stride: z.number().int().min(0),
+    pixelFormat: z.number().int().min(0),
+    timestamp: z.number().int().min(0),
     sharedTextureInfo: SharedTextureImportTextureInfoSchema.nullable(),
     sharedHandle: SharedHandleInfoSchema.nullable(),
     pixelData: z.instanceof(Buffer).nullable(),
@@ -58,11 +60,11 @@ export const MonitorUpdateSchema = z.object({
     backend: BackendSchema,
     id: z.string(),
     name: z.string(),
-    index: z.number().int().nonnegative(),
+    index: z.number().int().min(0),
     x: z.number().int(),
     y: z.number().int(),
-    width: z.number().int().nonnegative(),
-    height: z.number().int().nonnegative(),
+    width: z.number().int().min(0),
+    height: z.number().int().min(0),
     pipewireStream: z.number().int().optional(),
 }).strict();
 
@@ -74,7 +76,7 @@ export const ScreenCaptureOptionsSchema = z.object({
     portalMonitors: z.array(MonitorMetadataSchema).optional(),
 }).strict();
 
-export const MonitorIndexSchema = z.number().int().nonnegative();
+export const MonitorIndexSchema = z.number().int().min(0);
 
 export function parseOptions(opt: unknown) {
     return ScreenCaptureOptionsSchema.safeParse(opt);
