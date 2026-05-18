@@ -141,7 +141,11 @@ export interface MonitorUpdate {
 }
 
 export interface IScreenCapture {
-    /** Starts the screen capture process. Resolves when the capture backend has completed initialization and the shared handle is ready. */
+    /**
+     * Starts the screen capture process.
+     * Resolves when the capture backend has completed initialization and the shared handle is ready.
+     * @throws {Error} When the capture initialization times out after 15 seconds.
+     */
     start(): Promise<void>;
     /** Stops the screen capture process. */
     stop(): void;
@@ -177,7 +181,7 @@ export interface IScreenCapture {
     getPixelData(format?: PixelDataFormat): Buffer | null;
     /**
      * Forces a Windows capture backend.
-     * @throws When called on non-Windows systems or when the requested backend is unavailable.
+     * @throws {TypeError} When called on non-Windows systems or when the requested backend is unavailable.
      * @param backend The Windows-only backend to use: 'winrt', 'dxgi', or 'gdi'.
      */
     forceBackend(backend: WindowsBackend): void;
@@ -277,10 +281,18 @@ async function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Wraps the native ScreenCapture addon with validation and error handling.
+ */
 class ScreenCaptureWrapper implements IScreenCapture {
     private readonly inner: IScreenCapture;
     private frameWrapper?: (frame: FrameUpdate) => void;
 
+    /**
+     * Creates a new ScreenCapture instance.
+     * @param options Optional configuration options for the screen capture.
+     * @throws {TypeError} When provided options are invalid.
+     */
     constructor(options?: ScreenCaptureOptions) {
         if (options) {
             const res = parseOptions(options as any);
