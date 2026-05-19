@@ -4,7 +4,10 @@ Native Node.js addon for screen capture. Packages are published to NPM with prov
 
 ## Current state
 
-- Windows backend is implemented with `Windows.Graphics.Capture` + D3D11.
+- Windows backend utilizes a layered approach based on API availability and performance priority, as determined by runtime checks:
+    1. **WinRT Graphics Capture**: Checks `Windows.Graphics.Capture` first, providing good modern UWP/Desktop integration starting from Win 8+.
+    2. **DXGI Desktop Duplication API**: Falls back to DXGI for high-performance capture on environments where this is preferred or available and better suited than WinRT.
+    3. **GDI BitBlt (Fallback)**: A legacy fallback mechanism using GDI functions (`BitBlt`) for compatibility with older environments where advanced APIs are not available.
 - Linux backend is implemented with `xdg-desktop-portal` (D-Bus) and PipeWire stream, supporting modern desktop environments (Wayland/X11).
 - On Wayland with NVIDIA, the capture may use MemFd and CPU copy when DMA-BUF zero-copy is unavailable.
 - In this MemFd CPU fallback, `getSharedTextureInfo()` / shared texture export may be unavailable and `getPixelData()` is the supported path.
