@@ -1,6 +1,23 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import nodeGypBuild from 'node-gyp-build';
+import {
+    parseOptions,
+    parsePixelFormat,
+    parseWindowsBackend,
+    parseMonitorIndex,
+    parseFrameUpdate,
+    parseSharedHandle,
+    parseMonitorUpdate,
+    parseSharedTextureInfo,
+    BackendSchema,
+} from './schemas.js';
+import type {
+    PixelDataFormat as ZPixelDataFormat,
+    WindowsBackend as ZWindowsBackend,
+    LinuxBackend as ZLinuxBackend,
+    Backend as ZBackend,
+} from './schemas.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,21 +66,21 @@ export interface MonitorMetadata {
  * - `dxgi`: desktop duplication API good for most desktops but may fail with exclusive fullscreen or older drivers,
  * - `gdi`: legacy BitBlt fallback compatible with older Windows versions but slower and less efficient.
  */
-export type WindowsBackend = "winrt" | "dxgi" | "gdi";
+export type WindowsBackend = ZWindowsBackend;
 
 /**
  * Linux-only capture backends: `wayland` for Wayland compositors and `x11` for X11.
  */
-export type LinuxBackend = "wayland" | "x11";
+export type LinuxBackend = ZLinuxBackend;
 
 /**
  * All supported capture backends across platforms.
  */
-export type Backend = WindowsBackend | LinuxBackend | "stub" | "unknown";
+export type Backend = ZBackend;
 
 
 /** The format of the pixel data to retrieve. */
-export type PixelDataFormat = "rgba" | "bgra" | "rgbx" | "bgrx" | "xrgb" | "xbgr";
+export type PixelDataFormat = ZPixelDataFormat;
 
 /**
  * Configuration options for creating a `ScreenCapture` instance.
@@ -124,7 +141,11 @@ export interface MonitorUpdate {
 }
 
 export interface IScreenCapture {
-    /** Starts the screen capture process. Resolves when the capture backend has completed initialization and the shared handle is ready. */
+    /**
+     * Starts the screen capture process.
+     * Resolves when the capture backend has completed initialization and the shared handle is ready.
+     * @throws {Error} When the capture initialization times out after 15 seconds.
+     */
     start(): Promise<void>;
     /** Stops the screen capture process. */
     stop(): void;
@@ -160,7 +181,7 @@ export interface IScreenCapture {
     getPixelData(format?: PixelDataFormat): Buffer | null;
     /**
      * Forces a Windows capture backend.
-     * @throws When called on non-Windows systems or when the requested backend is unavailable.
+     * @throws {TypeError} When called on non-Windows systems or when the requested backend is unavailable.
      * @param backend The Windows-only backend to use: 'winrt', 'dxgi', or 'gdi'.
      */
     forceBackend(backend: WindowsBackend): void;
@@ -260,11 +281,28 @@ async function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Wraps the native ScreenCapture addon with validation and error handling.
+ */
 class ScreenCaptureWrapper implements IScreenCapture {
     private readonly inner: IScreenCapture;
+    private frameWrapper?: (frame: FrameUpdate) => void;
 
+    /**
+     * Creates a new ScreenCapture instance.
+     * @param options Optional configuration options for the screen capture.
+     * @throws {TypeError} When provided options are invalid.
+     */
     constructor(options?: ScreenCaptureOptions) {
-        this.inner = new native.ScreenCapture(options);
+        if (options) {
+            const res = parseOptions(options as any);
+            if (!res.success) {
+                throw new TypeError(`Invalid ScreenCapture options: ${res.error.message}`);
+            }
+            this.inner = new native.ScreenCapture(res.data as any);
+        } else {
+            this.inner = new native.ScreenCapture();
+        }
     }
 
     async start(): Promise<void> {
@@ -291,15 +329,36 @@ class ScreenCaptureWrapper implements IScreenCapture {
     }
 
     onFrame(callback: (frame: FrameUpdate) => void): void {
-        this.inner.onFrame(callback);
+        // Wrap native callback to validate incoming frames before forwarding.
+        this.frameWrapper = (frame: FrameUpdate) => {
+            const res = parseFrameUpdate(frame as any);
+            if (!res.success) {
+                // eslint-disable-next-line no-console
+                console.error('Invalid frame data from native addon:', res.error);
+                return;
+            }
+            callback(res.data as FrameUpdate);
+        };
+
+        this.inner.onFrame(this.frameWrapper);
     }
 
     offFrame(): void {
         this.inner.offFrame();
+        this.frameWrapper = undefined;
     }
 
     onMonitorChanged(callback: (monitor: MonitorUpdate) => void): void {
-        this.inner.onMonitorChanged(callback);
+        // Validate monitor updates from native addon before forwarding.
+        this.inner.onMonitorChanged((m) => {
+            const res = parseMonitorUpdate(m as any);
+            if (!res.success) {
+                // eslint-disable-next-line no-console
+                console.error('Invalid monitor update from native addon:', res.error);
+                return;
+            }
+            callback(res.data as MonitorUpdate);
+        });
     }
 
     offMonitorChanged(): void {
@@ -307,19 +366,53 @@ class ScreenCaptureWrapper implements IScreenCapture {
     }
 
     getSharedHandle(): SharedHandleInfo | null {
-        return this.inner.getSharedHandle();
+        const v = this.inner.getSharedHandle();
+        if (v == null) return null;
+        const res = parseSharedHandle(v as any);
+        if (!res.success) {
+            // eslint-disable-next-line no-console
+            console.error('Invalid shared handle from native addon:', res.error);
+            return null;
+        }
+        return res.data as SharedHandleInfo;
     }
 
     getPixelData(format?: PixelDataFormat): Buffer | null {
-        return this.inner.getPixelData(format);
+        if (format !== undefined) {
+            const pf = parsePixelFormat(format as any);
+            if (!pf.success) {
+                // eslint-disable-next-line no-console
+                console.error('Invalid pixel format requested:', pf.error);
+                return null;
+            }
+        }
+        const data = this.inner.getPixelData(format);
+        if (data == null) return null;
+        if (!Buffer.isBuffer(data)) {
+            // eslint-disable-next-line no-console
+            console.error('Native addon returned non-Buffer pixel data');
+            return null;
+        }
+        return data;
     }
 
     forceBackend(backend: WindowsBackend): void {
+        const wb = parseWindowsBackend(backend as any);
+        if (!wb.success) {
+            throw new TypeError(`Invalid Windows backend: ${wb.error.message}`);
+        }
         this.inner.forceBackend(backend);
     }
 
     getBackend(): Backend {
-        return this.inner.getBackend();
+        const b = this.inner.getBackend();
+        const res = BackendSchema.safeParse(b as any);
+        if (!res.success) {
+            // eslint-disable-next-line no-console
+            console.error('Native addon returned unknown backend:', res.error);
+            return 'unknown';
+        }
+        return res.data as Backend;
     }
 
     getWidth(): number {
@@ -347,7 +440,15 @@ class ScreenCaptureWrapper implements IScreenCapture {
     }
 
     getCurrentMonitor(): MonitorMetadata | null {
-        return this.inner.getCurrentMonitor();
+        const v = this.inner.getCurrentMonitor();
+        if (v == null) return null;
+        const res = parseMonitorUpdate(v as any);
+        if (!res.success) {
+            // eslint-disable-next-line no-console
+            console.error('Invalid current monitor from native addon:', res.error);
+            return null;
+        }
+        return res.data as MonitorMetadata;
     }
 
     nextMonitor(): void {
@@ -355,11 +456,25 @@ class ScreenCaptureWrapper implements IScreenCapture {
     }
 
     selectMonitor(index: number): void {
+        const mi = parseMonitorIndex(index as any);
+        if (!mi.success) {
+            // eslint-disable-next-line no-console
+            console.error('Invalid monitor index:', mi.error);
+            return;
+        }
         this.inner.selectMonitor(index);
     }
 
     getSharedTextureInfo(): SharedTextureImportTextureInfo | null {
-        return this.inner.getSharedTextureInfo();
+        const v = this.inner.getSharedTextureInfo();
+        if (v == null) return null;
+        const res = parseSharedTextureInfo(v as any);
+        if (!res.success) {
+            // eslint-disable-next-line no-console
+            console.error('Invalid shared texture info from native addon:', res.error);
+            return null;
+        }
+        return res.data as SharedTextureImportTextureInfo;
     }
 
     getFps(): number {
