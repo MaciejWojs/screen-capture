@@ -27,7 +27,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
     }
 
     void Start(Napi::Env env) override {
-        if (m_thread.joinable()) return;   // już działa
+        if (m_thread.joinable()) return;   // already running
 
         m_env = env;
         sc_logger::Info("Screen capture started via GDI BitBlt fallback (C++20 jthread)");
@@ -36,7 +36,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             napi_add_env_cleanup_hook(m_env, CleanupHook, this);
         }
 
-        // Uruchom wątek z obsługą stop_token
+        // Start thread with stop_token handling
         m_thread = std::jthread([this](std::stop_token stopToken) {
             InitializeDirect3D();
 
@@ -44,7 +44,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             while (!stopToken.stop_requested()) {
                 CaptureScreenGDI();
 
-                // Czekaj max 16 ms lub do sygnału stop
+                // Wait for max 16 ms or until stop signal is requested
                 m_cv.wait_for(lock, std::chrono::milliseconds(16),
                     [&stopToken] { return stopToken.stop_requested(); });
             }
@@ -60,9 +60,9 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         }
 
         if (m_thread.joinable()) {
-            m_thread.request_stop();      // wysyła sygnał zatrzymania
-            m_cv.notify_all();            // budzi wątek, jeśli czeka
-            m_thread.join();              // czeka na zakończenie
+            m_thread.request_stop();      // sends stop signal
+            m_cv.notify_all();            // wakes up thread if waiting
+            m_thread.join();              // waits for termination
         }
     }
 
@@ -97,11 +97,11 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             if (GetMonitorInfoW(m_targetMonitor, &mi)) {
                 MonitorMetadata info;
                 info.id = std::to_string(reinterpret_cast<uintptr_t>(m_targetMonitor));
-                
+
                 char name[CCHDEVICENAME];
                 WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, sizeof(name), nullptr, nullptr);
                 info.name = name;
-                
+
                 info.index = 0;
                 info.x = mi.rcMonitor.left;
                 info.y = mi.rcMonitor.top;
@@ -131,10 +131,10 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
 
     private:
     napi_env m_env{ nullptr };
-    std::jthread m_thread;                       // automatyczne zarządzanie wątkiem
-    mutable std::mutex m_cvMutex;                // dla condition_variable
+    std::jthread m_thread;                       // automatic thread management
+    mutable std::mutex m_cvMutex;                // for condition_variable
     HMONITOR m_targetMonitor = nullptr;
-    std::condition_variable_any m_cv;            // może czekać na stop_token
+    std::condition_variable_any m_cv;            // can wait for stop token
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
@@ -254,7 +254,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
         GetDIBits(hMemoryDC, hBitmap, 0, m_height, m_pixels.data(),
             reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
 
-        // kopiuj do staging texture
+        // copy to staging texture
         D3D11_MAPPED_SUBRESOURCE mapped;
         if (SUCCEEDED(m_context->Map(m_stagingTex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
             for (uint32_t y = 0; y < m_height; ++y) {
@@ -276,7 +276,7 @@ class LegacyWinPlatformCapture final : public IPlatformCapture {
             InvokeFrameAvailableCallback();
         }
 
-        // zwolnij GDI
+        // release GDI resources
         SelectObject(hMemoryDC, hOldBitmap);
         DeleteObject(hBitmap);
         DeleteDC(hMemoryDC);

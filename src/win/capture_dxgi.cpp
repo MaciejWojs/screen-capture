@@ -79,7 +79,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     std::optional<SharedHandleInfo> GetSharedHandle() const override {
-        // Nie zwracaj uchwytu, jeśli nie mamy jeszcze ani jednej rzeczywistej klatki
+        // Do not return handle if we haven't captured even one actual frame yet
         if (!m_firstFrameCaptured.load(std::memory_order_acquire)) {
             return std::nullopt;
         }
@@ -126,10 +126,10 @@ class DXGIPlatformCapture final : public IPlatformCapture {
 
     private:
     napi_env m_env{ nullptr };
-    std::jthread m_thread;                      // automatyczne zarządzanie wątkiem
-    mutable std::mutex m_reinitMutex;           // dla condition_variable przy ponownej inicjalizacji
+    std::jthread m_thread;                      // automatically manages thread lifetime
+    mutable std::mutex m_reinitMutex;           // for condition_variable upon reinitialization
     HMONITOR m_targetMonitor = nullptr;
-    std::condition_variable_any m_reinitCv;     // może czekać na stop_token
+    std::condition_variable_any m_reinitCv;     // can wait on stop_token
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
@@ -292,7 +292,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             if (FAILED(m_device->CreateQuery(&qDesc, &m_ringQuery[i]))) return false;
         }
 
-        // Tekstura publiczna (stabilny HANDLE dla Electrona)
+        // Public texture (stable HANDLE for Electron)
         D3D11_TEXTURE2D_DESC descPublic = descRing;
         descPublic.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
@@ -304,7 +304,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
 
         if (FAILED(m_device->CreateQuery(&qDesc, &m_publicQuery))) return false;
 
-        // Czyszczenie na czarno tekstury publicznej
+        // Clear the public texture to black
         float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
         if (SUCCEEDED(m_device->CreateRenderTargetView(m_publicSharedTex.Get(), nullptr, &rtv))) {
@@ -338,7 +338,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
     }
 
     void CleanupDirect3D() {
-        // 1. Od razu unieważnij publiczny uchwyt i stan gotowości
+        // 1. Immediately invalidate the public handle and readiness state
         m_sharedHandle.store(nullptr, std::memory_order_release);
         m_firstFrameCaptured.store(false, std::memory_order_release);
         m_width.store(0, std::memory_order_relaxed);
@@ -347,13 +347,13 @@ class DXGIPlatformCapture final : public IPlatformCapture {
         m_targetHeight = 0;
         m_ringIndex = 0;
 
-        // 2. Poczekaj na zakończenie poleceń GPU (np. CopyResource)
+        // 2. Wait for GPU commands to finish (e.g., CopyResource)
         if (m_context) {
             m_context->Flush();
             m_context->ClearState();
         }
 
-        // 3. Zamiast zamykać od razu, przenieś do "poczekalni"
+        // 3. Instead of closing immediately, move to "retirement queue"
         if (m_publicSharedTex || m_publicSharedHandle) {
             std::lock_guard<std::mutex> lock(m_retiredMutex);
             m_retiredResources.emplace_back(m_publicSharedTex, m_publicSharedHandle, std::chrono::steady_clock::now());
@@ -399,7 +399,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             return false;
         }
 
-        // Ignoruj ramki typu mouse-only lub puste aktualizacje (dirty rects == 0)
+        // Ignore mouse-only frames or empty updates (dirty rects == 0)
         if (frameInfo.AccumulatedFrames == 0 && m_firstFrameCaptured.load(std::memory_order_acquire)) {
             m_duplication->ReleaseFrame();
             return true;
@@ -413,12 +413,12 @@ class DXGIPlatformCapture final : public IPlatformCapture {
             desktopTexture->GetDesc(&texDesc);
 
             if (texDesc.Width != m_targetWidth || texDesc.Height != m_targetHeight) {
-                sc_logger::Info("DXGI: Surface size mismatch (prawdopodobnie zmiana rozdzielczości), reinit.");
+                sc_logger::Info("DXGI: Surface size mismatch (likely resolution change), reinitializing.");
                 m_duplication->ReleaseFrame();
                 return false;
             }
 
-            // 1. Kopiuj desktop do ring bufora (staging)
+            // 1. Copy desktop to ring buffer (staging)
             m_ringIndex = (m_ringIndex + 1) % 3;
             m_context->CopyResource(m_ringTex[m_ringIndex].Get(), desktopTexture.Get());
 
@@ -434,7 +434,7 @@ class DXGIPlatformCapture final : public IPlatformCapture {
                 }
             }
 
-            // 2. Kopiuj z ring do STAŁEJ tekstury publicznej
+            // 2. Copy from ring buffer to the PUBLIC texture
             m_context->CopyResource(m_publicSharedTex.Get(), m_ringTex[m_ringIndex].Get());
 
             if (m_publicQuery) {
